@@ -10,6 +10,7 @@ import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table";
 import { CheckCircle, Circle, ChevronDown, ChevronRight, Plus, X, Zap } from "lucide-react";
 import StreamIcebergPartitionEditor from "@/components/iceberg/StreamIcebergPartitionEditor";
+import { type PartitionField } from "@/lib/iceberg-config";
 
 const STEPS = ["Source", "Destination", "Streams & Transforms", "Config", "Review"];
 
@@ -72,7 +73,7 @@ interface StreamConfig {
   // table-level UDFs applied after column transforms
   table_udfs: Array<{ function_name: string; args: string; output_column: string }>;
   // Iceberg lake path (per-stream)
-  partition_spec?: Array<{ source_column: string; transform: string; name?: string; width?: number }>;
+  partition_spec?: PartitionField[];
   identifier_fields?: string[];
   iceberg_namespace?: string;
 }

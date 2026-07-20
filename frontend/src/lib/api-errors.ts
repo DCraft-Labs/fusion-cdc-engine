@@ -3,23 +3,44 @@
  * without crashing the page (fixes Register blank-page bug).
  */
 
-export function formatApiDetail(err: any): string {
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
+function getDetail(err: unknown): unknown {
+  if (isObject(err)) {
+    const resp = err.response;
+    if (isObject(resp) && isObject(resp.data) && "detail" in resp.data) {
+      return resp.data.detail;
+    }
+    if ("detail" in err) return err.detail;
+    if ("message" in err) return err.message;
+  }
+  return err;
+}
+
+export function formatApiDetail(err: unknown): string {
   if (!err) return "Unknown error";
-  const detail = err?.response?.data?.detail ?? err?.detail ?? err?.message ?? err;
+  const detail = getDetail(err);
   if (typeof detail === "string") return detail;
   if (Array.isArray(detail)) {
     return detail
-      .map((d: any) => {
+      .map((d) => {
         if (typeof d === "string") return d;
-        const loc = Array.isArray(d?.loc) ? d.loc.join(".") : d?.loc ?? "";
-        const msg = d?.msg ?? d?.message ?? "";
-        return loc ? `${loc}: ${msg}` : msg;
+        if (isObject(d)) {
+          const loc = Array.isArray(d.loc)
+            ? d.loc.join(".")
+            : typeof d.loc === "string"
+              ? d.loc
+              : "";
+          const msg = typeof d.msg === "string" ? d.msg : typeof d.message === "string" ? d.message : "";
+          return loc ? `${loc}: ${msg}` : msg;
+        }
+        return "";
       })
       .filter(Boolean)
       .join("; ");
   }
-  if (detail && typeof detail === "object") {
-    return JSON.stringify(detail);
-  }
+  if (isObject(detail)) return JSON.stringify(detail);
   return String(detail);
 }

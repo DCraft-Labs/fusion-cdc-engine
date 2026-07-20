@@ -6,10 +6,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { CheckCircle, Circle, Loader2, Check, X, Minus } from "lucide-react";
 import IcebergDestinationForm from "@/components/iceberg/IcebergDestinationForm";
-import { ICEBERG_DEFAULTS, IcebergDestinationConfig, buildConnectionConfig, validateIcebergForm } from "@/lib/iceberg-config";
+import {
+  ICEBERG_DEFAULTS,
+  type IcebergDestinationConfig,
+  buildConnectionConfig,
+  validateIcebergForm,
+} from "@/lib/iceberg-config";
 
 const STEPS = ["Select Type", "Configure", "Test Connection"];
 
@@ -33,7 +37,6 @@ export function CreateDestinationWizard() {
   });
   const [icebergForm, setIcebergForm] = useState<IcebergDestinationConfig>({
     ...ICEBERG_DEFAULTS,
-    name: "",
     catalog_type: "nessie",
     catalog_name: "fusion_cdc",
     namespace: "fusion",
@@ -43,7 +46,8 @@ export function CreateDestinationWizard() {
     s3_endpoint: "",
     s3_region: "us-east-1",
     auth_mode: "access_key",
-  } as any);
+  });
+  const [icebergDestName, setIcebergDestName] = useState("");
   const [destId, setDestId] = useState<string | null>(null);
   const [testChecks, setTestChecks] = useState<TestCheck[]>([]);
   const [sslOpen, setSslOpen] = useState(false);
@@ -108,7 +112,7 @@ export function CreateDestinationWizard() {
         });
       }
       return api.post("/destinations", {
-        destination_name: (icebergForm as any).name,
+        destination_name: icebergDestName,
         connector_definition_id: selectedConnector?.connector_id ?? selectedConnector?.id,
         connector_version: "1.0.0",
         config: buildConnectionConfig(icebergForm),
@@ -189,7 +193,7 @@ export function CreateDestinationWizard() {
       if (destType === "postgresql" || destType === "postgres") return pgForm.name.trim() !== "" && pgForm.host.trim() !== "" && pgForm.database.trim() !== "" && pgForm.username.trim() !== "" && pgForm.password.trim() !== "";
       if (destType === "iceberg") {
         const errs = validateIcebergForm(icebergForm);
-        return (icebergForm as any).name?.trim() !== "" && errs.length === 0;
+        return icebergDestName.trim() !== "" && errs.length === 0;
       }
     }
     return false;
@@ -437,7 +441,7 @@ export function CreateDestinationWizard() {
           <CardContent className="space-y-6">
             <div className="space-y-2">
               <label className="text-sm font-medium">Destination Name *</label>
-              <Input value={(icebergForm as any).name ?? ""} onChange={(e) => setIcebergForm({ ...icebergForm, name: e.target.value } as any)} placeholder="e.g. Data Lake - Iceberg" />
+              <Input value={icebergDestName} onChange={(e) => setIcebergDestName(e.target.value)} placeholder="e.g. Data Lake - Iceberg" />
             </div>
             <IcebergDestinationForm form={icebergForm} setForm={setIcebergForm} />
           </CardContent>

@@ -1,5 +1,14 @@
-import React from "react";
-import { PartitionField, PartitionTransform } from "../../lib/iceberg-config";
+import { type PartitionField, type PartitionTransform } from "@/lib/iceberg-config";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
+import { X, Plus } from "lucide-react";
 
 interface Props {
   partitionSpec: PartitionField[];
@@ -10,7 +19,15 @@ interface Props {
   sourcePrimaryKeys?: string[];
 }
 
-const TRANSFORMS: PartitionTransform[] = ["identity", "year", "month", "day", "hour", "bucket", "truncate"];
+const TRANSFORMS: PartitionTransform[] = [
+  "identity",
+  "year",
+  "month",
+  "day",
+  "hour",
+  "bucket",
+  "truncate",
+];
 
 export default function StreamIcebergPartitionEditor({
   partitionSpec,
@@ -20,73 +37,129 @@ export default function StreamIcebergPartitionEditor({
   availableColumns,
   sourcePrimaryKeys = [],
 }: Props) {
-  const addRow = () => setPartitionSpec([
-    ...partitionSpec,
-    { source_column: availableColumns[0] ?? "", transform: "day", name: "" },
-  ]);
+  const addRow = () =>
+    setPartitionSpec([
+      ...partitionSpec,
+      { source_column: availableColumns[0] ?? "", transform: "day", name: "" },
+    ]);
   const updateRow = (i: number, patch: Partial<PartitionField>) =>
-    setPartitionSpec(partitionSpec.map((p, idx) => (idx === i ? { ...p, ...patch } : p)));
-  const removeRow = (i: number) => setPartitionSpec(partitionSpec.filter((_, idx) => idx !== i));
+    setPartitionSpec(
+      partitionSpec.map((p, idx) => (idx === i ? { ...p, ...patch } : p))
+    );
+  const removeRow = (i: number) =>
+    setPartitionSpec(partitionSpec.filter((_, idx) => idx !== i));
 
   return (
-    <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, marginTop: 12, background: "#fafafa" }}>
-      <h4 style={{ marginTop: 0, marginBottom: 8, fontSize: 14 }}>Iceberg partition spec</h4>
-      <p style={{ fontSize: 12, color: "#6b7280", marginTop: 0 }}>
-        Prefer <code>day(event_ts)</code> or <code>bucket(16-128, pk)</code>. Avoid <code>hour</code> on
-        high-volume CDC — it produces small files.
-      </p>
+    <div className="rounded-md border bg-muted/30 p-3 space-y-3">
+      <div>
+        <h4 className="text-sm font-semibold">Iceberg partition spec</h4>
+        <p className="text-xs text-muted-foreground mt-0.5">
+          Prefer <code>day(event_ts)</code> or <code>bucket(16-128, pk)</code>. Avoid{" "}
+          <code>hour</code> on high-volume CDC — it produces small files.
+        </p>
+      </div>
 
       {partitionSpec.length === 0 && (
-        <div style={{ fontSize: 13, color: "#6b7280", marginBottom: 8 }}>No partition fields (unpartitioned table).</div>
+        <p className="text-xs text-muted-foreground">
+          No partition fields (unpartitioned table).
+        </p>
       )}
+
       {partitionSpec.map((p, i) => (
-        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 6, alignItems: "center" }}>
-          <select value={p.source_column} onChange={(e) => updateRow(i, { source_column: e.target.value })} style={{ flex: 1, padding: "6px" }}>
-            {availableColumns.map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <select value={p.transform} onChange={(e) => updateRow(i, { transform: e.target.value as PartitionTransform })} style={{ flex: 1, padding: "6px" }}>
-            {TRANSFORMS.map((t) => <option key={t} value={t}>{t}</option>)}
-          </select>
+        <div key={i} className="flex items-center gap-2">
+          <Select
+            value={p.source_column}
+            onValueChange={(v) => updateRow(i, { source_column: v })}
+          >
+            <SelectTrigger className="h-7 text-xs flex-1">
+              <SelectValue placeholder="Column" />
+            </SelectTrigger>
+            <SelectContent>
+              {availableColumns.map((c) => (
+                <SelectItem key={c} value={c}>
+                  {c}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select
+            value={p.transform}
+            onValueChange={(v) => updateRow(i, { transform: v as PartitionTransform })}
+          >
+            <SelectTrigger className="h-7 text-xs flex-1">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {TRANSFORMS.map((t) => (
+                <SelectItem key={t} value={t}>
+                  {t}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           {(p.transform === "bucket" || p.transform === "truncate") && (
-            <input
+            <Input
               type="number"
+              className="h-7 text-xs w-20"
               value={p.width ?? 16}
               onChange={(e) => updateRow(i, { width: Number(e.target.value) })}
               placeholder="width"
-              style={{ width: 80, padding: "6px" }}
             />
           )}
-          <input
+          <Input
+            className="h-7 text-xs flex-1"
             value={p.name ?? ""}
             onChange={(e) => updateRow(i, { name: e.target.value })}
             placeholder="optional name"
-            style={{ flex: 1, padding: "6px" }}
           />
-          <button type="button" onClick={() => removeRow(i)} style={{ padding: "6px 10px" }}>Remove</button>
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            className="h-7 w-7"
+            onClick={() => removeRow(i)}
+          >
+            <X className="h-3.5 w-3.5" />
+          </Button>
         </div>
       ))}
-      <button type="button" onClick={addRow} style={{ marginTop: 6, padding: "6px 12px" }}>+ Add partition field</button>
 
-      <h4 style={{ marginTop: 16, marginBottom: 8, fontSize: 14 }}>Identifier fields (PK for upsert)</h4>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-        {availableColumns.map((c) => {
-          const checked = identifierFields.includes(c);
-          return (
-            <label key={c} style={{ fontSize: 13 }}>
-              <input
-                type="checkbox"
-                checked={checked}
-                onChange={(e) =>
-                  setIdentifierFields(e.target.checked
-                    ? [...identifierFields, c]
-                    : identifierFields.filter((f) => f !== c))
-                }
-              />{" "}
-              {c}
-              {sourcePrimaryKeys.includes(c) && <span style={{ color: "#6b7280" }}> (PK)</span>}
-            </label>
-          );
-        })}
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        className="h-7 text-xs"
+        onClick={addRow}
+      >
+        <Plus className="h-3 w-3 mr-1" /> Add partition field
+      </Button>
+
+      <div className="border-t pt-3 space-y-2">
+        <h4 className="text-sm font-semibold">Identifier fields (PK for upsert)</h4>
+        <div className="flex flex-wrap gap-x-4 gap-y-2">
+          {availableColumns.map((c) => {
+            const checked = identifierFields.includes(c);
+            return (
+              <label key={c} className="flex items-center gap-1.5 text-xs cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={(e) =>
+                    setIdentifierFields(
+                      e.target.checked
+                        ? [...identifierFields, c]
+                        : identifierFields.filter((f) => f !== c)
+                    )
+                  }
+                />
+                <span className="font-mono">{c}</span>
+                {sourcePrimaryKeys.includes(c) && (
+                  <span className="text-muted-foreground">(PK)</span>
+                )}
+              </label>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
