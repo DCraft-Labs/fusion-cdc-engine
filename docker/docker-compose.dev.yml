@@ -304,6 +304,106 @@ services:
       retries: 3
 
   # -------------------------------------------------------------------------
+  # MinIO — S3-compatible object storage for Iceberg E2E (local lake)
+  # UI: http://localhost:9001  (minio / minio123)
+  # Bucket `iceberg-warehouse` auto-created by minio-init.
+  # -------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-08-17T01-24-06Z
+    container_name: fusion-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-08-17T04-14-18Z
+    container_name: fusion-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minio minio123 &&
+      mc mb -p local/iceberg-warehouse &&
+      mc mb -p local/iceberg-data &&
+      mc anonymous set download local/iceberg-warehouse || true
+      "
+
+  # -------------------------------------------------------------------------
+  # Nessie — Iceberg REST catalog (local dev; PyIceberg `nessie` catalog)
+  # Endpoint: http://nessie:19120/api/v2  (config; UI on 19120)
+  # -------------------------------------------------------------------------
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.92.1
+    container_name: fusion-nessie
+    restart: unless-stopped
+    ports:
+      - "19120:19120"
+    environment:
+      QUARKUS_HTTP_PORT: "19120"
+      NESSIE_VERSION_STORE_TYPE: "ROCKSDB"
+      NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH: "/var/lib/nessie/rocksdb"
+    volumes:
+      - nessie_data:/var/lib/nessie
+
+  # -------------------------------------------------------------------------
+  # Transform Worker — DuckDB + PyIceberg lake writer (default lake path).
+  # Replaces Spark for both Postgres and Iceberg destinations.
+  # KEDA scale-to-zero in K8s; in compose always-on for E2E.
+  # -------------------------------------------------------------------------
+  transform-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.transform-worker
+    container_name: fusion-transform-worker
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres-meta:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      nessie:
+        condition: service_started
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      METADATA_DB_DSN: "host=postgres-meta port=5432 dbname=fusion_cdc_metadata user=fusion_user password=fusion_password"
+      CONTROL_PLANE_URL: "http://host.docker.internal:8000"
+      WORKER_ID: "transform-worker-dev-1"
+      ENCRYPTION_KEY: "fusion-local-encrypt-key-32byt"
+      DUCKDB_THREADS: "2"
+      DUCKDB_MEMORY_LIMIT: "2GB"
+      # Iceberg / S3 (MinIO) defaults — overridden per-destination via connection_config
+      PYICEBERG_HOME: "/tmp/pyiceberg"
+      AWS_ACCESS_KEY_ID: "minio"
+      AWS_SECRET_ACCESS_KEY: "minio123"
+      AWS_ENDPOINT_URL_S3: "http://minio:9000"
+      AWS_REGION: "us-east-1"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - transform_worker_data:/var/lib/transform-worker
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f worker.py && echo healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # -------------------------------------------------------------------------
   # Spark Consumer — reads from Redis Streams, applies transforms & DQ,
   # writes to Postgres DW (or Iceberg). For REALTIME connections.
   # -------------------------------------------------------------------------
@@ -341,6 +441,9 @@ volumes:
   pg_source_data:
   mysql_data:
   mongo_data:
+  minio_data:
+  nessie_data:
+  transform_worker_data:
   airflow_dags:
   airflow_logs:
   cdc_worker_data:

@@ -4,6 +4,7 @@ import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
+import { formatApiDetail } from "@/lib/api-errors";
 
 export function RegisterPage() {
   const navigate = useNavigate();
@@ -33,7 +34,7 @@ export function RegisterPage() {
       });
       navigate("/login");
     } catch (err: any) {
-      setError(err.response?.data?.detail ?? "Registration failed");
+      setError(formatApiDetail(err) || "Registration failed");
     } finally {
       setLoading(false);
     }

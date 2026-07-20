@@ -134,8 +134,21 @@ export function ConnectorsPage() {
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        {filtered.length === 0 ? (
-          <p className="text-muted-foreground col-span-full text-center py-8">No connectors found</p>
+        {connectors.length === 0 ? (
+          <div className="col-span-full rounded-md border border-dashed p-8 text-center">
+            <p className="text-base font-medium">No connector definitions seeded yet.</p>
+            <p className="text-sm text-muted-foreground mt-1">
+              Run the seed job (<code>kubectl apply -f infra/local-dev/k8s/seed-connectors-job.yaml</code>)
+              or <code>docker compose -f docker/docker-compose.dev.yml up -d</code> with the seed sidecar,
+              then refresh this page.
+            </p>
+            <p className="text-xs text-muted-foreground mt-2">
+              See <code>docs/CONNECTORS_SEED.md</code> for the full list (MySQL / Postgres / Mongo sources,
+              Postgres / Iceberg / S3 destinations).
+            </p>
+          </div>
+        ) : filtered.length === 0 ? (
+          <p className="text-muted-foreground col-span-full text-center py-8">No connectors match your search</p>
         ) : (
           filtered.map((conn: any) => (
             <Card

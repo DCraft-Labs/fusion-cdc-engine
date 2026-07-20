@@ -53,20 +53,34 @@ class InitialLoadTask:
         else:
             transformed, child_tables = rows, {}
 
-        # Write to destination
-        dest_dsn = self._get_dest_dsn(connection_id)
+        # Write to destination — route by connector_type
+        dest = task.get("destination") or {}
+        connector_type = dest.get("connector_type") or task.get("dest_connector_type", "postgres")
         schema = task.get("dest_schema", "dw")
         table = task.get("dest_table", "data")
-        rows_written = self._copy_to_postgres(transformed, dest_dsn, schema, table)
 
-        # Write child tables if json_flatten_child produced any
-        for child_name, child_rows in child_tables.items():
-            if child_rows:
-                self._copy_to_postgres(child_rows, dest_dsn, schema, child_name)
+        if connector_type == "iceberg":
+            rows_written = self._write_to_iceberg(transformed, dest, table)
+            for child_name, child_rows in child_tables.items():
+                if child_rows:
+                    self._write_to_iceberg(child_rows, dest, child_name)
+        else:
+            dest_dsn = self._get_dest_dsn(connection_id)
+            rows_written = self._copy_to_postgres(transformed, dest_dsn, schema, table)
+            for child_name, child_rows in child_tables.items():
+                if child_rows:
+                    self._copy_to_postgres(child_rows, dest_dsn, schema, child_name)
 
         # Checkpoint
         self._mark_chunk_done(connection_id, chunk_seq, rows_written, last_pk=pk_end)
         log.info("InitialLoad chunk=%d done — %d rows written", chunk_seq, rows_written)
+
+    def _write_to_iceberg(self, rows: list[dict], dest: dict, table_name: str) -> int:
+        """Write rows to Iceberg via PyIceberg (DuckDB lake path)."""
+        from iceberg_writer import IcebergWriter
+        dest_config = dest.get("connection_config") or dest.get("config") or dest
+        writer = IcebergWriter(dest_config)
+        return writer.write_batch(rows, table_name=table_name)
 
     def _fetch_rows(self, connection_id: str, pk_start, pk_end) -> list[dict]:
         """Fetch rows via control-plane data-proxy endpoint."""
@@ -140,8 +154,10 @@ class CDCTransformTask:
         schema = task.get("dest_schema", "dw")
         table = task.get("dest_table", "data")
         pk_col = task.get("primary_key", "id")
+        dest = task.get("destination") or {}
+        connector_type = dest.get("connector_type") or task.get("dest_connector_type", "postgres")
 
-        log.info("CDCTransform connection=%s events=%d", connection_id, len(events))
+        log.info("CDCTransform connection=%s events=%d dest=%s", connection_id, len(events), connector_type)
 
         if not events:
             return
@@ -153,8 +169,23 @@ class CDCTransformTask:
         if to_upsert and steps:
             to_upsert, _ = self.engine.execute_pipeline(to_upsert, steps)
 
-        if dest_dsn:
+        if connector_type == "iceberg":
+            self._apply_to_iceberg(to_upsert, to_delete_pks, dest, table, pk_col)
+        elif dest_dsn:
             self._upsert(to_upsert, to_delete_pks, dest_dsn, schema, table, pk_col)
+
+    def _apply_to_iceberg(self, rows: list[dict], delete_pks: list,
+                          dest: dict, table: str, pk_col: str):
+        from iceberg_writer import IcebergWriter
+        dest_config = dest.get("connection_config") or dest.get("config") or dest
+        identifier_fields = dest_config.get("identifier_fields") or [pk_col]
+        writer = IcebergWriter(dest_config)
+        if rows:
+            writer.upsert(rows, table_name=table, identifier_fields=identifier_fields)
+        if delete_pks:
+            writer.delete(table_name=table,
+                          identifier_fields=identifier_fields,
+                          delete_keys=delete_pks)
 
     def _upsert(self, rows: list[dict], delete_pks: list,
                 dsn: str, schema: str, table: str, pk_col: str):

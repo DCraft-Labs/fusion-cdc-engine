@@ -342,6 +342,17 @@ app.add_middleware(
 # Add tenant isolation middleware (extracts tenant context from JWT)
 app.add_middleware(TenantIsolationMiddleware)
 
+# Convenience redirect: /docs → /api/docs (Swagger UI)
+from fastapi.responses import RedirectResponse  # noqa: E402
+
+@app.get("/docs", include_in_schema=False)
+async def docs_redirect():
+    return RedirectResponse(url="/api/docs")
+
+@app.get("/openapi.json", include_in_schema=False)
+async def openapi_redirect():
+    return RedirectResponse(url="/api/openapi.json")
+
 # ---------------------------------------------------------------------------
 # Request middleware: structured JSON logging + Prometheus metrics + trace_id
 # ---------------------------------------------------------------------------

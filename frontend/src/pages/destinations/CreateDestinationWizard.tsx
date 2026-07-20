@@ -1,4 +1,4 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api, fetchList } from "@/lib/api";
@@ -8,6 +8,8 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { CheckCircle, Circle, Loader2, Check, X, Minus } from "lucide-react";
+import IcebergDestinationForm from "@/components/iceberg/IcebergDestinationForm";
+import { ICEBERG_DEFAULTS, IcebergDestinationConfig, buildConnectionConfig, validateIcebergForm } from "@/lib/iceberg-config";
 
 const STEPS = ["Select Type", "Configure", "Test Connection"];
 
@@ -29,25 +31,19 @@ export function CreateDestinationWizard() {
     tunnel_auth_method: "password" as "password" | "key",
     tunnel_password: "", tunnel_private_key: "", tunnel_passphrase: "",
   });
-  const [icebergForm, setIcebergForm] = useState({
+  const [icebergForm, setIcebergForm] = useState<IcebergDestinationConfig>({
+    ...ICEBERG_DEFAULTS,
     name: "",
-    // Catalog
     catalog_type: "nessie",
-    catalog_name: "vp_terra",
-    namespace: "",
-    // Nessie
-    nessie_uri: "http://dr-shared-visapay-fusion-nessie-ds-nessie.fusion:19120/api/v2",
+    catalog_name: "fusion_cdc",
+    namespace: "fusion",
+    nessie_uri: "",
     nessie_ref: "main",
-    // Storage / Warehouse
-    storage_type: "aws",
-    warehouse: "s3a://visapay-ds-app-dr/terra/data/warehouse/",
-    s3_endpoint: "https://s3.ap-south-1.amazonaws.com",
-    s3_region: "ap-south-1",
-    aws_credentials_provider: "com.amazonaws.auth.WebIdentityTokenCredentialsProvider",
-    // Spark runtime
-    spark_env: "prod",
-    spark_master: "k8s://https://kubernetes.default.svc.cluster.local:443",
-  });
+    warehouse: "",
+    s3_endpoint: "",
+    s3_region: "us-east-1",
+    auth_mode: "access_key",
+  } as any);
   const [destId, setDestId] = useState<string | null>(null);
   const [testChecks, setTestChecks] = useState<TestCheck[]>([]);
   const [sslOpen, setSslOpen] = useState(false);
@@ -64,16 +60,16 @@ export function CreateDestinationWizard() {
       id: c.connector_type ?? c.type,
       connectorId: c.connector_id ?? c.id,
       name: c.connector_name ?? c.name,
-      icon: c.connector_type === "postgresql" || c.connector_type === "postgres" ? "🐘"
-        : c.connector_type === "iceberg" ? "🧊"
-        : c.connector_type === "snowflake" ? "❄️"
-        : c.connector_type === "bigquery" ? "📊"
-        : "🔌",
+      icon: c.connector_type === "postgresql" || c.connector_type === "postgres" ? "ðŸ˜"
+        : c.connector_type === "iceberg" ? "ðŸ§Š"
+        : c.connector_type === "snowflake" ? "â„ï¸"
+        : c.connector_type === "bigquery" ? "ðŸ“Š"
+        : "ðŸ”Œ",
       description: [
         c.supports_cdc && "CDC",
         c.supports_full_refresh && "Full Refresh",
         c.supports_incremental && "Incremental",
-      ].filter(Boolean).join(" · ") || c.connector_name,
+      ].filter(Boolean).join(" Â· ") || c.connector_name,
       disabled: false,
     }));
 
@@ -112,23 +108,10 @@ export function CreateDestinationWizard() {
         });
       }
       return api.post("/destinations", {
-        destination_name: icebergForm.name,
+        destination_name: (icebergForm as any).name,
         connector_definition_id: selectedConnector?.connector_id ?? selectedConnector?.id,
         connector_version: "1.0.0",
-        config: {
-          catalog_type: icebergForm.catalog_type,
-          catalog_name: icebergForm.catalog_name,
-          namespace: icebergForm.namespace,
-          nessie_uri: icebergForm.nessie_uri,
-          nessie_ref: icebergForm.nessie_ref,
-          storage_type: icebergForm.storage_type,
-          warehouse: icebergForm.warehouse,
-          s3_endpoint: icebergForm.s3_endpoint,
-          s3_region: icebergForm.s3_region,
-          aws_credentials_provider: icebergForm.aws_credentials_provider,
-          spark_env: icebergForm.spark_env,
-          spark_master: icebergForm.spark_master,
-        },
+        config: buildConnectionConfig(icebergForm),
       });
     },
     onSuccess: (res) => { setDestId(res.data.destination_id ?? res.data.id); setStep(2); },
@@ -137,15 +120,32 @@ export function CreateDestinationWizard() {
   const testMutation = useMutation({
     mutationFn: () => api.post(`/destinations/${destId}/test-connection`),
     onMutate: () => {
-      setTestChecks([
-        { label: "Network connectivity", status: "running" },
-        { label: "Authentication", status: "pending" },
-        { label: "Write permission", status: "pending" },
-      ]);
+      if (destType === "iceberg") {
+        setTestChecks([
+          { label: "Resolve Iceberg catalog", status: "running" },
+          { label: "List namespace", status: "pending" },
+          { label: "S3 HeadBucket / warehouse prefix", status: "pending" },
+        ]);
+      } else {
+        setTestChecks([
+          { label: "Network connectivity", status: "running" },
+          { label: "Authentication", status: "pending" },
+          { label: "Write permission", status: "pending" },
+        ]);
+      }
     },
     onSuccess: (res) => {
       const d = res.data ?? {};
       const isSuccess = d.status === "success";
+      const checks = d.checks ?? [];
+      if (destType === "iceberg" && checks.length) {
+        setTestChecks(checks.map((c: any) => ({
+          label: c.label,
+          status: c.ok ? "success" : "error",
+          message: c.message,
+        })));
+        return;
+      }
       const msg = d.message ?? d.error_details ?? undefined;
       setTestChecks([
         { label: "Network connectivity", status: isSuccess ? "success" : "error", message: isSuccess ? undefined : msg },
@@ -187,7 +187,10 @@ export function CreateDestinationWizard() {
     if (step === 0) return !!destType && !destConnectors.find((d: any) => d.id === destType)?.disabled;
     if (step === 1) {
       if (destType === "postgresql" || destType === "postgres") return pgForm.name.trim() !== "" && pgForm.host.trim() !== "" && pgForm.database.trim() !== "" && pgForm.username.trim() !== "" && pgForm.password.trim() !== "";
-      if (destType === "iceberg") return icebergForm.name.trim() !== "" && icebergForm.catalog_name.trim() !== "" && icebergForm.namespace.trim() !== "" && icebergForm.nessie_uri.trim() !== "" && icebergForm.warehouse.trim() !== "";
+      if (destType === "iceberg") {
+        const errs = validateIcebergForm(icebergForm);
+        return (icebergForm as any).name?.trim() !== "" && errs.length === 0;
+      }
     }
     return false;
   };
@@ -276,7 +279,7 @@ export function CreateDestinationWizard() {
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium">Password *</label>
-                <Input type="password" value={pgForm.password} onChange={(e) => setPgForm({ ...pgForm, password: e.target.value })} placeholder="••••••" />
+                <Input type="password" value={pgForm.password} onChange={(e) => setPgForm({ ...pgForm, password: e.target.value })} placeholder="â€¢â€¢â€¢â€¢â€¢â€¢" />
               </div>
             </div>
             <div className="space-y-2">
@@ -286,7 +289,7 @@ export function CreateDestinationWizard() {
             <div className="space-y-2">
               <label className="text-sm font-medium">Write Mode</label>
               <div className="space-y-2">
-                {([["scd1", "SCD Type 1 (Upsert)", "Latest value wins — overwrites on primary key match"], ["scd2", "SCD Type 2 (History)", "Tracks changes with valid_from/valid_to columns"], ["append", "Append Only", "Inserts all events without deduplication"]] as const).map(([val, label, desc]) => (
+                {([["scd1", "SCD Type 1 (Upsert)", "Latest value wins â€” overwrites on primary key match"], ["scd2", "SCD Type 2 (History)", "Tracks changes with valid_from/valid_to columns"], ["append", "Append Only", "Inserts all events without deduplication"]] as const).map(([val, label, desc]) => (
                   <label key={val} className={`flex items-start gap-3 rounded-md border p-3 cursor-pointer ${pgForm.write_mode === val ? "border-primary bg-primary/5" : ""}`}>
                     <input type="radio" name="write_mode" value={val} checked={pgForm.write_mode === val} onChange={() => setPgForm({ ...pgForm, write_mode: val })} className="mt-0.5" />
                     <div>
@@ -314,12 +317,12 @@ export function CreateDestinationWizard() {
                         value={pgForm.ssl_mode}
                         onChange={(e) => setPgForm({ ...pgForm, ssl_mode: e.target.value as typeof pgForm.ssl_mode })}
                       >
-                        <option value="disable">disable — no TLS</option>
-                        <option value="allow">allow — prefer plain, fallback to TLS</option>
-                        <option value="prefer">prefer — prefer TLS, fallback to plain</option>
-                        <option value="require">require — TLS required, skip cert verify</option>
-                        <option value="verify-ca">verify-ca — verify server cert against CA</option>
-                        <option value="verify-full">verify-full — verify cert + hostname</option>
+                        <option value="disable">disable â€” no TLS</option>
+                        <option value="allow">allow â€” prefer plain, fallback to TLS</option>
+                        <option value="prefer">prefer â€” prefer TLS, fallback to plain</option>
+                        <option value="require">require â€” TLS required, skip cert verify</option>
+                        <option value="verify-ca">verify-ca â€” verify server cert against CA</option>
+                        <option value="verify-full">verify-full â€” verify cert + hostname</option>
                       </select>
                     </div>
                     {(pgForm.ssl_mode === "verify-ca" || pgForm.ssl_mode === "verify-full") && (
@@ -388,7 +391,7 @@ export function CreateDestinationWizard() {
                     {pgForm.tunnel_auth_method === "password" ? (
                       <div className="space-y-1">
                         <label className="text-xs font-medium">SSH Password *</label>
-                        <Input type="password" value={pgForm.tunnel_password} onChange={(e) => setPgForm({ ...pgForm, tunnel_password: e.target.value })} placeholder="••••••" />
+                        <Input type="password" value={pgForm.tunnel_password} onChange={(e) => setPgForm({ ...pgForm, tunnel_password: e.target.value })} placeholder="â€¢â€¢â€¢â€¢â€¢â€¢" />
                       </div>
                     ) : (
                       <div className="space-y-3">
@@ -412,12 +415,12 @@ export function CreateDestinationWizard() {
                         <Button type="button" size="sm" variant="outline"
                           onClick={() => { setTunnelTestResult(null); tunnelTestMutation.mutate(); }}
                           disabled={tunnelTestMutation.isPending}>
-                          {tunnelTestMutation.isPending ? "Testing tunnel…" : "Test SSH Tunnel"}
+                          {tunnelTestMutation.isPending ? "Testing tunnelâ€¦" : "Test SSH Tunnel"}
                         </Button>
                         {tunnelTestResult && (
                           tunnelTestResult.status === "success"
-                            ? <p className="text-xs text-green-600">✓ {tunnelTestResult.message}</p>
-                            : <p className="text-xs text-destructive">✗ {tunnelTestResult.message}</p>
+                            ? <p className="text-xs text-green-600">âœ“ {tunnelTestResult.message}</p>
+                            : <p className="text-xs text-destructive">âœ— {tunnelTestResult.message}</p>
                         )}
                       </div>
                     )}
@@ -432,113 +435,11 @@ export function CreateDestinationWizard() {
         <Card>
           <CardHeader><CardTitle>Configure Apache Iceberg Destination</CardTitle></CardHeader>
           <CardContent className="space-y-6">
-            {/* Basic */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Destination Name *</label>
-              <Input value={icebergForm.name} onChange={(e) => setIcebergForm({ ...icebergForm, name: e.target.value })} placeholder="e.g. Data Lake - Iceberg" />
+              <Input value={(icebergForm as any).name ?? ""} onChange={(e) => setIcebergForm({ ...icebergForm, name: e.target.value } as any)} placeholder="e.g. Data Lake - Iceberg" />
             </div>
-
-            {/* Catalog */}
-            <div className="space-y-3">
-              <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">Iceberg Catalog</h3>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Catalog Type</label>
-                  <Select value={icebergForm.catalog_type} onValueChange={(v) => setIcebergForm({ ...icebergForm, catalog_type: v })}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="nessie">Nessie</SelectItem>
-                      <SelectItem value="hive">Hive Metastore</SelectItem>
-                      <SelectItem value="rest">REST Catalog</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Catalog Name *</label>
-                  <Input value={icebergForm.catalog_name} onChange={(e) => setIcebergForm({ ...icebergForm, catalog_name: e.target.value })} placeholder="e.g. vp_terra" />
-                </div>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Namespace *</label>
-                <Input value={icebergForm.namespace} onChange={(e) => setIcebergForm({ ...icebergForm, namespace: e.target.value })} placeholder="e.g. raw_bank" />
-              </div>
-            </div>
-
-            {/* Nessie */}
-            {icebergForm.catalog_type === "nessie" && (
-              <div className="space-y-3">
-                <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">Nessie Settings</h3>
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Nessie URI *</label>
-                  <Input value={icebergForm.nessie_uri} onChange={(e) => setIcebergForm({ ...icebergForm, nessie_uri: e.target.value })} placeholder="http://nessie-service:19120/api/v2" />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Nessie Branch / Ref</label>
-                  <Input value={icebergForm.nessie_ref} onChange={(e) => setIcebergForm({ ...icebergForm, nessie_ref: e.target.value })} placeholder="main" />
-                </div>
-              </div>
-            )}
-
-            {/* Storage / Warehouse */}
-            <div className="space-y-3">
-              <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">Storage &amp; Warehouse</h3>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Storage Type</label>
-                <div className="flex gap-4">
-                  {([ ["aws", "AWS S3"], ["azure", "Azure Blob"], ["gcs", "Google GCS"] ] as [string, string][]).map(([val, label]) => (
-                    <label key={val} className={`flex items-center gap-2 rounded-md border px-4 py-2 cursor-pointer ${icebergForm.storage_type === val ? "border-primary bg-primary/5" : ""}`}>
-                      <input type="radio" name="storage_type" value={val} checked={icebergForm.storage_type === val} onChange={() => setIcebergForm({ ...icebergForm, storage_type: val })} />
-                      <span className="text-sm">{label}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Warehouse Path *</label>
-                <Input value={icebergForm.warehouse} onChange={(e) => setIcebergForm({ ...icebergForm, warehouse: e.target.value })} placeholder="s3a://my-bucket/warehouse/" />
-              </div>
-              {icebergForm.storage_type === "aws" && (
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">S3 Endpoint</label>
-                    <Input value={icebergForm.s3_endpoint} onChange={(e) => setIcebergForm({ ...icebergForm, s3_endpoint: e.target.value })} placeholder="https://s3.ap-south-1.amazonaws.com" />
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">S3 Region</label>
-                    <Input value={icebergForm.s3_region} onChange={(e) => setIcebergForm({ ...icebergForm, s3_region: e.target.value })} placeholder="ap-south-1" />
-                  </div>
-                </div>
-              )}
-              {icebergForm.storage_type === "aws" && (
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">AWS Credentials Provider</label>
-                  <Input value={icebergForm.aws_credentials_provider} onChange={(e) => setIcebergForm({ ...icebergForm, aws_credentials_provider: e.target.value })} placeholder="com.amazonaws.auth.WebIdentityTokenCredentialsProvider" />
-                </div>
-              )}
-            </div>
-
-            {/* Spark Runtime */}
-            <div className="space-y-3">
-              <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">Spark Runtime</h3>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Environment</label>
-                <div className="flex gap-4">
-                  {([ ["prod", "Production (Kubernetes)"], ["dev", "Development (local[*])"] ] as [string, string][]).map(([val, label]) => (
-                    <label key={val} className={`flex items-center gap-2 rounded-md border px-4 py-2 cursor-pointer ${icebergForm.spark_env === val ? "border-primary bg-primary/5" : ""}`}>
-                      <input type="radio" name="spark_env" value={val} checked={icebergForm.spark_env === val} onChange={() => setIcebergForm({ ...icebergForm, spark_env: val })} />
-                      <span className="text-sm">{label}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-              {icebergForm.spark_env === "prod" && (
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Spark Master URL</label>
-                  <Input value={icebergForm.spark_master} onChange={(e) => setIcebergForm({ ...icebergForm, spark_master: e.target.value })} placeholder="k8s://https://kubernetes.default.svc.cluster.local:443" />
-                  <p className="text-xs text-muted-foreground">Kubernetes API server URL for spark-on-k8s. Leave default for in-cluster.</p>
-                </div>
-              )}
-            </div>
+            <IcebergDestinationForm form={icebergForm} setForm={setIcebergForm} />
           </CardContent>
         </Card>
       )}
@@ -576,11 +477,11 @@ export function CreateDestinationWizard() {
       {/* Navigation */}
       <div className="flex justify-between">
         <Button variant="outline" onClick={() => step > 0 ? setStep(step - 1) : navigate("/destinations")}>
-          {step === 0 ? "Cancel" : "← Back"}
+          {step === 0 ? "Cancel" : "â† Back"}
         </Button>
         {step < 2 && (
           <Button onClick={() => { if (step === 0) setStep(1); else if (step === 1) createMutation.mutate(); }} disabled={!canProceed() || createMutation.isPending}>
-            {createMutation.isPending ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Creating...</> : "Next →"}
+            {createMutation.isPending ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Creating...</> : "Next â†’"}
           </Button>
         )}
       </div>

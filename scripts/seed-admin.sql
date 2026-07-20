@@ -26,6 +26,8 @@ DECLARE
   v_mysql_src_def_id  uuid;
   v_mongo_src_def_id  uuid;
   v_pg_dst_def_id     uuid;  -- assigned from v_pg_src_def_id (same connector)
+  v_iceberg_dst_def_id uuid;
+  v_s3_dst_def_id     uuid;
   v_source_id         uuid;
   v_dest_id           uuid;
 BEGIN
@@ -160,6 +162,71 @@ BEGIN
     category = EXCLUDED.category
   RETURNING connector_id INTO v_mongo_src_def_id;
 
+  -- Apache Iceberg destination connector (DuckDB/PyIceberg lake path)
+  INSERT INTO connector_definitions (
+    connector_name, connector_type, category, latest_version,
+    default_config, required_fields, optional_fields, default_resource_limits,
+    supports_cdc, supports_full_refresh, supports_incremental,
+    documentation_url, is_active
+  )
+  VALUES (
+    'Apache Iceberg', 'iceberg', 'destination', '1.0.0',
+    '{
+      "catalog_type": "nessie",
+      "catalog_name": "fusion_cdc",
+      "namespace": "fusion",
+      "warehouse": "s3://iceberg-warehouse/fusion-cdc/",
+      "auth_mode": "access_key",
+      "format_version": 2,
+      "parquet_compression": "zstd",
+      "object_storage_enabled": true,
+      "partitioned_paths": true,
+      "cdc_apply_strategy": "upsert"
+    }'::jsonb,
+    '["catalog_type","catalog_name","namespace","warehouse","auth_mode"]'::jsonb,
+    '["nessie_uri","nessie_ref","catalog_uri","catalog_oauth_token","rest_sigv4","hive_uri","glue_region","glue_endpoint","glue_account_id","glue_skip_archive","sql_catalog_uri","dynamodb_table","s3_endpoint","s3_region","s3_path_style","s3_force_virtual_addressing","s3_proxy_uri","s3_anonymous","sse_type","sse_kms_key_id","aws_access_key_id","aws_secret_access_key","aws_session_token","aws_region","aws_profile","parent_credential_mode","parent_role_arn","target_role_arn","external_id","role_session_name","assume_role_timeout_sec","sts_region","service_account_role_arn","same_creds_for_catalog_and_s3","s3_access_key_id","s3_secret_access_key","s3_session_token","format_version","parquet_compression","object_storage_enabled","partitioned_paths","cdc_apply_strategy","write_metadata_delete_after_commit","spark_master","spark_image"]'::jsonb,
+    '{"cpu": "1000m", "memory": "1024Mi"}'::jsonb,
+    true, true, true,
+    'https://docs.dcraftfusion.io/connectors/iceberg',
+    true
+  )
+  ON CONFLICT (connector_name) DO UPDATE SET
+    connector_type = EXCLUDED.connector_type,
+    category = EXCLUDED.category
+  RETURNING connector_id INTO v_iceberg_dst_def_id;
+
+  -- Amazon S3 destination connector (catalog on S3; warehouse via Iceberg)
+  INSERT INTO connector_definitions (
+    connector_name, connector_type, category, latest_version,
+    default_config, required_fields, optional_fields, default_resource_limits,
+    supports_cdc, supports_full_refresh, supports_incremental,
+    documentation_url, is_active
+  )
+  VALUES (
+    'Amazon S3', 's3', 'destination', '1.0.0',
+    '{
+      "catalog_type": "sql",
+      "catalog_name": "fusion_s3",
+      "namespace": "fusion",
+      "warehouse": "s3://iceberg-warehouse/fusion-cdc/",
+      "auth_mode": "access_key",
+      "format_version": 2,
+      "parquet_compression": "zstd",
+      "object_storage_enabled": true,
+      "partitioned_paths": true
+    }'::jsonb,
+    '["warehouse","auth_mode","aws_region"]'::jsonb,
+    '["s3_endpoint","s3_path_style","sse_type","sse_kms_key_id","aws_access_key_id","aws_secret_access_key","aws_session_token","target_role_arn","external_id","service_account_role_arn"]'::jsonb,
+    '{"cpu": "1000m", "memory": "1024Mi"}'::jsonb,
+    true, true, true,
+    'https://docs.dcraftfusion.io/connectors/s3',
+    true
+  )
+  ON CONFLICT (connector_name) DO UPDATE SET
+    connector_type = EXCLUDED.connector_type,
+    category = EXCLUDED.category
+  RETURNING connector_id INTO v_s3_dst_def_id;
+
   -- ──────────────────────────────────────────────────────────────────────────
   -- 4. Sample source — local pg-source (wal_level=logical, port 5434)
   --    password 'cdc_password' encrypted with ENCRYPTION_KEY from .env.local
@@ -226,6 +293,46 @@ BEGIN
   END IF;
 
   -- ──────────────────────────────────────────────────────────────────────────
+  -- 5b. Sample destination — Iceberg on MinIO via Nessie (DuckDB/PyIceberg path)
+  -- ──────────────────────────────────────────────────────────────────────────
+  INSERT INTO destinations (
+    destination_name, connector_definition_id, connector_version,
+    host, port, database_name, schema_name, username, password_encrypted,
+    ssl_enabled, ssl_config, config,
+    status, created_at, updated_at
+  )
+  VALUES (
+    'Local Iceberg (MinIO + Nessie)',
+    v_iceberg_dst_def_id,
+    '1.0.0',
+    '', 5432, '', 'fusion', '', '',
+    false, '{}'::jsonb,
+    '{
+      "catalog_type": "nessie",
+      "catalog_name": "fusion_cdc",
+      "namespace": "fusion",
+      "nessie_uri": "http://nessie:19120/api/v2",
+      "nessie_ref": "main",
+      "warehouse": "s3://iceberg-warehouse/fusion-cdc/",
+      "s3_endpoint": "http://minio:9000",
+      "s3_region": "us-east-1",
+      "s3_path_style": true,
+      "auth_mode": "access_key",
+      "aws_access_key_id": "minio",
+      "aws_secret_access_key": "minio123",
+      "aws_region": "us-east-1",
+      "format_version": 2,
+      "parquet_compression": "zstd",
+      "object_storage_enabled": true,
+      "partitioned_paths": true,
+      "cdc_apply_strategy": "upsert"
+    }'::jsonb,
+    'active',
+    NOW(), NOW()
+  )
+  ON CONFLICT DO NOTHING;
+
+  -- ──────────────────────────────────────────────────────────────────────────
   -- 6. Sample connection — pg-source → pg-dest, REALTIME CDC
   -- ──────────────────────────────────────────────────────────────────────────
   INSERT INTO connections (
@@ -261,9 +368,10 @@ BEGIN
 
   RAISE NOTICE '=== Seed complete ===';
   RAISE NOTICE 'Admin login  : admin / Admin@123';
-  RAISE NOTICE 'Connector defs: PostgreSQL SOURCE, MySQL SOURCE, MongoDB SOURCE, PostgreSQL DESTINATION';
+  RAISE NOTICE 'Connector defs: PostgreSQL SOURCE, MySQL SOURCE, MongoDB SOURCE, PostgreSQL DESTINATION, Apache Iceberg DESTINATION, Amazon S3 DESTINATION';
   RAISE NOTICE 'Source       : Local PostgreSQL Source  (pg-source:5432/source_db)';
-  RAISE NOTICE 'Destination  : Local PostgreSQL Destination (postgres-dest:5432/fusion_dw)';
+  RAISE NOTICE 'Destinations : Local PostgreSQL Destination (postgres-dest:5432/fusion_dw)';
+  RAISE NOTICE '             : Local Iceberg (MinIO + Nessie) — s3://iceberg-warehouse/fusion-cdc/';
   RAISE NOTICE 'Connection   : pg-source → pg-dest (REALTIME CDC)';
 
 END

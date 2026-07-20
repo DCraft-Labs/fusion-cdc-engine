@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table";
 import { CheckCircle, Circle, ChevronDown, ChevronRight, Plus, X, Zap } from "lucide-react";
+import StreamIcebergPartitionEditor from "@/components/iceberg/StreamIcebergPartitionEditor";
 
 const STEPS = ["Source", "Destination", "Streams & Transforms", "Config", "Review"];
 
@@ -70,6 +71,10 @@ interface StreamConfig {
   expanded: boolean;
   // table-level UDFs applied after column transforms
   table_udfs: Array<{ function_name: string; args: string; output_column: string }>;
+  // Iceberg lake path (per-stream)
+  partition_spec?: Array<{ source_column: string; transform: string; name?: string; width?: number }>;
+  identifier_fields?: string[];
+  iceberg_namespace?: string;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -88,7 +93,7 @@ function buildTransformSpec(stream: StreamConfig): Record<string, any> | undefin
       if (t.type === "string_op") { step.op = t.op || "upper"; step.params = t.params || {}; }
       if (t.type === "math_op") step.expression = t.expression || "";
       if (t.type === "mask") step.strategy = t.strategy || "last4";
-      if (t.type === "expression") { step.expression = t.expression || ""; step.language = t.language || "spark_sql"; }
+      if (t.type === "expression") { step.expression = t.expression || ""; step.language = t.language || "duckdb_sql"; }
       if (t.type === "udf") { step.function = t.function_name || ""; step.args = t.udf_args || []; }
       if (t.type === "json_flatten_inline") step.keep_original = t.keep_original ?? false;
       if (t.type === "json_flatten_child") { step.child_table = t.child_table || ""; step.array_path = t.array_path || "$[*]"; }
@@ -230,10 +235,11 @@ function TransformStepEditor({
         <>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground w-20 shrink-0">Language:</span>
-            <Select value={step.language || "spark_sql"} onValueChange={(v) => set({ language: v })}>
+            <Select value={step.language || "duckdb_sql"} onValueChange={(v) => set({ language: v })}>
               <SelectTrigger className="h-6 text-xs py-0"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="spark_sql">SQL Expression</SelectItem>
+                <SelectItem value="duckdb_sql">DuckDB SQL</SelectItem>
+                <SelectItem value="spark_sql">Spark SQL (legacy)</SelectItem>
                 <SelectItem value="sel">SEL (simple)</SelectItem>
               </SelectContent>
             </Select>
@@ -541,6 +547,10 @@ export function CreateConnectionWizard() {
             cursor_field: s.cursor_field || null,
             is_enabled: true,
             transform_steps: transform_steps ?? null,
+            // Iceberg lake path (per-stream)
+            partition_spec: s.partition_spec ?? null,
+            identifier_fields: s.identifier_fields ?? (s.primary_key ? [s.primary_key] : []),
+            iceberg_namespace: s.iceberg_namespace ?? null,
           };
         }),
         resource_limits:
@@ -557,6 +567,9 @@ export function CreateConnectionWizard() {
 
   const selectedSource = sources.find((s: any) => s.source_id === sourceId);
   const selectedDest = destinations.find((d: any) => d.destination_id === destinationId);
+  const isIcebergDestination = (selectedDest as any)?.connector_type === "iceberg"
+    || (selectedDest as any)?.connector_definition_type === "iceberg"
+    || (selectedDest as any)?.config?.catalog_type != null;
 
   const sourcesByType = sources.reduce((acc: Record<string, any[]>, s: any) => {
     const type = s.connector_definition_type ?? "other";
@@ -737,6 +750,29 @@ export function CreateConnectionWizard() {
                             placeholder={stream.sync_mode === "cdc" ? "(auto — binlog)" : "updated_at"}
                           />
                         </div>
+
+                        {/* Iceberg lake path — partition_spec + identifier_fields */}
+                        {isIcebergDestination && (
+                          <div className="px-4 py-3 border-b bg-blue-50/40">
+                            <StreamIcebergPartitionEditor
+                              partitionSpec={stream.partition_spec ?? []}
+                              setPartitionSpec={(spec) => updateStream(idx, { partition_spec: spec })}
+                              identifierFields={stream.identifier_fields ?? (stream.primary_key ? [stream.primary_key] : [])}
+                              setIdentifierFields={(fields) => updateStream(idx, { identifier_fields: fields })}
+                              availableColumns={stream.columns.map((c) => c.column_name)}
+                              sourcePrimaryKeys={stream.columns.filter((c) => c.is_primary_key).map((c) => c.column_name)}
+                            />
+                            <div className="mt-2 flex items-center gap-3 text-xs">
+                              <span className="text-muted-foreground w-32 shrink-0">Iceberg namespace override:</span>
+                              <Input
+                                className="h-6 text-xs py-0 max-w-xs"
+                                value={stream.iceberg_namespace ?? ""}
+                                onChange={(e) => updateStream(idx, { iceberg_namespace: e.target.value })}
+                                placeholder="(use destination default)"
+                              />
+                            </div>
+                          </div>
+                        )}
 
                         {/* Column list with transforms */}
                         {stream.columns.length === 0 ? (

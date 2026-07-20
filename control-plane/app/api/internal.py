@@ -454,6 +454,15 @@ def upsert_checkpoints(
         count += 1
 
     db.commit()
+    # Audit hook: checkpoint.update (worker → control-plane)
+    db.add(AuditLog(
+        action="checkpoint.update",
+        resource_type="checkpoint",
+        resource_id=UUID(payload.source_id) if payload.source_id else None,
+        status="success",
+        details={"worker_id": payload.worker_id, "upserted": count},
+    ))
+    db.commit()
     return CheckpointBatchResponse(upserted=count)
 
 
