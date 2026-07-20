@@ -6,11 +6,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM node:20-alpine AS builder
+# debian builder — avoids Alpine/musl lightningcss native binary failures
+FROM node:20-bookworm-slim AS builder
 
 WORKDIR /app
 
-# Cache deps separately from source
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
