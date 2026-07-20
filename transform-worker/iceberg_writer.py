@@ -32,6 +32,13 @@ def load_catalog(dest_config: dict):
     settings: dict[str, Any] = {}
     creds = _resolve_credentials(dest_config)
 
+    # Warehouse is required by all catalogs to resolve table locations
+    # (PyIceberg key: `warehouse`). Without this, create_table() raises
+    # "No default path is set, please specify a location when creating a table".
+    warehouse = _normalize_warehouse(dest_config.get("warehouse", ""))
+    if warehouse:
+        settings["warehouse"] = warehouse
+
     if catalog_type == "rest":
         settings["uri"] = dest_config["catalog_uri"]
         if dest_config.get("catalog_oauth_token"):
@@ -63,8 +70,11 @@ def load_catalog(dest_config: dict):
     s3 = _resolve_s3_settings(dest_config, creds)
     settings.update(s3)
 
-    # PyIceberg expects settings under `catalog.<name>.*` or passed to load_catalog
-    return _load(catalog_name, **{f"catalog.{catalog_name}.{k}": v for k, v in settings.items()})
+    # PyIceberg 0.7.1: load_catalog(name, **properties) takes FLAT property keys
+    # (e.g. `uri=...`, `glue.region=...`, `s3.endpoint=...`). The `catalog.<name>.*`
+    # prefix is only used for env vars / yaml config — passing prefixed kwargs here
+    # causes `infer_catalog_type` to miss `uri` and raise "URI missing".
+    return _load(catalog_name, **settings)
 
 
 def _resolve_credentials(dest_config: dict) -> dict:
@@ -182,7 +192,9 @@ def _build_partition_spec(table_schema, partition_spec_cfg):
             transform=transform,
             name=name,
         ))
-    return PartitionSpec(fields) if fields else PartitionSpec(())
+    # PyIceberg 0.7.1: PartitionSpec.__init__ takes *args (varargs), not a list.
+    # PartitionSpec([pf]) raises ValidationError; must use PartitionSpec(*fields).
+    return PartitionSpec(*fields) if fields else PartitionSpec()
 
 
 def _build_table_properties(dest_config: dict) -> dict:
@@ -216,13 +228,24 @@ def _get_or_create_table(catalog, namespace: str, table_name: str,
         log.info("Creating Iceberg table %s.%s", namespace, table_name)
         partition_spec = _build_partition_spec_from_arrow(arrow_schema, dest_config.get("partition_spec", []))
         props = _build_table_properties(dest_config)
-        identifier_fields = dest_config.get("identifier_fields", [])
+        # PyIceberg 0.7.1: Catalog.create_table() does NOT accept an
+        # `identifier_fields` kwarg (TypeError: unexpected keyword argument).
+        # Identifier fields must be set on the PyIceberg Schema via
+        # `identifier_field_ids=[field_id, ...]`, but the Arrow schema produced
+        # by `pa.Table.from_pylist` has nullable fields with no field IDs, so
+        # attaching `identifier_field_ids` here raises
+        # "Identifier field -1 invalid: not a required field".
+        # We therefore create the table WITHOUT identifier fields on 0.7.1.
+        # The `identifier_fields` config is still consumed by `IcebergWriter.upsert`
+        # (delete+append) and `IcebergWriter.delete` (In-filter), so CDC correctness
+        # does not depend on schema-level identifier fields. When the project
+        # upgrades to PyIceberg >= 0.11, switch to `table.upsert(join_cols=...)`
+        # and re-enable schema-level identifier fields here.
         return catalog.create_table(
             identifier=f"{namespace}.{table_name}",
             schema=arrow_schema,
             partition_spec=partition_spec,
             properties=props,
-            identifier_fields=identifier_fields or None,
         )
 
 
@@ -265,7 +288,8 @@ def _build_partition_spec_from_arrow(arrow_schema, partition_spec_cfg):
             transform=transform,
             name=name,
         ))
-    return PartitionSpec(fields) if fields else PartitionSpec(())
+    # PyIceberg 0.7.1: PartitionSpec.__init__ takes *args (varargs), not a list.
+    return PartitionSpec(*fields) if fields else PartitionSpec()
 
 # ─── Public writer API ───────────────────────────────────────────────────────
 class IcebergWriter:
@@ -299,7 +323,16 @@ class IcebergWriter:
 
     def upsert(self, rows: list[dict], table_name: str,
                identifier_fields: list[str]) -> int:
-        """Apply upsert on identifier fields (PyIceberg table.upsert())."""
+        """Apply upsert on identifier fields (PyIceberg table.upsert()).
+
+        PyIceberg 0.7.1 does NOT implement `Table.upsert()` — it was added
+        in 0.11.0. The previous fallback to `table.overwrite()` was
+        semantically WRONG: `overwrite` replaces the entire table data with
+        just the new batch, losing all previously-committed rows. We now
+        emulate upsert as delete(matching keys) + append, which is the
+        standard pattern for older PyIceberg (and what the 0.11+ `upsert`
+        does under the hood for non-merge-on-read catalogs).
+        """
         if not rows:
             return 0
         table_data = _rows_to_arrow(rows)
@@ -307,11 +340,20 @@ class IcebergWriter:
             self.catalog, self.namespace, table_name,
             table_data.schema, self.dest_config,
         )
-        try:
+        if hasattr(table, "upsert"):
             table.upsert(table_data, join_cols=identifier_fields)
-        except AttributeError:
-            # Older PyIceberg — fall back to overwrite
-            table.overwrite(table_data)
+        else:
+            # PyIceberg 0.7.1 path: delete matching rows then append.
+            col = identifier_fields[0] if identifier_fields else None
+            if col:
+                keys = [r[col] for r in rows if r.get(col) is not None]
+                if keys:
+                    from pyiceberg.expressions import In
+                    try:
+                        table.delete(In(col, keys))
+                    except Exception:
+                        log.exception("Iceberg upsert: delete-before-append failed for %d keys", len(keys))
+            table.append(table_data)
         return len(rows)
 
     def delete(self, table_name: str, identifier_fields: list[str],

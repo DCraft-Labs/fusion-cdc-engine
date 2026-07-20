@@ -230,6 +230,13 @@ BEGIN
   -- ──────────────────────────────────────────────────────────────────────────
   -- 4. Sample source — local pg-source (wal_level=logical, port 5434)
   --    password 'cdc_password' encrypted with ENCRYPTION_KEY from .env.local
+  --
+  --    NOTE: the unique constraint on sources is (sub_tenant_id, source_name) and
+  --    this seed inserts with sub_tenant_id = NULL. Postgres treats NULL as
+  --    distinct in UNIQUE constraints by default, so `ON CONFLICT DO NOTHING`
+  --    does NOT match existing rows with NULL sub_tenant_id → re-running the
+  --    seed would insert duplicates. We use a `WHERE NOT EXISTS` guard instead
+  --    to make the seed truly idempotent.
   -- ──────────────────────────────────────────────────────────────────────────
   INSERT INTO sources (
     source_name, connector_definition_id, connector_version,
@@ -237,7 +244,7 @@ BEGIN
     ssl_enabled, ssl_config, config,
     status, created_at, updated_at
   )
-  VALUES (
+  SELECT
     'Local PostgreSQL Source',
     v_pg_src_def_id,
     '1.0.0',
@@ -251,17 +258,19 @@ BEGIN
     '{"replication_plugin": "pgoutput", "replication_slot": "fusion_slot", "publication": "fusion_pub"}'::jsonb,
     'active',
     NOW(), NOW()
+  WHERE NOT EXISTS (
+    SELECT 1 FROM sources WHERE source_name = 'Local PostgreSQL Source' AND sub_tenant_id IS NULL
   )
-  ON CONFLICT DO NOTHING
   RETURNING source_id INTO v_source_id;
 
   IF v_source_id IS NULL THEN
-    SELECT source_id INTO v_source_id FROM sources WHERE source_name = 'Local PostgreSQL Source';
+    SELECT source_id INTO v_source_id FROM sources WHERE source_name = 'Local PostgreSQL Source' AND sub_tenant_id IS NULL;
   END IF;
 
   -- ──────────────────────────────────────────────────────────────────────────
   -- 5. Sample destination — local postgres-dest (port 5433)
   --    password 'dw_password' encrypted with ENCRYPTION_KEY from .env.local
+  --    (uses WHERE NOT EXISTS guard — see note on sources above.)
   -- ──────────────────────────────────────────────────────────────────────────
   INSERT INTO destinations (
     destination_name, connector_definition_id, connector_version,
@@ -269,7 +278,7 @@ BEGIN
     ssl_enabled, ssl_config, config,
     status, created_at, updated_at
   )
-  VALUES (
+  SELECT
     'Local PostgreSQL Destination',
     v_pg_dst_def_id,
     '1.0.0',
@@ -284,16 +293,18 @@ BEGIN
     '{"batch_size": 1000}'::jsonb,
     'active',
     NOW(), NOW()
+  WHERE NOT EXISTS (
+    SELECT 1 FROM destinations WHERE destination_name = 'Local PostgreSQL Destination' AND sub_tenant_id IS NULL
   )
-  ON CONFLICT DO NOTHING
   RETURNING destination_id INTO v_dest_id;
 
   IF v_dest_id IS NULL THEN
-    SELECT destination_id INTO v_dest_id FROM destinations WHERE destination_name = 'Local PostgreSQL Destination';
+    SELECT destination_id INTO v_dest_id FROM destinations WHERE destination_name = 'Local PostgreSQL Destination' AND sub_tenant_id IS NULL;
   END IF;
 
   -- ──────────────────────────────────────────────────────────────────────────
   -- 5b. Sample destination — Iceberg on MinIO via Nessie (DuckDB/PyIceberg path)
+  --    (uses WHERE NOT EXISTS guard — see note on sources above.)
   -- ──────────────────────────────────────────────────────────────────────────
   INSERT INTO destinations (
     destination_name, connector_definition_id, connector_version,
@@ -301,7 +312,7 @@ BEGIN
     ssl_enabled, ssl_config, config,
     status, created_at, updated_at
   )
-  VALUES (
+  SELECT
     'Local Iceberg (MinIO + Nessie)',
     v_iceberg_dst_def_id,
     '1.0.0',
@@ -329,11 +340,13 @@ BEGIN
     }'::jsonb,
     'active',
     NOW(), NOW()
-  )
-  ON CONFLICT DO NOTHING;
+  WHERE NOT EXISTS (
+    SELECT 1 FROM destinations WHERE destination_name = 'Local Iceberg (MinIO + Nessie)' AND sub_tenant_id IS NULL
+  );
 
   -- ──────────────────────────────────────────────────────────────────────────
   -- 6. Sample connection — pg-source → pg-dest, REALTIME CDC
+  --    (uses WHERE NOT EXISTS guard — see note on sources above.)
   -- ──────────────────────────────────────────────────────────────────────────
   INSERT INTO connections (
     connection_name, source_id, destination_id,
@@ -344,7 +357,7 @@ BEGIN
     schema_evolution_policy, initial_load_completed,
     created_by, created_at, updated_at
   )
-  VALUES (
+  SELECT
     'pg-source → pg-dest (REALTIME)',
     v_source_id,
     v_dest_id,
@@ -363,8 +376,9 @@ BEGIN
     false,
     v_user_id,
     NOW(), NOW()
-  )
-  ON CONFLICT DO NOTHING;
+  WHERE NOT EXISTS (
+    SELECT 1 FROM connections WHERE connection_name = 'pg-source → pg-dest (REALTIME)' AND sub_tenant_id IS NULL
+  );
 
   RAISE NOTICE '=== Seed complete ===';
   RAISE NOTICE 'Admin login  : admin / Admin@123';
