@@ -334,6 +334,18 @@ async def login(
         details={"roles": roles},
         ip_address=get_client_ip(request),
     )
+    # Canonical action name expected by scripts/e2e/audit_metadata.py
+    create_audit_log(
+        db=db,
+        action="user.login",
+        status="success",
+        user_id=str(user.user_id),
+        username=user.username,
+        resource_type="user",
+        resource_id=str(user.user_id),
+        details={"roles": roles},
+        ip_address=get_client_ip(request),
+    )
     
     return TokenResponse(
         access_token=access_token,

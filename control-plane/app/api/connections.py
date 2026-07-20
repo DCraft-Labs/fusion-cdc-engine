@@ -15,6 +15,7 @@ from app.models.connection import Connection, Stream
 from app.models.source_destination import Source, Destination
 from app.models.connector import ConnectorDefinition
 from app.models.monitoring import ConnectionRun, CheckpointState, InitialLoadCheckpoint
+from app.services.audit_log import record_audit
 from app.schemas.connection import (
     ConnectionCreate,
     ConnectionUpdate,
@@ -443,6 +444,15 @@ async def create_connection(
     db.commit()
     db.refresh(connection)
 
+    record_audit(
+        db,
+        "connection.create",
+        user=current_user,
+        resource_type="connection",
+        resource_id=str(connection.connection_id),
+        details={"connection_name": connection.connection_name, "sync_mode": connection.sync_mode},
+    )
+
     # Trigger initial sync automatically if connection is created as active
     if connection.status == "active":
         connection.initial_load_started_at = datetime.utcnow()
@@ -586,10 +596,19 @@ async def update_connection(
     
     db.commit()
     db.refresh(connection)
-    
+
+    record_audit(
+        db,
+        "connection.update",
+        user=current_user,
+        resource_type="connection",
+        resource_id=str(connection.connection_id),
+        details={"fields": list(update_dict.keys())},
+    )
+
     # Load relationships
     db.refresh(connection, ["source", "destination", "streams"])
-    
+
     return ConnectionResponse.model_validate(connection)
 
 
@@ -988,11 +1007,29 @@ async def trigger_manual_sync(
     )
     db.add(run)
 
+    record_audit(
+        db,
+        "connection.sync",
+        user=current_user,
+        resource_type="connection",
+        resource_id=str(connection_id),
+        details={"sync_type": sync_type, "run_number": next_run_number},
+    )
+
     # Mark initial load started if first sync
     if is_first_sync:
         connection.initial_load_started_at = datetime.utcnow()
 
     _trigger_dag_or_worker(connection, db)
+
+    record_audit(
+        db,
+        "connection_run.start",
+        user=current_user,
+        resource_type="connection_run",
+        resource_id=str(run.run_id),
+        details={"connection_id": str(connection_id), "run_number": next_run_number, "sync_type": sync_type},
+    )
 
     # For CDC/streaming connections: check worker health immediately.
     # A CDC "trigger" is fire-and-confirm — the run completes once the worker
@@ -1078,6 +1115,15 @@ async def trigger_manual_sync(
             run.completed_at = datetime.utcnow()
             run.error_message = None
             run.run_config = {**run.run_config, "snapshot": _snapshot}
+
+            record_audit(
+                db,
+                "connection_run.complete",
+                user=current_user,
+                resource_type="connection_run",
+                resource_id=str(run.run_id),
+                details={"connection_id": str(connection_id), "sync_type": sync_type, "snapshot": _snapshot},
+            )
 
     db.commit()
 

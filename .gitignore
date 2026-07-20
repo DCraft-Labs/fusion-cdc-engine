@@ -17,3 +17,7 @@ coverage/
 
 # Playwright CLI local cache
 .playwright-cli/
+
+.venv-audit/
+_audit_*.py
+

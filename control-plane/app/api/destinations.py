@@ -15,6 +15,7 @@ from app.models.auth import AuditLog, User
 from app.models.source_destination import Destination
 from app.models.connector import ConnectorDefinition
 from app.models.connection import Connection
+from app.services.audit_log import record_audit
 from app.schemas.destination import (
     DestinationCreate,
     DestinationUpdate,
@@ -362,7 +363,16 @@ async def create_destination(
     db.add(destination)
     db.commit()
     db.refresh(destination)
-    
+
+    record_audit(
+        db,
+        "destination.create",
+        user=current_user,
+        resource_type="destination",
+        resource_id=str(destination.destination_id),
+        details={"destination_name": destination.destination_name, "connector_type": connector.connector_type},
+    )
+
     # Load connector definition for response
     db.refresh(destination, ["connector_definition"])
     
@@ -557,11 +567,20 @@ async def update_destination(
     
     db.commit()
     db.refresh(destination)
-    
+
+    record_audit(
+        db,
+        "destination.update",
+        user=current_user,
+        resource_type="destination",
+        resource_id=str(destination.destination_id),
+        details={"fields": list(update_data.keys())},
+    )
+
     # Mask password
     response_data = DestinationResponse.model_validate(destination)
     response_data.password = "********"
-    
+
     return response_data
 
 
@@ -666,7 +685,7 @@ async def test_destination_connection(
     
     # Test connection
     success, message, latency_ms = _test_database_connection(destination, override_params)
-    
+
     # Update destination if test used actual credentials (no override)
     if not override_params:
         destination.connection_test_status = "success" if success else "failed"
@@ -674,7 +693,17 @@ async def test_destination_connection(
         destination.connection_test_at = datetime.utcnow()
         _maybe_activate_destination(destination, db)
         db.commit()
-    
+
+    record_audit(
+        db,
+        "destination.test",
+        user=current_user,
+        resource_type="destination",
+        resource_id=str(destination.destination_id),
+        status="success" if success else "failure",
+        details={"message": message, "latency_ms": latency_ms},
+    )
+
     return ConnectionTestResponse(
         status="success" if success else "failed",
         message=message,

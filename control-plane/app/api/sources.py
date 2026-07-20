@@ -36,6 +36,7 @@ from app.schemas.source import (
     SourceStats,
 )
 from app.auth.dependencies import get_current_user, require_permission
+from app.services.audit_log import record_audit
 
 
 router = APIRouter()
@@ -757,7 +758,16 @@ async def create_source(
     db.add(db_source)
     db.commit()
     db.refresh(db_source)
-    
+
+    record_audit(
+        db,
+        "source.create",
+        user=current_user,
+        resource_type="source",
+        resource_id=str(db_source.source_id),
+        details={"source_name": db_source.source_name, "connector_type": connector_def.connector_type},
+    )
+
     # Load connector definition for response
     db.refresh(db_source, attribute_names=['connector_definition'])
     
@@ -899,11 +909,20 @@ async def update_source(
         setattr(source, field, value)
     
     source.updated_at = datetime.utcnow()
-    
+
     db.commit()
     db.refresh(source)
     db.refresh(source, attribute_names=['connector_definition'])
-    
+
+    record_audit(
+        db,
+        "source.update",
+        user=current_user,
+        resource_type="source",
+        resource_id=str(source.source_id),
+        details={"fields": list(update_data.keys())},
+    )
+
     response = SourceResponse.from_orm(source)
     response.connector_definition_name = source.connector_definition.connector_name
     response.connector_definition_type = source.connector_definition.connector_type

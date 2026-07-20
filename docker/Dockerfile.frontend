@@ -12,7 +12,10 @@ FROM node:20-bookworm-slim AS builder
 WORKDIR /app
 
 COPY frontend/package.json frontend/package-lock.json* ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+# Use npm install (not npm ci) — npm bug #4828 drops rolldown's optional
+# native binding (@rolldown/binding-linux-x64-gnu) when using `npm ci`.
+# Vite 8 depends on rolldown, so the build fails with "Cannot find native binding".
+RUN npm install --no-audit --no-fund
 
 COPY frontend/ .
 
@@ -40,6 +43,8 @@ RUN printf 'server {\n\
     listen 8080;\n\
     root /usr/share/nginx/html;\n\
     index index.html;\n\
+    charset utf-8;\n\
+    charset_types text/css text/plain text/xml application/json application/javascript text/javascript;\n\
     location /api/ {\n\
         proxy_pass http://fusion-control-plane-svc:8000/api/;\n\
         proxy_set_header Host $host;\n\

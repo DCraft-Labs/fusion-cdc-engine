@@ -1,55 +1,80 @@
 # E2E Metadata Audit
 
-This file is **generated** by `scripts/e2e/audit_metadata.py` after a CDC E2E run.
-It records per-table row counts, audit-log events, and any missing audit hooks.
+Generated: `2026-07-20T16:27:50.229415Z`
+DSN: `postgresql://fusion:fusion_local@127.0.0.1:55432/fusion_cdc_metadata`
 
-## Regenerate
+## Table row counts
 
-```bash
-# After running the E2E driver (see docs/CDC_E2E.md)
-python scripts/e2e/audit_metadata.py \
-  --dsn postgresql://fusion_user:fusion_password@localhost:5432/fusion_cdc_metadata \
-  --out docs/E2E_METADATA_AUDIT.md
-```
+| Table | Rows | Has data |
+|-------|------|----------|
+| `users` | 1 | yes |
+| `roles` | 1 | yes |
+| `user_roles` | 1 | yes |
+| `connector_definitions` | 6 | yes |
+| `sources` | 1 | yes |
+| `destinations` | 2 | yes |
+| `connections` | 1 | yes |
+| `connection_runs` | 0 | NO |
+| `connection_run_events` | -1 | NO |
+| `checkpoint_state` | -1 | NO |
+| `audit_logs` | -1 | NO |
 
-## What the audit checks
+## Audit log events
 
-### Expected tables
-- `users`, `roles`, `user_roles` — RBAC seeded by `seed-admin.sql`
-- `connector_definitions` — 6 connectors (3 sources + 3 destinations)
-- `sources`, `destinations`, `connections` — created during E2E
-- `connection_runs`, `connection_run_events` — one run per sync trigger
-- `checkpoint_state` — one row per (worker, source, schema, table) during initial load
-- `audit_logs` — every state-changing operation
+_(audit_log table empty or not queryable)_
 
-### Expected audit events (`audit_logs.action`)
-| Event | Fired by |
-|-------|----------|
-| `user.login` | auth login handler |
-| `source.create` / `source.update` | sources API |
-| `destination.create` / `destination.update` / `destination.test` | destinations API |
-| `connection.create` / `connection.update` / `connection.sync` | connections API |
-| `connection_run.start` / `connection_run.complete` | sync orchestrator |
-| `checkpoint.update` | control-plane `/api/v1/internal/checkpoints/batch` (called by transform-worker) |
-| `connection.batch_run.success` / `.error` | `/api/v1/internal/connections/{id}/run-complete` (Airflow callback) |
+## Missing audit events
+
+The following expected audit events did not fire during the E2E run:
+
+- `user.login`
+- `source.create`
+- `source.update`
+- `destination.create`
+- `destination.update`
+- `destination.test`
+- `connection.create`
+- `connection.update`
+- `connection.sync`
+- `connection_run.start`
+- `connection_run.complete`
+- `checkpoint.update`
+
+### Recommended fixes
+
+Add audit-log writes in the control-plane handlers listed below. Each
+should call `audit_log.record(user_id, event_type, entity_id, payload)`
+after the DB transaction commits:
+
+| Event | Handler |
+|-------|---------|
+| `user.login` | `app/api/auth.py::login` |
+| `source.create` | `app/api/sources.py::create_source` |
+| `destination.create` | `app/api/destinations.py::create_destination` |
+| `destination.test` | `app/api/destinations.py::test_connection` |
+| `connection.create` | `app/api/connections.py::create_connection` |
+| `connection.sync` | `app/api/connections.py::trigger_sync` |
+| `connection_run.start` | `app/services/sync_orchestrator.py::start_run` |
+| `connection_run.complete` | `app/services/sync_orchestrator.py::complete_run` |
+| `checkpoint.update` | `transform-worker/loader.py::_mark_chunk_done` (via control-plane `/internal/load-checkpoints`) |
+
+## Empty tables
+
+The following tables have zero rows after E2E — verify the E2E actually
+exercised the code path that writes them:
+
+- `connection_runs`
+
+## Missing tables
+
+The following tables could not be queried — they may not exist or the
+schema is out of date. Run `alembic upgrade head` in the control plane:
+
+- `connection_run_events`
+- `checkpoint_state`
+- `audit_logs`
 
 ## Verdict
 
-> The committed version of this file is a placeholder. Run the audit script
-> after a full E2E to populate it. A green audit (no missing events, no empty
-> tables) is a release gate for v1.2.0.
+❌ **FAIL** — see sections above for missing items.
 
-## Known gaps to fix before release
-
-The audit script will report any of these if they are still missing at audit
-time. Track them in the v1.2.0 milestone:
-
-1. **`destination.test`** — the test-connection endpoint must write an audit
-   entry with the test result + checks array.
-2. **`checkpoint.update`** — the transform-worker calls
-   `/internal/load-checkpoints` after each chunk; the control-plane handler
-   must write an audit entry.
-3. **`connection_run.complete`** — the sync orchestrator must write the audit
-   entry on both success and failure paths (currently only success).
-4. **Iceberg writer heartbeats** — `cdc_workers` / `worker_heartbeats` should
-   show the transform-worker as healthy with `last_heartbeat_at` within 60s.
