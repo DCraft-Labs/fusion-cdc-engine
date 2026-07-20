@@ -1,0 +1,256 @@
+# Fusion CDC Engine — Kubernetes NetworkPolicies
+# Spec §5 (PDF4): "Define Kubernetes NetworkPolicies to restrict pod communication.
+#   Only allow DB host workers to connect to source databases, Redis, Postgres and the
+#   control plane. Deny all other traffic."
+
+---
+# Default-deny all ingress + egress for the fusion namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: fusion
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# Allow control-plane pods to receive API traffic from ingress controller
+# and to reach Postgres metadata DB and Redis
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app: fusion-control-plane
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Accept traffic from the ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Accept health-check probes from the kubelet (node-local)
+    - ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # Reach Postgres metadata DB
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Reach Redis cluster
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # DNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# Allow CDC workers to reach source databases, Redis, Postgres checkpoints
+# and the control-plane internal API only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cdc-workers
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app: cdc-worker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only the control-plane may push assignments / pull heartbeats
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fusion-control-plane
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Prometheus scraper
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # Control-plane internal API
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fusion-control-plane
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Redis for publishing CDC events
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # External source databases (MySQL, Postgres, MongoDB) — allow all egress on
+    # common DB ports; tighten further by adding ipBlock CIDRs for your DW hosts
+    - ports:
+        - protocol: TCP
+          port: 3306   # MySQL
+        - protocol: TCP
+          port: 5432   # PostgreSQL
+        - protocol: TCP
+          port: 27017  # MongoDB
+    # DNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# Allow Spark driver/executor pods to reach Redis and destination DBs
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-spark-consumer
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app: spark-consumer
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Schema-reload webhook from control-plane
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fusion-control-plane
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Spark executor → driver communication
+    - from:
+        - podSelector:
+            matchLabels:
+              app: spark-consumer
+  egress:
+    # Redis source streams
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Postgres destination DW
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Iceberg object storage (S3/Azure/GCS) — requires egress to internet on 443
+    - ports:
+        - protocol: TCP
+          port: 443
+    # Spark executor inter-pod
+    - to:
+        - podSelector:
+            matchLabels:
+              app: spark-consumer
+    # Control-plane (fetch transform specs)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fusion-control-plane
+      ports:
+        - protocol: TCP
+          port: 8000
+    # DNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# Allow Redis pods to accept connections from workers, spark and control-plane
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: cdc-worker
+        - podSelector:
+            matchLabels:
+              app: spark-consumer
+        - podSelector:
+            matchLabels:
+              app: fusion-control-plane
+      ports:
+        - protocol: TCP
+          port: 6379
+
+---
+# Allow Postgres (metadata DB) to accept connections from control-plane only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fusion-control-plane
+        - podSelector:
+            matchLabels:
+              app: spark-consumer
+      ports:
+        - protocol: TCP
+          port: 5432

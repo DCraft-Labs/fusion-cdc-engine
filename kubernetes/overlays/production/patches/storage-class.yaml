@@ -1,0 +1,17 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Production Storage Class Patch — use EBS gp3 instead of hostpath
+# ─────────────────────────────────────────────────────────────────────────────
+# Postgres Meta PVC
+- op: replace
+  path: /spec/volumeClaimTemplates/0/spec/storageClassName
+  target:
+    kind: StatefulSet
+    name: fusion-postgres-meta
+  value: gp3
+# Redis PVC
+- op: replace
+  path: /spec/volumeClaimTemplates/0/spec/storageClassName
+  target:
+    kind: StatefulSet
+    name: fusion-redis
+  value: gp3

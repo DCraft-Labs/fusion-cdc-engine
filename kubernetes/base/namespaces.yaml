@@ -1,0 +1,18 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Kubernetes Namespaces
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fusion
+  labels:
+    app.kubernetes.io/part-of: fusion-cdc
+    environment: production
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fusion-monitoring
+  labels:
+    app.kubernetes.io/part-of: fusion-cdc
+    environment: production

@@ -1,0 +1,95 @@
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+# Requires: Prometheus Operator (kube-prometheus-stack)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}-control-plane-monitor
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fusion-cdc.labels" . | nindent 4 }}
+    release: prometheus   # match kube-prometheus-stack default selector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name }}-control-plane
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}-cdc-worker-monitor
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fusion-cdc.labels" . | nindent 4 }}
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: cdc-worker
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ .Release.Name }}-alerts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fusion-cdc.labels" . | nindent 4 }}
+    release: prometheus
+spec:
+  groups:
+    - name: fusion-cdc.rules
+      interval: 30s
+      rules:
+        - alert: CDCWorkerDown
+          expr: up{job="fusion-cdc-worker"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "CDC Worker {{ "{{" }} $labels.pod {{ "}}" }} is down"
+            description: "CDC Worker has been down for more than 2 minutes"
+
+        - alert: CDCStreamLagHigh
+          expr: cdc_stream_lag_seconds > 30
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CDC stream lag exceeds 30s"
+            description: "Tenant={{ "{{" }} $labels.tenant {{ "}}" }} source={{ "{{" }} $labels.source {{ "}}" }} lag={{ "{{" }} $value {{ "}}" }}s"
+
+        - alert: CDCFallbackQueueGrowing
+          expr: cdc_fallback_queue_length > 1000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CDC fallback queue has >1000 events"
+            description: "Redis may be down or slow — fallback queue growing"
+
+        - alert: CDCErrorRateHigh
+          expr: rate(cdc_errors_total[5m]) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CDC error rate > 1/s"
+            description: "High error rate for {{ "{{" }} $labels.tenant {{ "}}" }}/{{ "{{" }} $labels.source {{ "}}" }}"
+
+        - alert: ControlPlaneDown
+          expr: up{job="fusion-control-plane"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Control Plane is unreachable"
+{{- end }}

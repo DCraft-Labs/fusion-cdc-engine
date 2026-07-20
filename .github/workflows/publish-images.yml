@@ -1,0 +1,82 @@
+name: Publish CDC images
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-cdc-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish-${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: control-plane
+            image: fusion-cdc-control-plane
+            file: docker/Dockerfile.control-plane
+            platforms: linux/amd64,linux/arm64
+          - name: worker
+            image: fusion-cdc-worker
+            file: docker/Dockerfile.cdc-worker
+            platforms: linux/amd64,linux/arm64
+          - name: frontend
+            image: fusion-cdc-frontend
+            file: docker/Dockerfile.frontend
+            platforms: linux/amd64,linux/arm64
+          - name: spark-consumer
+            image: fusion-cdc-spark-consumer
+            file: docker/Dockerfile.spark-consumer
+            platforms: linux/amd64
+          - name: transform-worker
+            image: fusion-cdc-transform-worker
+            file: docker/Dockerfile.transform-worker
+            platforms: linux/amd64,linux/arm64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Derive tags
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${GITHUB_REF_NAME}"
+          if [[ "$REF" == v* ]]; then SEMVER="${REF#v}"; else SEMVER="0.0.0-${GITHUB_SHA:0:12}"; fi
+          SHA_SHORT="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+          IMAGE="ghcr.io/dcraft-labs/${{ matrix.image }}"
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:latest"
+            echo "${IMAGE}:${SEMVER}"
+            echo "${IMAGE}:sha-${SHA_SHORT}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}

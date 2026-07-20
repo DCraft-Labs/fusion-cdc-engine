@@ -1,0 +1,61 @@
+{{/* NOTES.txt — printed after helm install */}}
+🚀 Fusion CDC Engine has been deployed!
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+Version: {{ .Chart.AppVersion }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SERVICES DEPLOYED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.controlPlane.enabled }}
+  ✅ Control Plane API     → http://{{ .Release.Name }}-control-plane-svc:8000
+{{- end }}
+{{- if .Values.cdcWorkers.postgres.enabled }}
+  ✅ CDC Worker (Postgres) → StatefulSet cdc-worker-postgres ({{ .Values.cdcWorkers.postgres.replicas }} replica)
+{{- end }}
+{{- if .Values.cdcWorkers.mysql.enabled }}
+  ✅ CDC Worker (MySQL)    → StatefulSet cdc-worker-mysql ({{ .Values.cdcWorkers.mysql.replicas }} replica)
+{{- end }}
+{{- if .Values.cdcWorkers.mongodb.enabled }}
+  ✅ CDC Worker (MongoDB)  → StatefulSet cdc-worker-mongodb ({{ .Values.cdcWorkers.mongodb.replicas }} replica)
+{{- end }}
+{{- if .Values.sparkConsumer.enabled }}
+  ✅ Spark Consumer        → Deployment fusion-spark-consumer
+{{- end }}
+{{- if .Values.redis.enabled }}
+  ✅ Redis                 → {{ .Release.Name }}-redis-master:6379
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HEALTH CHECK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  kubectl port-forward svc/{{ .Release.Name }}-control-plane-svc 8000:8000 -n {{ .Release.Namespace }}
+  curl http://localhost:8000/api/v1/monitoring/health
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INITIAL SETUP (run once)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. Apply database migrations:
+     kubectl exec -n {{ .Release.Namespace }} deploy/{{ .Release.Name }}-control-plane -- \
+       alembic upgrade head
+
+  2. Create your first admin user:
+     kubectl exec -n {{ .Release.Namespace }} deploy/{{ .Release.Name }}-control-plane -- \
+       python scripts/create_admin.py
+
+  3. View API docs:
+     kubectl port-forward svc/{{ .Release.Name }}-control-plane-svc 8000:8000 -n {{ .Release.Namespace }}
+     open http://localhost:8000/api/docs
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  SECURITY REMINDER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  The default secrets in this release are PLACEHOLDERS.
+  Rotate them IMMEDIATELY in production:
+
+  helm upgrade {{ .Release.Name }} fusion-cdc/fusion-cdc \
+    --set controlPlane.secrets.secretKey=$(openssl rand -hex 32) \
+    --set controlPlane.secrets.encryptionKey=$(openssl rand -hex 16) \
+    --set controlPlane.secrets.workerTokenSecret=$(openssl rand -hex 32) \
+    --set cdcWorkers.workerToken=$(openssl rand -hex 32)

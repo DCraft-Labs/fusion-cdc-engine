@@ -1,0 +1,45 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — ConfigMap (non-sensitive configuration)
+# Secrets are managed separately via kubernetes/secrets.yaml
+# or external-secrets-operator + Vault/AWS Secrets Manager in production.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fusion-config
+  namespace: fusion
+  labels:
+    app.kubernetes.io/part-of: fusion-cdc
+data:
+  # Control-plane
+  LOG_LEVEL: "INFO"
+  ENVIRONMENT: "production"
+  ALGORITHM: "HS256"
+  ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+  CORS_ORIGINS: "https://app.dcraftfusion.io"
+
+  # CDC Worker
+  METRICS_PORT: "8081"
+  CHECKPOINT_DB_PATH: "/tmp/cdc/checkpoints.db"    # emptyDir, write-ahead buffer
+  FALLBACK_DB_PATH: "/tmp/cdc/fallback.db"
+  REDIS_STREAM_MAXLEN: "100000"
+  CHECKPOINT_SYNC_INTERVAL: "30"
+  FALLBACK_DRAIN_INTERVAL: "60"
+  HEARTBEAT_INTERVAL: "15"
+  MAX_CONCURRENT_TABLES: "30"
+
+  # Transform Worker (DuckDB replaces Spark)
+  DUCKDB_THREADS: "2"
+  DUCKDB_MEMORY_LIMIT: "3GB"
+  HIGH_PRIORITY_QUEUE: "fusion:transforms:high"
+  NORMAL_PRIORITY_QUEUE: "fusion:transforms:normal"
+
+  # Service discovery — internal cluster DNS
+  # These are correct for both local (Docker Desktop K8s) and production (EKS)
+  CONTROL_PLANE_URL: "http://fusion-control-plane-svc.fusion.svc.cluster.local:8000"
+  REDIS_URL: "redis://fusion-redis-master.fusion.svc.cluster.local:6379/0"
+  KAFKA_BOOTSTRAP_SERVERS: "fusion-kafka.fusion.svc.cluster.local:9092"
+  POSTGRES_META_HOST: "fusion-postgres-meta.fusion.svc.cluster.local"
+  POSTGRES_META_PORT: "5432"
+  POSTGRES_META_DB: "fusion_cdc_metadata"
+

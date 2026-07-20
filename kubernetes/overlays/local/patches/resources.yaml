@@ -1,0 +1,163 @@
+# Strategic merge patch: reduce resource requests for local dev
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fusion-control-plane
+  namespace: fusion
+spec:
+  replicas: 1
+  template:
+    spec:
+      # Docker Desktop is single-node — remove zone spread constraint
+      topologySpreadConstraints: []
+      # Named user "fusion" (uid=999) needs numeric runAsUser for K8s runAsNonRoot check
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: control-plane
+          # Use locally-built image (not in remote registry)
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-cdc-worker
+  namespace: fusion
+spec:
+  template:
+    spec:
+      containers:
+        - name: cdc-worker
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-cdc-worker
+  namespace: fusion
+spec:
+  template:
+    spec:
+      containers:
+        - name: cdc-worker
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongo-cdc-worker
+  namespace: fusion
+spec:
+  template:
+    spec:
+      containers:
+        - name: cdc-worker
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fusion-cdc-consumer
+  namespace: fusion
+spec:
+  template:
+    spec:
+      containers:
+        - name: cdc-consumer
+          # Needs headroom for initial-load of large tables (800k+ rows)
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fusion-transform-worker
+  namespace: fusion
+spec:
+  template:
+    spec:
+      containers:
+        - name: transform-worker
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "3Gi"
+          env:
+            - name: DUCKDB_MEMORY_LIMIT
+              value: "1GB"
+---
+# Reduce Kafka resources for local dev
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: fusion-kafka
+  namespace: fusion
+spec:
+  template:
+    spec:
+      containers:
+        - name: kafka
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          env:
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xmx512m -Xms128m"
+      initContainers:
+        - name: kafka-init
+          env:
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xmx128m -Xms64m"
+---
+# Fix storageClass for Docker Desktop (uses "hostpath" not "standard")
+# Note: volumeClaimTemplates cannot be patched via strategic merge.
+# The base manifests already use "hostpath" — this is a no-op in local overlay
+# (the sed fix already updated the base). This comment confirms the fix.

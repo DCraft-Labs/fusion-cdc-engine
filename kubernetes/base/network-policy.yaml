@@ -1,0 +1,207 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Network Policies
+#
+# Zero-trust model:
+#   control-plane  ← ingress from: ingress-controller, cdc-workers, spark-consumer
+#                  → egress to: postgres-meta, redis
+#   cdc-worker     → egress to: control-plane, redis, source DBs (Postgres/MySQL/MongoDB)
+#   spark-consumer → egress to: control-plane, redis, postgres-dest
+#   All other pod-to-pod traffic: DENIED
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Default deny all ingress + egress in the fusion namespace ─────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: fusion
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# ── DNS egress (all pods need DNS) ────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: fusion
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+---
+# ── Control Plane: ingress ────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: control-plane-ingress
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  policyTypes:
+    - Ingress
+  ingress:
+    # From nginx-ingress / load balancer
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8000
+    # From CDC workers (heartbeat + checkpoint sync)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: cdc-worker
+      ports:
+        - port: 8000
+    # From Spark consumer
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: spark-consumer
+      ports:
+        - port: 8000
+    # Prometheus scraping
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fusion-monitoring
+      ports:
+        - port: 8000
+
+---
+# ── Control Plane: egress ─────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: control-plane-egress
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  policyTypes:
+    - Egress
+  egress:
+    # Postgres metadata DB
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres-meta
+      ports:
+        - port: 5432
+    # Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - port: 6379
+
+---
+# ── CDC Workers: egress ───────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cdc-worker-egress
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: cdc-worker
+  policyTypes:
+    - Egress
+  egress:
+    # Control-plane API
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: control-plane
+      ports:
+        - port: 8000
+    # Redis (event publishing)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - port: 6379
+    # Source Postgres (replication protocol)
+    - ports:
+        - port: 5432
+          protocol: TCP
+    # Source MySQL (binlog protocol)
+    - ports:
+        - port: 3306
+          protocol: TCP
+    # Source MongoDB (change streams)
+    - ports:
+        - port: 27017
+          protocol: TCP
+
+---
+# ── CDC Workers: ingress (Prometheus only) ────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cdc-worker-ingress
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: cdc-worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fusion-monitoring
+      ports:
+        - port: 8080
+
+---
+# ── Spark Consumer: egress ────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spark-consumer-egress
+  namespace: fusion
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: spark-consumer
+  policyTypes:
+    - Egress
+  egress:
+    # Control-plane
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: control-plane
+      ports:
+        - port: 8000
+    # Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - port: 6379
+    # Destination Postgres
+    - ports:
+        - port: 5432
+          protocol: TCP

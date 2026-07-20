@@ -1,0 +1,62 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Transform Worker (DuckDB, replaces Spark)
+#
+# Image: fusion/transform-worker:local
+# Purpose: Run all 10 transform types via DuckDB + write to Postgres / Iceberg
+#
+# Bigger than cdc-worker (needs DuckDB, polars, pyarrow, pyiceberg)
+# but scale-to-zero means this cost only incurs when transforms run.
+# ─────────────────────────────────────────────────────────────────────────────
+ARG PYTHON_VERSION=3.11
+
+# ── Stage 1: builder ──────────────────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        default-libmysqlclient-dev \
+        libpq-dev \
+        libssl-dev \
+        libffi-dev \
+        pkg-config \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY transform-worker/requirements.txt ./requirements.txt
+
+RUN pip install --upgrade pip \
+    && pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+# ── Stage 2: production ───────────────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim AS runtime
+
+LABEL org.opencontainers.image.title="fusion-transform-worker" \
+      org.opencontainers.image.description="Fusion CDC Engine – Transform Worker (DuckDB)" \
+      org.opencontainers.image.vendor="Fusion" \
+      org.opencontainers.image.version="2.0.0"
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+        libssl3 \
+        default-mysql-client \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 2001 -r transform \
+    && useradd -r -u 2001 -g transform -d /app -s /sbin/nologin transform
+
+COPY --from=builder /install /usr/local
+COPY transform-worker/ .
+
+RUN mkdir -p /tmp/duckdb \
+    && chown -R transform:transform /app /tmp/duckdb
+
+USER transform
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD pgrep -f "worker.py" || exit 1
+
+CMD ["python", "worker.py"]

@@ -1,0 +1,24 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Local Overlay — ConfigMap Patch
+# Override prod values with local-friendly equivalents
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fusion-config
+  namespace: fusion
+data:
+  ENVIRONMENT: "local"
+  LOG_LEVEL: "DEBUG"
+
+  # Allow the UI served by NodePort 30080 to call the API
+  CORS_ORIGINS: "http://localhost:30080,http://localhost:3000"
+
+  # Control plane reachable via NodePort 30800 from outside the cluster
+  # but inside the cluster it still uses ClusterIP DNS — do NOT change CONTROL_PLANE_URL
+  CONTROL_PLANE_URL: "http://fusion-control-plane-svc.fusion.svc.cluster.local:8000"
+  REDIS_URL: "redis://fusion-redis-master.fusion.svc.cluster.local:6379/0"
+
+  # DuckDB local limits
+  DUCKDB_THREADS: "1"
+  DUCKDB_MEMORY_LIMIT: "1GB"

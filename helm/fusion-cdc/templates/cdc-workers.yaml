@@ -1,0 +1,125 @@
+{{/*
+CDC Worker StatefulSet template — instantiated once per enabled source type
+*/}}
+{{- define "fusion-cdc.workerStatefulSet" -}}
+{{- $root := index . 0 -}}
+{{- $sourceType := index . 1 -}}
+{{- $cfg := index . 2 -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $root.Release.Name }}-cdc-worker-{{ $sourceType }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $root.Release.Name }}-cdc-worker-{{ $sourceType }}
+    app.kubernetes.io/component: cdc-worker
+    app.kubernetes.io/part-of: fusion-cdc
+    cdc.dcraftfusion.io/source-type: {{ $sourceType }}
+spec:
+  serviceName: {{ $root.Release.Name }}-cdc-worker-{{ $sourceType }}-headless
+  replicas: {{ $cfg.replicas }}
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $root.Release.Name }}-cdc-worker-{{ $sourceType }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $root.Release.Name }}-cdc-worker-{{ $sourceType }}
+        app.kubernetes.io/component: cdc-worker
+        cdc.dcraftfusion.io/source-type: {{ $sourceType }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ $root.Values.cdcWorkers.metricsPort }}"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ $root.Release.Name }}-cdc-worker-sa
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cdc-worker
+          image: {{ include "fusion-cdc.workerImage" $root }}
+          imagePullPolicy: {{ $root.Values.cdcWorkers.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ $root.Values.cdcWorkers.metricsPort }}
+          env:
+            - name: CDC_SOURCE_TYPE
+              value: {{ $sourceType | quote }}
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CONTROL_PLANE_URL
+              value: {{ include "fusion-cdc.controlPlaneURL" $root | quote }}
+            - name: REDIS_URL
+              value: "redis://{{ include "fusion-cdc.redisHost" $root }}:6379/0"
+            - name: METRICS_PORT
+              value: {{ $root.Values.cdcWorkers.metricsPort | quote }}
+            - name: WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Release.Name }}-secrets
+                  key: WORKER_TOKEN
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: {{ $root.Values.cdcWorkers.metricsPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: {{ $root.Values.cdcWorkers.metricsPort }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            {{- toYaml $cfg.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml $root.Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: cdc-data
+              mountPath: /var/lib/cdc
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: cdc-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $cfg.storageClass }}
+        resources:
+          requests:
+            storage: {{ $cfg.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $root.Release.Name }}-cdc-worker-{{ $sourceType }}-headless
+  namespace: {{ $root.Release.Namespace }}
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: {{ $root.Release.Name }}-cdc-worker-{{ $sourceType }}
+  ports:
+    - name: metrics
+      port: {{ $root.Values.cdcWorkers.metricsPort }}
+{{- end }}
+
+{{- if .Values.cdcWorkers.postgres.enabled }}
+{{ include "fusion-cdc.workerStatefulSet" (list . "postgres" .Values.cdcWorkers.postgres) }}
+{{- end }}
+
+{{- if .Values.cdcWorkers.mysql.enabled }}
+{{ include "fusion-cdc.workerStatefulSet" (list . "mysql" .Values.cdcWorkers.mysql) }}
+{{- end }}
+
+{{- if .Values.cdcWorkers.mongodb.enabled }}
+{{ include "fusion-cdc.workerStatefulSet" (list . "mongodb" .Values.cdcWorkers.mongodb) }}
+{{- end }}

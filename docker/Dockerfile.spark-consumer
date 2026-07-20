@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Spark Consumer
+# Uses bitnami/spark as base (Java 11 + Spark 3.5 pre-installed)
+# Python deps added via pip on top.
+# ─────────────────────────────────────────────────────────────────────────────
+ARG SPARK_VERSION=3.5.0
+ARG PYTHON_VERSION=3.11
+
+# ── Stage 1: Python dependency builder ───────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim AS pybuilder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        libpq-dev \
+        libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY spark-consumer/requirements.txt ./requirements.txt
+
+RUN pip install --upgrade pip \
+    && pip install --prefix=/pyinstall --no-cache-dir -r requirements.txt
+
+# ── Stage 2: Spark runtime ────────────────────────────────────────────────────
+FROM bitnami/spark:3.5 AS runtime
+
+LABEL org.opencontainers.image.title="fusion-spark-consumer" \
+      org.opencontainers.image.description="Fusion CDC Engine – Spark Consumer" \
+      org.opencontainers.image.vendor="Fusion" \
+      org.opencontainers.image.version="2.0.0"
+
+USER root
+
+# Install Python 3.11 and psycopg2 runtime deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 \
+        python3.11-dev \
+        python3-pip \
+        libpq5 \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python
+
+# Copy Python packages from pybuilder
+COPY --from=pybuilder /pyinstall /usr/local
+
+# Set PySpark to use the system Python 3.11
+ENV PYSPARK_PYTHON=/usr/local/bin/python3
+ENV PYSPARK_DRIVER_PYTHON=/usr/local/bin/python3
+ENV PYTHONPATH=/opt/fusion:$PYTHONPATH
+
+WORKDIR /opt/fusion
+
+COPY spark-consumer/ .
+
+# Checkpoints directory (override via SPARK_CHECKPOINT_DIR env)
+RUN mkdir -p /var/lib/spark/checkpoints \
+    && chown -R 1001:1001 /opt/fusion /var/lib/spark/checkpoints
+
+USER 1001
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python3 -c "import consumer.streaming_consumer; print('OK')" || exit 1
+
+EXPOSE 4040 8080
+
+# Default: run in REALTIME streaming mode
+# Override with: docker run ... python -m consumer.batch_consumer
+CMD ["python", "-m", "consumer.streaming_consumer"]

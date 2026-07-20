@@ -1,0 +1,476 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — CDC Workers (3 Deployments, KEDA-scaled)
+#
+# DESIGN: Pods are STATELESS. Checkpoint authority = postgres-meta DB.
+# SQLite is a write-ahead buffer only (emptyDir, not PVC).
+# Any pod can pick up any source by pulling checkpoint on startup.
+# Source exclusivity enforced via Redis distributed lock (TTL=30s, heartbeat=15s).
+#
+# MySQL server_id = hash(source_id) % MAX_INT → stable per source, not per pod.
+# Postgres WAL slot exclusivity = Redis lock (only lock-holder consumes slot).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MySQL CDC Worker
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-cdc-worker
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: mysql-cdc-worker
+    app.kubernetes.io/component: cdc-worker
+    app.kubernetes.io/part-of: fusion-cdc
+    cdc.dcraftfusion.io/source-type: mysql
+spec:
+  replicas: 1               # KEDA manages actual replica count
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mysql-cdc-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mysql-cdc-worker
+        app.kubernetes.io/component: cdc-worker
+        app.kubernetes.io/part-of: fusion-cdc
+        cdc.dcraftfusion.io/source-type: mysql
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: fusion-cdc-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cdc-worker
+          image: fusion/cdc-worker:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: CDC_SOURCE_TYPE
+              value: mysql
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name   # pod name = unique worker id
+            - name: CONTROL_PLANE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: CONTROL_PLANE_URL
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: REDIS_URL
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: ENCRYPTION_KEY
+            - name: WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: WORKER_TOKEN
+            - name: METADATA_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: METADATA_DB_DSN
+            - name: CHECKPOINT_DB_PATH
+              value: /tmp/cdc/checkpoints.db   # emptyDir — write-ahead buffer only
+            - name: FALLBACK_DB_PATH
+              value: /tmp/cdc/fallback.db
+            - name: MAX_CONCURRENT_TABLES
+              value: "30"
+            - name: HEARTBEAT_INTERVAL
+              value: "15"
+            - name: CHECKPOINT_SYNC_INTERVAL
+              value: "30"
+          volumeMounts:
+            - name: tmp-cdc
+              mountPath: /tmp/cdc
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      volumes:
+        - name: tmp-cdc
+          emptyDir:
+            sizeLimit: 500Mi   # SQLite write-ahead buffer, not primary storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-cdc-worker-svc
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: mysql-cdc-worker
+spec:
+  selector:
+    app.kubernetes.io/name: mysql-cdc-worker
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+  type: ClusterIP
+---
+# KEDA: scale based on how many MySQL sources are assigned in Redis
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: mysql-cdc-worker-scaler
+  namespace: fusion
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mysql-cdc-worker
+  minReplicaCount: 1          # always 1 pod listening for assignments
+  maxReplicaCount: 50
+  cooldownPeriod: 300          # 5 min: allow binlog streams to close cleanly
+  pollingInterval: 10
+  triggers:
+    - type: redis
+      metadata:
+        address: fusion-redis-master.fusion.svc.cluster.local:6379
+        listName: fusion:assigned:mysql
+        listLength: "30"       # 1 pod per 30 assigned sources
+
+---
+# ══════════════════════════════════════════════════════════════════════════════
+# PostgreSQL CDC Worker
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-cdc-worker
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: postgres-cdc-worker
+    app.kubernetes.io/component: cdc-worker
+    app.kubernetes.io/part-of: fusion-cdc
+    cdc.dcraftfusion.io/source-type: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres-cdc-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres-cdc-worker
+        app.kubernetes.io/component: cdc-worker
+        app.kubernetes.io/part-of: fusion-cdc
+        cdc.dcraftfusion.io/source-type: postgres
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: fusion-cdc-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cdc-worker
+          image: fusion/cdc-worker:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: CDC_SOURCE_TYPE
+              value: postgres
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CONTROL_PLANE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: CONTROL_PLANE_URL
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: REDIS_URL
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: ENCRYPTION_KEY
+            - name: WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: WORKER_TOKEN
+            - name: METADATA_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: METADATA_DB_DSN
+            - name: CHECKPOINT_DB_PATH
+              value: /tmp/cdc/checkpoints.db
+            - name: FALLBACK_DB_PATH
+              value: /tmp/cdc/fallback.db
+            - name: MAX_CONCURRENT_TABLES
+              value: "30"
+            - name: HEARTBEAT_INTERVAL
+              value: "15"
+            - name: CHECKPOINT_SYNC_INTERVAL
+              value: "30"
+          volumeMounts:
+            - name: tmp-cdc
+              mountPath: /tmp/cdc
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      volumes:
+        - name: tmp-cdc
+          emptyDir:
+            sizeLimit: 500Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-cdc-worker-svc
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: postgres-cdc-worker
+spec:
+  selector:
+    app.kubernetes.io/name: postgres-cdc-worker
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+  type: ClusterIP
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: postgres-cdc-worker-scaler
+  namespace: fusion
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: postgres-cdc-worker
+  minReplicaCount: 1
+  maxReplicaCount: 50
+  cooldownPeriod: 300
+  pollingInterval: 10
+  triggers:
+    - type: redis
+      metadata:
+        address: fusion-redis-master.fusion.svc.cluster.local:6379
+        listName: fusion:assigned:postgres
+        listLength: "30"
+
+---
+# ══════════════════════════════════════════════════════════════════════════════
+# MongoDB CDC Worker
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongo-cdc-worker
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: mongo-cdc-worker
+    app.kubernetes.io/component: cdc-worker
+    app.kubernetes.io/part-of: fusion-cdc
+    cdc.dcraftfusion.io/source-type: mongodb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mongo-cdc-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mongo-cdc-worker
+        app.kubernetes.io/component: cdc-worker
+        app.kubernetes.io/part-of: fusion-cdc
+        cdc.dcraftfusion.io/source-type: mongodb
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: fusion-cdc-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cdc-worker
+          image: fusion/cdc-worker:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: CDC_SOURCE_TYPE
+              value: mongodb
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CONTROL_PLANE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: CONTROL_PLANE_URL
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: REDIS_URL
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: ENCRYPTION_KEY
+            - name: WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: WORKER_TOKEN
+            - name: METADATA_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: METADATA_DB_DSN
+            - name: CHECKPOINT_DB_PATH
+              value: /tmp/cdc/checkpoints.db
+            - name: FALLBACK_DB_PATH
+              value: /tmp/cdc/fallback.db
+            - name: MAX_CONCURRENT_TABLES
+              value: "30"
+            - name: HEARTBEAT_INTERVAL
+              value: "15"
+            - name: CHECKPOINT_SYNC_INTERVAL
+              value: "30"
+          volumeMounts:
+            - name: tmp-cdc
+              mountPath: /tmp/cdc
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      volumes:
+        - name: tmp-cdc
+          emptyDir:
+            sizeLimit: 500Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-cdc-worker-svc
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: mongo-cdc-worker
+spec:
+  selector:
+    app.kubernetes.io/name: mongo-cdc-worker
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+  type: ClusterIP
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: mongo-cdc-worker-scaler
+  namespace: fusion
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mongo-cdc-worker
+  minReplicaCount: 1
+  maxReplicaCount: 50
+  cooldownPeriod: 300
+  pollingInterval: 10
+  triggers:
+    - type: redis
+      metadata:
+        address: fusion-redis-master.fusion.svc.cluster.local:6379
+        listName: fusion:assigned:mongodb
+        listLength: "30"

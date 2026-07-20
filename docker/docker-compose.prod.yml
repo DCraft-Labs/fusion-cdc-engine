@@ -1,0 +1,297 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Production Docker Compose
+#
+# Services:
+#   postgres-meta      5432  control-plane metadata DB
+#   postgres-dest      5433  Spark DW writer target
+#   pg-source          5434  CDC source (wal_level=logical)
+#   mysql-source       3307  CDC source (binlog ROW)
+#   mongo-source       27018 CDC source (replica set rs0)
+#   redis              6379  CDC event transport
+#   control-plane      8000  FastAPI API
+#   cdc-worker         8080  CDC async worker (postgres connector demo)
+#   spark-consumer     4040  Spark consumer UI
+#
+# Quick start:
+#   docker compose -f docker/docker-compose.prod.yml up -d
+#   docker compose -f docker/docker-compose.prod.yml logs -f control-plane
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-postgres-healthcheck: &postgres-healthcheck
+  test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+  interval: 10s
+  timeout: 5s
+  retries: 10
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres-meta:
+    image: postgres:16-alpine
+    container_name: fusion-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fusion_user
+      POSTGRES_PASSWORD: fusion_password
+      POSTGRES_DB: fusion_cdc_metadata
+    volumes:
+      - postgres-meta-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck: *postgres-healthcheck
+    logging: *default-logging
+    networks:
+      - fusion-internal
+
+  postgres-dest:
+    image: postgres:16-alpine
+    container_name: fusion-postgres-dest
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dw_user
+      POSTGRES_PASSWORD: dw_password
+      POSTGRES_DB: fusion_dw
+    volumes:
+      - postgres-dest-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck: *postgres-healthcheck
+    logging: *default-logging
+    networks:
+      - fusion-internal
+
+  pg-source:
+    image: postgres:16-alpine
+    container_name: fusion-pg-source
+    restart: unless-stopped
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=10
+        -c max_wal_senders=10
+        -c wal_keep_size=512
+    environment:
+      POSTGRES_USER: cdc_user
+      POSTGRES_PASSWORD: cdc_password
+      POSTGRES_DB: source_db
+    volumes:
+      - pg-source-data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    healthcheck: *postgres-healthcheck
+    logging: *default-logging
+    networks:
+      - fusion-internal
+
+  mysql-source:
+    image: mysql:8.0
+    container_name: fusion-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: fusion_cdc_metadata
+      MYSQL_USER: fusion_user
+      MYSQL_PASSWORD: fusion_password
+    command: >
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+      --log-slave-updates=ON
+      --expire-logs-days=3
+    volumes:
+      - mysql-source-data:/var/lib/mysql
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    networks:
+      - fusion-internal
+
+  mongo-source:
+    image: mongo:7.0
+    container_name: fusion-mongo
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    volumes:
+      - mongo-source-data:/data/db
+    ports:
+      - "27018:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    networks:
+      - fusion-internal
+
+  mongo-init:
+    image: mongo:7.0
+    container_name: fusion-mongo-init
+    restart: on-failure
+    depends_on:
+      mongo-source:
+        condition: service_healthy
+    command: >
+      mongosh --host mongo-source --eval
+      "rs.status().ok === 1 ? print('already init') :
+       rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo-source:27017'}]})"
+    networks:
+      - fusion-internal
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: fusion-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 2gb
+        --maxmemory-policy allkeys-lru
+        --save 900 1
+        --save 300 10
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+    networks:
+      - fusion-internal
+
+  # ── Application Services ────────────────────────────────────────────────────
+
+  control-plane:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.control-plane
+    image: fusion/control-plane:latest
+    container_name: fusion-control-plane
+    restart: unless-stopped
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://fusion_user:fusion_password@postgres-meta:5432/fusion_cdc_metadata
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: "${SECRET_KEY:-change-me-in-production-use-32-char-minimum}"
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+      LOG_LEVEL: INFO
+      ENVIRONMENT: production
+      CORS_ORIGINS: "${CORS_ORIGINS:-https://app.dcraftfusion.io}"
+      WORKER_TOKEN_SECRET: "${WORKER_TOKEN_SECRET:-change-me-worker-secret}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:-change-me-encryption-key-32chars}"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/monitoring/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 45s
+      retries: 5
+    logging: *default-logging
+    networks:
+      - fusion-internal
+      - fusion-external
+
+  cdc-worker-postgres:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cdc-worker
+    image: fusion/cdc-worker:latest
+    container_name: fusion-cdc-worker-postgres
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      CDC_SOURCE_TYPE: postgres
+      CONTROL_PLANE_URL: http://control-plane:8000
+      WORKER_TOKEN: "${WORKER_TOKEN:-change-me-worker-token}"
+      REDIS_URL: redis://redis:6379/0
+      CHECKPOINT_DB_PATH: /var/lib/cdc/checkpoints/checkpoint.db
+      FALLBACK_DB_PATH: /var/lib/cdc/fallback/fallback.db
+      METRICS_PORT: "8080"
+      LOG_LEVEL: INFO
+    volumes:
+      - cdc-worker-pg-data:/var/lib/cdc
+    ports:
+      - "8081:8080"
+    logging: *default-logging
+    networks:
+      - fusion-internal
+
+  spark-consumer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.spark-consumer
+    image: fusion/spark-consumer:latest
+    container_name: fusion-spark-consumer
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      SPARK_CHECKPOINT_DIR: /var/lib/spark/checkpoints
+      CONTROL_PLANE_URL: http://control-plane:8000
+      WORKER_TOKEN: "${WORKER_TOKEN:-change-me-worker-token}"
+      SPARK_MASTER: local[4]
+      LOG_LEVEL: INFO
+    volumes:
+      - spark-checkpoint-data:/var/lib/spark/checkpoints
+    ports:
+      - "4040:4040"   # Spark UI
+    logging: *default-logging
+    networks:
+      - fusion-internal
+
+volumes:
+  postgres-meta-data:
+    driver: local
+  postgres-dest-data:
+    driver: local
+  pg-source-data:
+    driver: local
+  mysql-source-data:
+    driver: local
+  mongo-source-data:
+    driver: local
+  redis-data:
+    driver: local
+  cdc-worker-pg-data:
+    driver: local
+  spark-checkpoint-data:
+    driver: local
+
+networks:
+  fusion-internal:
+    driver: bridge
+    internal: true       # no direct internet access for infra containers
+  fusion-external:
+    driver: bridge       # control-plane exposed externally

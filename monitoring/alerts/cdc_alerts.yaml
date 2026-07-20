@@ -1,0 +1,153 @@
+---
+# PrometheusRule CRD — Fusion CDC Alerting Rules
+# Requires: Prometheus Operator (kube-prometheus-stack)
+# Apply: kubectl apply -f monitoring/alerts/cdc_alerts.yaml -n fusion-monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fusion-cdc-alerts
+  namespace: fusion-monitoring
+  labels:
+    app.kubernetes.io/name: fusion-cdc
+    app.kubernetes.io/component: alerting
+    release: prometheus   # match kube-prometheus-stack selector
+spec:
+  groups:
+    # ──────────────────────────────────────────────────────────
+    # Availability
+    # ──────────────────────────────────────────────────────────
+    - name: fusion.availability
+      interval: 30s
+      rules:
+        - alert: ControlPlaneDown
+          expr: up{job="fusion-control-plane"} == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Control Plane is unreachable"
+            description: "Fusion Control Plane has been down for >1 minute. Pod may be crashlooping."
+            runbook_url: "https://docs.dcraftfusion.io/runbook#control-plane-down"
+
+        - alert: CDCWorkerDown
+          expr: up{job="fusion-cdc-worker"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "CDC Worker {{ $labels.pod }} is down"
+            description: "CDC Worker {{ $labels.pod }} has been unreachable for >2 minutes. CDC replication may be stalled."
+            runbook_url: "https://docs.dcraftfusion.io/runbook#cdc-worker-down"
+
+        - alert: RedisDown
+          expr: up{job="fusion-redis"} == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Redis event bus is down"
+            description: "Redis is unreachable — CDC event transport is disrupted. Fallback queues will activate."
+            runbook_url: "https://docs.dcraftfusion.io/runbook#redis-down"
+
+    # ──────────────────────────────────────────────────────────
+    # Latency
+    # ──────────────────────────────────────────────────────────
+    - name: fusion.latency
+      interval: 30s
+      rules:
+        - alert: CDCStreamLagWarning
+          expr: cdc_stream_lag_seconds > 10
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "CDC stream lag >10s for {{ $labels.tenant }}/{{ $labels.source }}"
+            description: "Stream lag is {{ $value | humanizeDuration }}. SLA threshold is 30s."
+            runbook_url: "https://docs.dcraftfusion.io/runbook#stream-lag"
+
+        - alert: CDCStreamLagCritical
+          expr: cdc_stream_lag_seconds > 30
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "CDC stream lag >30s (SLA BREACH) for {{ $labels.tenant }}/{{ $labels.source }}"
+            description: "Stream lag is {{ $value | humanizeDuration }}. SLA is breached. Immediate investigation required."
+            runbook_url: "https://docs.dcraftfusion.io/runbook#stream-lag"
+
+    # ──────────────────────────────────────────────────────────
+    # Errors
+    # ──────────────────────────────────────────────────────────
+    - name: fusion.errors
+      interval: 30s
+      rules:
+        - alert: CDCErrorRateHigh
+          expr: rate(cdc_errors_total[5m]) > 1
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "CDC error rate >1/s for {{ $labels.tenant }}/{{ $labels.source }}"
+            description: "Error rate is {{ $value | humanize }}/s. Error type: {{ $labels.error_type }}."
+            runbook_url: "https://docs.dcraftfusion.io/runbook#error-rate"
+
+        - alert: CDCFallbackQueueGrowing
+          expr: cdc_fallback_queue_length > 1000
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Fallback queue depth >1000 events"
+            description: "Fallback queue has {{ $value }} events. Redis may be slow/down. Check Redis health."
+            runbook_url: "https://docs.dcraftfusion.io/runbook#fallback-queue"
+
+        - alert: CDCFallbackQueueCritical
+          expr: cdc_fallback_queue_length > 10000
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Fallback queue critical: >10k events"
+            description: "Fallback queue has {{ $value }} events. Data loss risk if disk fills. Investigate Redis immediately."
+            runbook_url: "https://docs.dcraftfusion.io/runbook#fallback-queue"
+
+    # ──────────────────────────────────────────────────────────
+    # Resources
+    # ──────────────────────────────────────────────────────────
+    - name: fusion.resources
+      interval: 60s
+      rules:
+        - alert: CDCWorkerMemoryHigh
+          expr: |
+            container_memory_working_set_bytes{
+              pod=~".*cdc-worker.*",
+              container="cdc-worker"
+            } / container_spec_memory_limit_bytes > 0.85
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "CDC Worker {{ $labels.pod }} memory >85%"
+            description: "Memory usage is at {{ $value | humanizePercentage }}. OOM kill risk."
+
+        - alert: PVCAlmostFull
+          expr: |
+            kubelet_volume_stats_available_bytes{
+              persistentvolumeclaim=~".*cdc-worker.*"
+            } / kubelet_volume_stats_capacity_bytes < 0.15
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "PVC {{ $labels.persistentvolumeclaim }} is >85% full"
+            description: "Checkpoint/fallback PVC has {{ $value | humanizePercentage }} space remaining."

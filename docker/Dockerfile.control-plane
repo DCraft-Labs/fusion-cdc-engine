@@ -1,0 +1,68 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Control Plane
+# Multi-stage build: builder → runtime
+# Target: python:3.11-slim | Port: 8000
+# ─────────────────────────────────────────────────────────────────────────────
+ARG PYTHON_VERSION=3.11
+
+# ── Stage 1: dependency builder ───────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+WORKDIR /build
+
+# System deps needed to compile psycopg2 / cryptography C extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        libpq-dev \
+        libffi-dev \
+        libssl-dev \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY control-plane/requirements.txt ./requirements.txt
+
+RUN pip install --upgrade pip \
+    && pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim AS runtime
+
+LABEL org.opencontainers.image.title="fusion-control-plane" \
+      org.opencontainers.image.description="Fusion CDC Engine – Control Plane API" \
+      org.opencontainers.image.vendor="Fusion" \
+      org.opencontainers.image.version="2.0.0"
+
+WORKDIR /app
+
+# Runtime system deps only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    # Non-root user for security
+    && groupadd -r fusion \
+    && useradd -r -g fusion -d /app -s /sbin/nologin fusion
+
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy application source
+COPY control-plane/ .
+
+# Ensure Alembic migrations are available (they live at repo root, not inside control-plane/)
+COPY alembic.ini ./alembic.ini
+COPY migrations/ ./migrations/
+COPY schemas/ ./schemas/
+
+RUN chown -R fusion:fusion /app
+
+USER fusion
+
+# Healthcheck: poll the monitoring endpoint
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8000/api/v1/monitoring/health || exit 1
+
+EXPOSE 8000
+
+# Entrypoint: run migrations then start API
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 --loop uvloop"]

@@ -1,0 +1,114 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Spark Consumer Deployment
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fusion-spark-consumer
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: spark-consumer
+    app.kubernetes.io/component: stream-processor
+    app.kubernetes.io/part-of: fusion-cdc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spark-consumer
+  strategy:
+    type: Recreate    # Spark maintains its own internal parallelism
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spark-consumer
+        app.kubernetes.io/component: stream-processor
+        app.kubernetes.io/part-of: fusion-cdc
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: fusion-spark-consumer
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90    # Allow in-flight batch to complete
+      containers:
+        - name: spark-consumer
+          image: fusion/spark-consumer:latest
+          imagePullPolicy: Always
+          ports:
+            - name: spark-ui
+              containerPort: 4040
+            - name: metrics
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: fusion-config
+          env:
+            - name: WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: WORKER_TOKEN
+          readinessProbe:
+            exec:
+              command: ["python3", "-c", "import consumer.streaming_consumer; print('OK')"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["python3", "-c", "import consumer.streaming_consumer; print('OK')"]
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+            limits:
+              cpu: "4000m"
+              memory: "8Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+          volumeMounts:
+            - name: spark-checkpoints
+              mountPath: /var/lib/spark/checkpoints
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: spark-checkpoints
+          persistentVolumeClaim:
+            claimName: spark-checkpoints-pvc
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: spark-checkpoints-pvc
+  namespace: fusion
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fusion-spark-consumer-svc
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: spark-consumer
+spec:
+  selector:
+    app.kubernetes.io/name: spark-consumer
+  ports:
+    - name: spark-ui
+      port: 4040
+      targetPort: 4040
+  type: ClusterIP

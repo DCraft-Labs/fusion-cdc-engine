@@ -1,0 +1,228 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Helm Chart Default Values
+# Override with: helm install -f my-values.yaml ...
+# ─────────────────────────────────────────────────────────────────────────────
+
+global:
+  # Image registry prefix — set to your private registry in production
+  imageRegistry: ""
+  # Pull secrets for private registries
+  imagePullSecrets: []
+  # Namespace (defaults to helm release namespace)
+  namespace: ""
+
+# ── Control Plane ─────────────────────────────────────────────────────────────
+controlPlane:
+  enabled: true
+  replicaCount: 2
+
+  image:
+    repository: ghcr.io/dcraft-labs/fusion-cdc-control-plane
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  service:
+    type: ClusterIP
+    port: 8000
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/limit-rps: "100"
+    hosts:
+      - host: api.dcraftfusion.io
+        paths:
+          - path: /api
+            pathType: Prefix
+    tls:
+      - secretName: fusion-tls
+        hosts:
+          - api.dcraftfusion.io
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  config:
+    logLevel: INFO
+    environment: production
+    algorithm: HS256
+    accessTokenExpireMinutes: 60
+    corsOrigins: "https://app.dcraftfusion.io"
+
+  # Secrets — REQUIRED; provide via --set or external secret
+  secrets:
+    # secretName: existing-secret   # use existing secret
+    create: true
+    secretKey: "change-me-in-production"
+    encryptionKey: "change-me-encryption-key-32chars"
+    workerTokenSecret: "change-me-worker-secret"
+
+# ── CDC Workers ───────────────────────────────────────────────────────────────
+cdcWorkers:
+  image:
+    repository: ghcr.io/dcraft-labs/fusion-cdc-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  # Enable per source-type worker
+  postgres:
+    enabled: true
+    replicas: 1
+    storage: 5Gi
+    storageClass: standard
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+  mysql:
+    enabled: true
+    replicas: 1
+    storage: 5Gi
+    storageClass: standard
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+  mongodb:
+    enabled: true
+    replicas: 1
+    storage: 5Gi
+    storageClass: standard
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+  # Autoscaling (requires Prometheus Adapter)
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+
+  workerToken: "change-me-worker-token"
+  metricsPort: 8080
+
+# ── Spark Consumer ────────────────────────────────────────────────────────────
+# Templates for spark-consumer / frontend / transform-worker live in the
+# canonical chart at infra/helm/fusion-cdc. Image repos kept in sync here.
+sparkConsumer:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/dcraft-labs/fusion-cdc-spark-consumer
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  storage:
+    size: 20Gi
+    storageClass: standard
+
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 2Gi
+    limits:
+      cpu: 4000m
+      memory: 8Gi
+
+  config:
+    sparkMaster: "local[*]"
+    sparkCheckpointDir: /var/lib/spark/checkpoints
+
+frontend:
+  enabled: true
+  image:
+    repository: ghcr.io/dcraft-labs/fusion-cdc-frontend
+    tag: latest
+    pullPolicy: IfNotPresent
+
+transformWorker:
+  enabled: false
+  image:
+    repository: ghcr.io/dcraft-labs/fusion-cdc-transform-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+
+# ── Redis (Bitnami subchart) ──────────────────────────────────────────────────
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: false    # Enable and set password for production
+    # password: "change-me-redis-password"
+  master:
+    persistence:
+      enabled: true
+      size: 10Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 3Gi
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+monitoring:
+  # ServiceMonitor for Prometheus Operator
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+  # Grafana dashboard ConfigMaps
+  grafanaDashboards:
+    enabled: true
+
+# ── Pod Security ──────────────────────────────────────────────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# ── Topology Spread ───────────────────────────────────────────────────────────
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule

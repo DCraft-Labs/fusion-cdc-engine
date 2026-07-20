@@ -1,0 +1,110 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — CDC Consumer
+# Fast path: Kafka/Redis → destination Postgres (no transforms)
+# KEDA-scaled on Redis stream pending entries. min=1, max=500.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fusion-cdc-consumer
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: cdc-consumer
+    app.kubernetes.io/component: consumer
+    app.kubernetes.io/part-of: fusion-cdc
+spec:
+  replicas: 1               # KEDA manages actual count
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cdc-consumer
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 5
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cdc-consumer
+        app.kubernetes.io/component: consumer
+        app.kubernetes.io/part-of: fusion-cdc
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: fusion-cdc-consumer
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: cdc-consumer
+          image: fusion/cdc-worker:local    # same image, different CMD
+          imagePullPolicy: IfNotPresent
+          command: ["python", "cdc_consumer.py"]
+          env:
+            - name: METADATA_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: METADATA_DB_DSN
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: REDIS_URL
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: KAFKA_BOOTSTRAP_SERVERS
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: ENCRYPTION_KEY
+            - name: CONSUMER_GROUP
+              value: fusion-cdc-consumer
+            - name: CONSUMER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: BATCH_SIZE
+              value: "1000"
+            - name: SCAN_INTERVAL
+              value: "2"
+          livenessProbe:
+            exec:
+              command: ["pgrep", "-f", "cdc_consumer.py"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+---
+# KEDA: scale based on Redis stream pending entries across all cdc: keys
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: cdc-consumer-scaler
+  namespace: fusion
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fusion-cdc-consumer
+  minReplicaCount: 1
+  maxReplicaCount: 500
+  cooldownPeriod: 120
+  pollingInterval: 5
+  triggers:
+    - type: redis-streams
+      metadata:
+        address: fusion-redis-master.fusion.svc.cluster.local:6379
+        stream: cdc:events          # aggregate stream for consumer group lag
+        consumerGroup: fusion-cdc-consumer
+        pendingEntriesCount: "1000" # 1 pod per 1K pending entries

@@ -1,0 +1,347 @@
+# Fusion CDC Engine — Dev Environment
+#
+# Services:
+#   postgres-meta  5432 — control-plane metadata DB (runs migrations via alembic)
+#   postgres-dest  5433 — destination data warehouse (for Spark Postgres writer)
+#   pg-source      5434 — CDC source Postgres (wal_level=logical for Phase 2 connector)
+#   mysql-source   3307 — CDC source MySQL  (binlog ROW for Phase 2 connector)
+#   mongo-source   27018 — CDC source MongoDB (replica set for Phase 2 connector)
+#   redis          6379  — event transport (Phase 2 publisher / Phase 3 consumer)
+#   airflow        8080  — Airflow webserver + scheduler for BATCH/SCHEDULED syncs
+#   cdc-worker     8081  — CDC worker (reads change logs, publishes to Redis Streams)
+#   spark-consumer       — Spark consumer (reads Redis Streams, writes to destinations)
+#
+# Usage:
+#   docker compose -f docker/docker-compose.dev.yml up -d
+#   docker compose -f docker/docker-compose.dev.yml down
+#   docker compose -f docker/docker-compose.dev.yml logs -f <service>
+
+version: "3.9"
+
+services:
+  # -------------------------------------------------------------------------
+  # Postgres — control-plane metadata store
+  # -------------------------------------------------------------------------
+  postgres-meta:
+    image: postgres:16-alpine
+    container_name: fusion-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fusion_user
+      POSTGRES_PASSWORD: fusion_password
+      POSTGRES_DB: fusion_cdc_metadata
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_meta_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fusion_user -d fusion_cdc_metadata"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------------------------------------------------------
+  # Postgres — destination data warehouse (Spark Phase 3 writer target)
+  # -------------------------------------------------------------------------
+  postgres-dest:
+    image: postgres:16-alpine
+    container_name: fusion-postgres-dest
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dw_user
+      POSTGRES_PASSWORD: dw_password
+      POSTGRES_DB: fusion_dw
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_dest_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dw_user -d fusion_dw"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------------------------------------------------------
+  # Postgres — CDC source  (wal_level=logical, Phase 2 postgres connector)
+  # -------------------------------------------------------------------------
+  pg-source:
+    image: postgres:16-alpine
+    container_name: fusion-pg-source
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cdc_user
+      POSTGRES_PASSWORD: cdc_password
+      POSTGRES_DB: source_db
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=4
+        -c max_wal_senders=4
+    ports:
+      - "5434:5432"
+    volumes:
+      - pg_source_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cdc_user -d source_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------------------------------------------------------
+  # MySQL — CDC source  (ROW binlog, Phase 2 mysql connector)
+  # -------------------------------------------------------------------------
+  mysql-source:
+    image: mysql:8.0
+    container_name: fusion-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_USER: fusion_user
+      MYSQL_PASSWORD: fusion_password
+      MYSQL_DATABASE: fusion_cdc_metadata
+    command: >
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "fusion_user", "-pfusion_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # -------------------------------------------------------------------------
+  # MongoDB — CDC source  (replica set, Phase 2 mongodb connector)
+  # No auth in dev: replica sets + auth require a keyFile (unnecessary for local dev).
+  # -------------------------------------------------------------------------
+  mongo-source:
+    image: mongo:7.0
+    container_name: fusion-mongo
+    restart: unless-stopped
+    command: >
+      mongod
+        --replSet rs0
+        --bind_ip_all
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # -------------------------------------------------------------------------
+  # Mongo replica-set initialiser  (one-shot container)
+  # -------------------------------------------------------------------------
+  mongo-init:
+    image: mongo:7.0
+    container_name: fusion-mongo-init
+    depends_on:
+      mongo-source:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: >
+      mongosh --host mongo-source
+        --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo-source:27017'}]})"
+
+  # -------------------------------------------------------------------------
+  # Redis — event transport
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: fusion-redis
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # -------------------------------------------------------------------------
+  # Airflow — batch/scheduled job orchestration
+  # Single-node dev setup: webserver + scheduler + triggerer in one container
+  # Uses the same postgres-meta DB (separate schema) for its metadata.
+  # UI: http://localhost:8080  (admin / admin)
+  # -------------------------------------------------------------------------
+  airflow:
+    image: apache/airflow:2.9.3-python3.11
+    container_name: fusion-airflow
+    restart: unless-stopped
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://fusion_user:fusion_password@postgres-meta:5432/fusion_cdc_metadata
+      AIRFLOW__CORE__FERNET_KEY: "81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs="
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      # Connection to control-plane (host.docker.internal for macOS host networking)
+      FUSION_CONTROL_PLANE_URL: "http://host.docker.internal:8000"
+      FUSION_WORKER_TOKEN: "dev-worker-token"
+      # Redis connection for BatchConsumer
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # Destination Postgres for BatchConsumer writes
+      DEST_PG_HOST: postgres-dest
+      DEST_PG_PORT: "5432"
+      DEST_PG_USER: dw_user
+      DEST_PG_PASSWORD: dw_password
+      DEST_PG_DATABASE: fusion_dw
+    volumes:
+      - ../spark-consumer/orchestration:/opt/airflow/plugins/orchestration:ro
+      - ../spark-consumer/consumer:/opt/airflow/plugins/consumer:ro
+      - airflow_dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Fusion \
+          --lastname Admin \
+          --role Admin \
+          --email admin@fusion.dev || true
+        airflow webserver &
+        exec airflow scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+
+  # -------------------------------------------------------------------------
+  # CDC Worker — reads change logs from sources, publishes to Redis Streams
+  # Receives start/stop-streaming commands via Redis pub/sub + HTTP :8081
+  # -------------------------------------------------------------------------
+  cdc-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cdc-worker
+    container_name: fusion-cdc-worker
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres-meta:
+        condition: service_healthy
+    environment:
+      CONTROL_PLANE_URL: "http://host.docker.internal:8000"
+      WORKER_TOKEN: "dev-worker-token"
+      WORKER_ID: "worker-dev-1"
+      REDIS_URL: "redis://host.docker.internal:6379/0"
+      CHECKPOINT_DB_PATH: "/var/lib/cdc/checkpoints.db"
+      FALLBACK_DB_PATH: "/var/lib/cdc/fallback.db"
+      MAX_CONCURRENT_TABLES: "20"
+      HEARTBEAT_INTERVAL: "30"
+      CHECKPOINT_SYNC_INTERVAL: "60"
+      HTTP_PORT: "8081"
+      ENCRYPTION_KEY: "your-32-byte-encryption-key-for-aes256"
+    ports:
+      - "8081:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - cdc_worker_data:/var/lib/cdc
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+  # -------------------------------------------------------------------------
+  # CDC Consumer — performs initial full-table load (MySQL → Postgres dest)
+  # then continuously reads Redis Streams and applies CDC events.
+  # Runs automatically; restarts on failure so new connections are picked up.
+  # -------------------------------------------------------------------------
+  cdc-consumer:
+    build:
+      context: ..
+      dockerfile: cdc-workers/Dockerfile
+    container_name: fusion-cdc-consumer
+    restart: unless-stopped
+    command: ["python", "cdc_consumer.py"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres-meta:
+        condition: service_healthy
+    environment:
+      METADATA_DB_DSN: "host=host.docker.internal port=5432 dbname=fusion_cdc_metadata user=fusion_user password=fusion_password"
+      REDIS_URL: "redis://host.docker.internal:6379/0"
+      ENCRYPTION_KEY: "fusion-local-encrypt-key-32byt"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../cdc-workers/cdc_consumer.py:/app/cdc_consumer.py:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f cdc_consumer.py && echo healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  # -------------------------------------------------------------------------
+  # Spark Consumer — reads from Redis Streams, applies transforms & DQ,
+  # writes to Postgres DW (or Iceberg). For REALTIME connections.
+  # -------------------------------------------------------------------------
+  spark-consumer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.spark-consumer
+    container_name: fusion-spark-consumer
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres-dest:
+        condition: service_healthy
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      DEST_PG_HOST: "postgres-dest"
+      DEST_PG_PORT: "5432"
+      DEST_PG_USER: "dw_user"
+      DEST_PG_PASSWORD: "dw_password"
+      DEST_PG_DATABASE: "fusion_dw"
+      CONTROL_PLANE_URL: "http://host.docker.internal:8000"
+      WORKER_TOKEN: "dev-worker-token"
+      SPARK_CHECKPOINT_DIR: "/tmp/spark-checkpoints"
+      CONSUMER_GROUP: "fusion-spark"
+      CONSUMER_NAME: "spark-consumer-dev-1"
+      PYSPARK_PYTHON: "python3"
+      PYSPARK_DRIVER_PYTHON: "python3"
+    volumes:
+      - spark_checkpoints:/tmp/spark-checkpoints
+
+volumes:
+  pg_meta_data:
+  pg_dest_data:
+  pg_source_data:
+  mysql_data:
+  mongo_data:
+  airflow_dags:
+  airflow_logs:
+  cdc_worker_data:
+  spark_checkpoints:

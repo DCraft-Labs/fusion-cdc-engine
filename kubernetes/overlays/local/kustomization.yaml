@@ -1,0 +1,99 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Local Overlay (Docker Desktop Kubernetes)
+#
+# Pre-requisite (one-time):
+#   kubectl apply -f kubernetes/namespaces.yaml
+#   helm install keda kedacore/keda --namespace keda --create-namespace
+#
+# Deploy:
+#   kubectl apply -k kubernetes/overlays/local/
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: fusion
+
+resources:
+  - ../../base
+
+images:
+  - name: fusion/control-plane
+    newTag: "local"
+  - name: fusion/cdc-worker
+    newTag: "local"
+  - name: fusion/frontend
+    newTag: "local"
+  - name: fusion/transform-worker
+    newTag: "local"
+
+patches:
+  - path: patches/resources.yaml
+  - path: patches/configmap.yaml
+  # Remove zone topology spread — Docker Desktop is single-node (no zone labels)
+  - target:
+      kind: Deployment
+      name: fusion-control-plane
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/topologySpreadConstraints
+  # Health endpoint /health returns 200, /api/v1/monitoring/health returns 403 (auth required)
+  - target:
+      kind: Deployment
+      name: fusion-control-plane
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 90
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe
+        value:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 30
+  # Expose control-plane API externally for local dev/debug (NodePort 30800)
+  - target:
+      kind: Service
+      name: fusion-control-plane-svc
+    patch: |-
+      - op: replace
+        path: /spec/type
+        value: NodePort
+      - op: add
+        path: /spec/ports/0/nodePort
+        value: 30800
+  # Reduce HPA minReplicas to 1 for single-node Docker Desktop
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: fusion-control-plane-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+  # Remove liveness probe from cdc-consumer — initial load is long-running batch
+  # process, not a server. The exec probe kills the pod mid initial-load.
+  - target:
+      kind: Deployment
+      name: fusion-cdc-consumer
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/containers/0/livenessProbe

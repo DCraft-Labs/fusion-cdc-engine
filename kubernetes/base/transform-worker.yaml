@@ -1,0 +1,124 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Transform Worker
+# Smart path: initial loads (100M+ rows) + CDC events with column transforms
+# DuckDB engine: all 10 transform types, Python UDFs, chunked PK-range loading
+# KEDA: scale-to-zero (min=0). 0 pods at idle = $0 cost.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fusion-transform-worker
+  namespace: fusion
+  labels:
+    app.kubernetes.io/name: transform-worker
+    app.kubernetes.io/component: transform-worker
+    app.kubernetes.io/part-of: fusion-cdc
+spec:
+  replicas: 0               # KEDA starts from 0 — true scale-to-zero
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: transform-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 10
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: transform-worker
+        app.kubernetes.io/component: transform-worker
+        app.kubernetes.io/part-of: fusion-cdc
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: fusion-transform-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120   # allow in-flight transform to finish
+      containers:
+        - name: transform-worker
+          image: fusion/transform-worker:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: METADATA_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: METADATA_DB_DSN
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: REDIS_URL
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: ENCRYPTION_KEY
+            - name: CONTROL_PLANE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fusion-config
+                  key: CONTROL_PLANE_URL
+            - name: WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fusion-secrets
+                  key: WORKER_TOKEN
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: HIGH_PRIORITY_QUEUE
+              value: fusion:transforms:high
+            - name: NORMAL_PRIORITY_QUEUE
+              value: fusion:transforms:normal
+            - name: DUCKDB_THREADS
+              value: "2"
+            - name: DUCKDB_MEMORY_LIMIT
+              value: "3GB"         # leave 1GB for OS + Python overhead
+          volumeMounts:
+            - name: duckdb-scratch
+              mountPath: /tmp/duckdb
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+            limits:
+              cpu: "4000m"
+              memory: "4Gi"
+      volumes:
+        - name: duckdb-scratch
+          emptyDir:
+            sizeLimit: 10Gi      # DuckDB memory-mapped temp files for 100M row loads
+---
+# KEDA: scale-to-zero on Redis queue depth
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: transform-worker-scaler
+  namespace: fusion
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fusion-transform-worker
+  minReplicaCount: 0          # TRUE scale-to-zero
+  maxReplicaCount: 500
+  cooldownPeriod: 120         # 2 min idle → scale to 0
+  pollingInterval: 5
+  triggers:
+    # High priority: initial loads (1 pod per task, max priority)
+    - type: redis
+      metadata:
+        address: fusion-redis-master.fusion.svc.cluster.local:6379
+        listName: fusion:transforms:high
+        listLength: "1"          # 1 task = 1 pod immediately
+    # Normal priority: CDC events with column transforms (batch them)
+    - type: redis
+      metadata:
+        address: fusion-redis-master.fusion.svc.cluster.local:6379
+        listName: fusion:transforms:normal
+        listLength: "5"          # 5 tasks batched per pod

@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — Kustomize Base
+# All manifests are in this directory.
+# Overlays reference this base via: resources: - ../../base
+#
+# Direct apply: kubectl apply -k kubernetes/base/
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: fusion
+
+resources:
+  - service-accounts.yaml
+  - network-policy.yaml
+  - configmap.yaml
+  - secrets.yaml
+  - postgres-meta.yaml      # Metadata DB — runs inside K8s
+  - redis.yaml              # Redis — runs inside K8s
+  - kafka.yaml              # Kafka KRaft — runs inside K8s
+  - deployment.yaml         # Control-plane
+  - frontend.yaml           # Next.js frontend
+  - cdc-workers.yaml        # 3 typed CDC worker Deployments + KEDA
+  - cdc-consumer.yaml       # CDC consumer + KEDA
+  - transform-worker.yaml   # DuckDB transform worker + KEDA (min=0)
+  - hpa.yaml
+
+images:
+  - name: fusion/control-plane
+    newTag: "local"
+  - name: fusion/cdc-worker
+    newTag: "local"
+  - name: fusion/frontend
+    newTag: "local"
+  - name: fusion/transform-worker
+    newTag: "local"

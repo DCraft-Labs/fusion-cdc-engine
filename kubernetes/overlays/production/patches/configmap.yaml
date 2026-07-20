@@ -1,0 +1,14 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Production ConfigMap Patch — override local/dev values with production values
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fusion-config
+  namespace: fusion
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  CORS_ORIGINS: "https://app.dcraftfusion.io"
+  DUCKDB_THREADS: "2"
+  DUCKDB_MEMORY_LIMIT: "3GB"

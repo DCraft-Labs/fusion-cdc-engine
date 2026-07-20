@@ -1,0 +1,16 @@
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+dist/
+.vite/
+coverage/
+*.pem
+*.key
+.DS_Store
+.idea/
+.vscode/
+.tmp/

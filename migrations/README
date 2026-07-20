@@ -1,0 +1,174 @@
+# Alembic Migrations for Fusion CDC Engine
+
+This directory contains database migration scripts for the Fusion CDC Engine PostgreSQL metadata database.
+
+## Overview
+
+- **Database:** PostgreSQL 14+
+- **Migration Tool:** Alembic
+- **Total Tables:** 42 tables across 8 categories
+- **Schema Location:** `../schemas/schema_postgres.sql`
+
+## Initial Setup
+
+1. **Install dependencies:**
+   ```bash
+   pip install alembic psycopg2-binary
+   ```
+
+2. **Configure database connection:**
+   Edit `../alembic.ini` and update the database URL:
+   ```ini
+   sqlalchemy.url = postgresql://fusion_user:password@localhost:5432/fusion_cdc_metadata
+   ```
+
+3. **Run initial migration:**
+   ```bash
+   alembic upgrade head
+   ```
+
+## Migration Commands
+
+### Apply Migrations
+
+```bash
+# Upgrade to latest version
+alembic upgrade head
+
+# Upgrade one version
+alembic upgrade +1
+
+# Upgrade to specific version
+alembic upgrade <revision_id>
+```
+
+### Rollback Migrations
+
+```bash
+# Downgrade one version
+alembic downgrade -1
+
+# Downgrade to specific version
+alembic downgrade <revision_id>
+
+# Downgrade all (WARNING: drops all tables!)
+alembic downgrade base
+```
+
+### View Migration Status
+
+```bash
+# Show current version
+alembic current
+
+# Show migration history
+alembic history
+
+# Show pending migrations
+alembic history --verbose
+```
+
+### Create New Migration
+
+```bash
+# Auto-generate migration from model changes
+alembic revision --autogenerate -m "Add column to connections table"
+
+# Create empty migration template
+alembic revision -m "Custom migration description"
+```
+
+## Migration Structure
+
+### Current Migrations
+
+1. **04aff4ce3106** - Initial schema with 42 tables
+   - Creates all connector, source, destination, connection tables
+   - Creates Spark operator tables
+   - Creates DQ, transformation, event tracking tables
+   - Creates observability and system config tables
+   - Sets up triggers, views, and constraints
+
+### Adding New Migrations
+
+When adding new migrations:
+
+1. Create the migration:
+   ```bash
+   alembic revision -m "Description of change"
+   ```
+
+2. Edit the generated file in `versions/`
+
+3. Implement `upgrade()` and `downgrade()` functions
+
+4. Test the migration:
+   ```bash
+   # Apply
+   alembic upgrade head
+   
+   # Rollback to test downgrade
+   alembic downgrade -1
+   
+   # Re-apply
+   alembic upgrade head
+   ```
+
+## Integration with Main Application
+
+The CDC Engine metadata database has foreign key relationships with the main Fusion application:
+
+- `sub_tenant_id` → `sub_tenants.id` (main app)
+- `bank_id` → `banks.id` (main app)
+- `created_by`, `updated_by` → `users.id` (main app)
+
+**Important:** Ensure the main application database is running and accessible before applying migrations.
+
+## Troubleshooting
+
+### Migration Fails with "relation already exists"
+
+This means the table already exists. Options:
+
+1. **If upgrading existing database:** Mark current schema as migrated:
+   ```bash
+   alembic stamp head
+   ```
+
+2. **If starting fresh:** Drop all tables and re-run:
+   ```bash
+   alembic downgrade base
+   alembic upgrade head
+   ```
+
+### Database connection fails
+
+Check `alembic.ini` database URL and ensure:
+- PostgreSQL is running
+- Database exists
+- User has proper permissions
+- Network connectivity (if remote database)
+
+### Auto-generation doesn't detect changes
+
+Ensure your SQLAlchemy models are:
+- Imported in `env.py`
+- Properly defined with metadata
+- Matching the target schema
+
+## Best Practices
+
+1. **Always test migrations** in development before production
+2. **Backup database** before applying migrations in production
+3. **Review generated migrations** - auto-generated code may need adjustments
+4. **One logical change per migration** - easier to rollback if needed
+5. **Include downgrade logic** - allows rollback in case of issues
+6. **Document complex migrations** - add comments explaining the changes
+
+## See Also
+
+- Schema documentation: `../docs/schema_implementation_plan.md`
+- Database setup guide: `../schemas/DATABASE_SETUP.md`
+- Main application integration: `../user-management/README.md`
+
+Generic single-database configuration.

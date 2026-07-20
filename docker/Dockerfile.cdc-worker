@@ -1,0 +1,67 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fusion CDC Engine — CDC Worker
+# Requires: libmysqlclient, libpq, libssl for connector libraries
+# ─────────────────────────────────────────────────────────────────────────────
+ARG PYTHON_VERSION=3.11
+
+# ── Stage 1: builder ──────────────────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+WORKDIR /build
+
+# MySQL client dev headers + Postgres + crypto headers needed to compile wheels
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        default-libmysqlclient-dev \
+        libpq-dev \
+        libssl-dev \
+        libffi-dev \
+        pkg-config \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY cdc-workers/requirements.txt ./requirements.txt
+
+RUN pip install --upgrade pip \
+    && pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim AS runtime
+
+LABEL org.opencontainers.image.title="fusion-cdc-worker" \
+      org.opencontainers.image.description="Fusion CDC Engine – CDC Worker" \
+      org.opencontainers.image.vendor="Fusion" \
+      org.opencontainers.image.version="2.0.0"
+
+WORKDIR /app
+
+# Runtime-only C libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        default-mysql-client \
+        libpq5 \
+        libssl3 \
+        curl \
+        sqlite3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 2000 -r fusion \
+    && useradd -r -u 2000 -g fusion -d /app -s /sbin/nologin fusion
+
+COPY --from=builder /install /usr/local
+
+COPY cdc-workers/ .
+
+# Persistent volume mount points
+# /var/lib/cdc/checkpoints — SQLite checkpoint DB
+# /var/lib/cdc/fallback    — SQLite fallback queue DB
+RUN mkdir -p /var/lib/cdc/checkpoints /var/lib/cdc/fallback \
+    && chown -R fusion:fusion /app /var/lib/cdc
+
+USER fusion
+
+HEALTHCHECK --interval=20s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -sf http://localhost:8081/health || exit 1
+
+EXPOSE 8081
+
+# Default: start the async worker (override source-type via env CDC_SOURCE_TYPE)
+CMD ["python", "-m", "cdc_worker.worker"]
