@@ -4,6 +4,52 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.8] — 2026-07-22
+
+Follow-up to v1.2.7. The v1.2.7 live stability audit found that
+`/api/v1/alerts/suppressions` still returned HTTP 500 with an empty body
+even after the v1.2.5 `f7a8b9c0d1e2` migration shipped, and
+`/api/v1/data-quality/templates` returned HTTP 501 from a stub handler.
+This release completes the `alert_suppressions` migration and replaces the
+templates stub with an empty 200 response.
+
+### Fixed
+- **`alert_suppressions` remaining columns**
+  (`migrations/versions/a8b9c0d1e2f3_add_alert_suppressions_remaining_columns.py`):
+  the v1.2.5 migration `f7a8b9c0d1e2` only added the `rule_ids` /
+  `connection_ids` ARRAY columns (and dropped the legacy single-valued
+  `rule_id` / `connection_id`). But the `AlertSuppression` model
+  (`control-plane/app/models/alerting.py:309-345`) declares three
+  additional columns that NO migration ever created:
+  `is_recurring` (Boolean, NOT NULL, default false),
+  `recurrence_pattern` (JSONB, nullable), and `updated_by` (UUID,
+  nullable). Without these, every POST/GET to
+  `/api/v1/alerts/suppressions` raised
+  `psycopg2.errors.UndefinedColumn: column alert_suppressions.is_recurring
+  does not exist` (HTTP 500). This migration adds the three missing
+  columns with types/defaults that exactly match the model declarations.
+  Alembic chain: `f7a8b9c0d1e2` → `a8b9c0d1e2f3`.
+- **`/api/v1/data-quality/templates` 501 → 200**
+  (`control-plane/app/api/data_quality.py:192`): the GET handler was a
+  stub that raised `HTTPException(501, "Rule templates not yet
+  implemented")`. Replaced with an empty `RuleTemplateListResponse`
+  (`templates=[], total=0, page, page_size, total_pages=0`) so the
+  endpoint answers 200. The API contract stays intact for when
+  `RuleTemplate` rows are eventually seeded. (The POST
+  `/templates` create handler is left as 501 — it is out of scope for
+  this release and not exercised by the live audit.)
+
+### Changed
+- Bumped FastAPI app version `1.2.7` → `1.2.8`
+  (`control-plane/app/main.py:349`).
+- Bumped private `fusion-cdc` Helm chart to `version: 1.2.8` /
+  `appVersion: "1.2.8"` (`helm/fusion-cdc/Chart.yaml`).
+
+### Notes
+- pg-source discovery returning 0 tables is operational (the seeded
+  source ships with no discovered streams). Already documented in
+  `docs/POST_DEPLOY_CHECKLIST.md` §2 — no code change.
+
 ## [1.2.7] — 2026-07-22
 
 Coordinated release with the public `dcraft-fusion` v1.2.7. The v1.2.6

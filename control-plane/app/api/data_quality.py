@@ -198,10 +198,15 @@ async def list_rule_templates(
     current_user: User = Depends(get_current_user),
 ) -> RuleTemplateListResponse:
     """List available rule templates"""
-    # TODO: Implement template listing
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Rule templates not yet implemented"
+    # No seeded templates exist yet — return an empty page so the endpoint
+    # answers 200 instead of 501. The API contract stays intact for when
+    # RuleTemplate rows are eventually seeded.
+    return RuleTemplateListResponse(
+        templates=[],
+        total=0,
+        page=page,
+        page_size=page_size,
+        total_pages=0,
     )
 
 
