@@ -4,6 +4,24 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.7] — 2026-07-22
+
+Coordinated release with the public `dcraft-fusion` v1.2.7. The v1.2.6
+CDC `Publish CDC images` workflow already succeeded; this is a
+version-bump-only release to keep the CDC image tags and the private
+`fusion-cdc` Helm chart aligned with the public repo's v1.2.7 chart
+(which fixes the public CI `npm audit` gate via a Vite override).
+
+### Changed
+- Bumped FastAPI app version `1.2.6` → `1.2.7`
+  (`control-plane/app/main.py:349`).
+- Bumped private `fusion-cdc` Helm chart to `version: 1.2.7` /
+  `appVersion: "1.2.7"` (`helm/fusion-cdc/Chart.yaml`).
+
+### Notes
+- The CI fix (Vite override for `npm audit`) lives in the public
+  `dcraft-fusion` repo and ships in its v1.2.7 release.
+
 ## [1.2.6] — 2026-07-22
 
 Coordinated release with the public `dcraft-fusion` v1.2.6. The CDC
