@@ -6,7 +6,6 @@ import {
   Lock,
   Users,
   Shield,
-  ScrollText,
   Settings2,
   Flag,
   Wrench,
@@ -27,7 +26,9 @@ const settingsCards: SettingsCard[] = [
   { title: "Change Password", description: "Update your password and security settings", icon: Lock, path: "/settings/change-password" },
   { title: "Users", description: "Manage users, invite members, and assign roles", icon: Users, path: "/settings/users", requiredRole: "admin" },
   { title: "Roles", description: "Define roles and configure permission levels", icon: Shield, path: "/settings/roles", requiredRole: "admin" },
-  { title: "Audit Logs", description: "View activity history and system events", icon: ScrollText, path: "/settings/audit-logs", requiredRole: "admin" },
+  // Audit Logs card removed in v1.2.1 — the control-plane has no
+  // /api/v1/settings/audit-logs endpoint yet (audit_logs table exists but no
+  // router reads from it). Re-add once the endpoint lands. See CHANGELOG.
   { title: "System Config", description: "Manage platform-wide configuration parameters", icon: Settings2, path: "/settings/system-config", requiredRole: "superadmin" },
   { title: "Feature Flags", description: "Control feature rollouts and toggle capabilities", icon: Flag, path: "/settings/feature-flags", requiredRole: "superadmin" },
   { title: "Maintenance Windows", description: "Schedule maintenance periods and manage downtime", icon: Wrench, path: "/settings/maintenance-windows", requiredRole: "superadmin" },

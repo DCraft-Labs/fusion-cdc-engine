@@ -44,7 +44,9 @@ import { SettingsPage } from "@/pages/settings/SettingsPage";
 import { ProfilePage } from "@/pages/settings/ProfilePage";
 import { UsersPage } from "@/pages/settings/UsersPage";
 import { RolesPage } from "@/pages/settings/RolesPage";
-import { AuditLogsPage } from "@/pages/settings/AuditLogsPage";
+// AuditLogsPage import removed in v1.2.1 — control-plane has no
+// /api/v1/settings/audit-logs endpoint yet. Page file retained for the
+// follow-up that adds the endpoint.
 import { SystemConfigPage } from "@/pages/settings/SystemConfigPage";
 import { FeatureFlagsPage } from "@/pages/settings/FeatureFlagsPage";
 import { MaintenanceWindowsPage } from "@/pages/settings/MaintenanceWindowsPage";
@@ -146,7 +148,7 @@ export default function App() {
         <Route path="settings/password" element={<ChangePasswordPage />} />
         <Route path="settings/users" element={<UsersPage />} />
         <Route path="settings/roles" element={<RolesPage />} />
-        <Route path="settings/audit-logs" element={<AuditLogsPage />} />
+        {/* Audit Logs route removed in v1.2.1 — no backend endpoint. */}
         <Route path="settings/system" element={<SystemConfigPage />} />
         <Route path="settings/system-config" element={<SystemConfigPage />} />
         <Route path="settings/feature-flags" element={<FeatureFlagsPage />} />
