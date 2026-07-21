@@ -3,12 +3,12 @@
 __all__ = [
     "auth",
     "connector_definitions",
-    "sources", 
+    "sources",
     "destinations",
     "connections",
     "streams",
     "transformations",
-    "dq_policies",
+    "data_quality",
     "monitoring",
     "schema_evolution",
     "udfs"

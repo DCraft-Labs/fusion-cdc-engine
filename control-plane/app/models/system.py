@@ -63,8 +63,16 @@ class FeatureFlag(BaseModel, TimestampMixin):
 
 
 class Alert(BaseModel):
-    """System and connection alerts"""
-    
+    """System and connection alerts.
+
+    NOTE: This table is created by `schemas/schema_postgres.sql` (and by the
+    flyway V1 script) WITHOUT `created_at` / `updated_at` columns. The
+    alembic migration `2512af1df83a` does add them, but the live DB is
+    provisioned from `schema_postgres.sql` directly, so the model MUST NOT
+    declare TimestampMixin — otherwise every INSERT/SELECT against the
+    real `alerts` table raises `psycopg2.errors.UndefinedColumn` (HTTP 500).
+    """
+
     __tablename__ = "alerts"
     
     # Primary Key

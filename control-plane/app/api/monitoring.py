@@ -75,7 +75,7 @@ def _check_kafka() -> str:
     """Probe the Kafka broker configured via KAFKA_BOOTSTRAP_SERVERS.
 
     Returns one of:
-      - "healthy"        : broker reachable and list_topics() succeeded
+      - "healthy"        : broker reachable
       - "unhealthy"      : KAFKA_BOOTSTRAP_SERVERS set but broker unreachable
       - "not_configured" : KAFKA_BOOTSTRAP_SERVERS empty (Kafka not expected)
 
@@ -105,6 +105,25 @@ def _check_kafka() -> str:
         return "unhealthy"
 
 
+def _seed_health() -> str:
+    """Return the last auto-seed outcome from `app.seed.seed_admin`.
+
+    One of:
+      - "applied"      : seed ran and connector_definitions is now populated
+      - "not_applied" : seed ran but failed / left connector_definitions empty
+      - "skipped"      : seed skipped because DB was already populated
+      - "not_run"      : run_seed() has not been called yet in this process
+
+    Never raises — the health endpoint must not crash if the seed module
+    is not importable in a stripped-down deployment.
+    """
+    try:
+        from app.seed.seed_admin import get_seed_status
+        return get_seed_status()
+    except Exception:
+        return "not_run"
+
+
 # ============================================================================
 # Endpoints
 # ============================================================================
@@ -113,7 +132,11 @@ def _check_kafka() -> str:
 async def system_health(
     db: Session = Depends(get_db),
 ):
-    """System health check — pings DB, Redis, and (optionally) Kafka."""
+    """System health check — pings DB, Redis, and (optionally) Kafka.
+
+    Also surfaces the last auto-seed outcome so operators can detect a
+    failed self-healing seed without scraping logs.
+    """
     db_healthy = _check_db(db)
     redis_healthy = _check_redis()
     kafka_status = _check_kafka()
@@ -121,6 +144,10 @@ async def system_health(
     # not_configured means the operator hasn't wired Kafka in, so we don't
     # penalize the overall status for it.
     kafka_degrades = kafka_status == "unhealthy"
+    seed_status = _seed_health()
+    # A failed seed does not degrade the overall status (the control-plane
+    # still starts so operators can debug), but it is surfaced explicitly so
+    # monitoring can alert on `services.seed == "not_applied"`.
     overall = "healthy" if (db_healthy and redis_healthy and not kafka_degrades) else "degraded"
 
     return {
@@ -129,6 +156,7 @@ async def system_health(
             "database": "healthy" if db_healthy else "unhealthy",
             "redis": "healthy" if redis_healthy else "unhealthy",
             "kafka": kafka_status,
+            "seed": seed_status,
         },
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }

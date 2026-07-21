@@ -4,6 +4,83 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.5] — 2026-07-22
+
+Follow-up to v1.2.4. The v1.2.4 live verification + codebase map audit
+found that the v1.2.4 `alert_rules` migration was incomplete (only added
+`scope_id`; `threshold_value` + `consecutive_failures_required` +
+`cooldown_minutes` were still missing → HTTP 500 on
+`/api/v1/alerts/rules`), the `alert_suppressions` table had a
+`rule_id`/`rule_ids` schema mismatch (HTTP 500 on
+`/api/v1/alerts/suppressions`), and several security fail-fast gaps
+remained. This release completes the migrations, aligns the models with
+the real DB schema, and adds production fail-fast for default secrets.
+
+### Fixed (alerting migrations — live verification)
+- **`alert_rules` remaining columns**
+  (`migrations/versions/e6f7a8b9c0d1_add_alert_rules_remaining_columns.py`):
+  the v1.2.4 migration `d5e6f7a8b9c0` only added `scope_id`. This migration
+  adds the three columns declared by the `AlertRule` model that the
+  original `2512af1df83a` migration never created:
+    - `threshold_value` (Numeric, nullable=True)
+    - `consecutive_failures_required` (Integer, NOT NULL, server_default 1)
+    - `cooldown_minutes` (Integer, NOT NULL, server_default 15)
+  Without these, every POST/GET to `/api/v1/alerts/rules` raised
+  `psycopg2.errors.UndefinedColumn` (HTTP 500).
+- **`alert_suppressions` rule_ids/connection_ids arrays**
+  (`migrations/versions/f7a8b9c0d1e2_align_alert_suppressions_rule_ids.py`):
+  the model and API schemas declare `rule_ids` / `connection_ids` as
+  `ARRAY(UUID)` (a suppression can target multiple rules/connections),
+  but the original migration created single-valued `rule_id` /
+  `connection_id`. This migration adds the array columns, back-fills them
+  from the legacy single-valued columns, and drops the legacy columns +
+  indexes. Fixes HTTP 500 on `/api/v1/alerts/suppressions`.
+
+### Fixed (models vs. real DB schema — codebase map audit)
+- **`system_alerts` model mismatch** (`control-plane/app/models/system.py`):
+  removed `TimestampMixin` from the `Alert` model. The real `alerts`
+  table (per `schemas/schema_postgres.sql`) does NOT have `created_at` /
+  `updated_at` columns, so every INSERT/SELECT against it raised
+  `psycopg2.errors.UndefinedColumn`. Deleted the dead duplicate
+  `control-plane/app/models/system_alert.py` (no callers imported it).
+- **`dq_policies` router dedup** (`control-plane/app/api/`): removed the
+  duplicate `dq_policies.py` router. It mirrored `data_quality.py`'s
+  policy endpoints but was never registered in `main.py` and not called
+  by the frontend. The canonical router is `data_quality.py` (mounted at
+  `/api/v1/data-quality`).
+
+### Fixed (security fail-fast — codebase map audit)
+- **JWT_SECRET_KEY** (`control-plane/app/config.py`): in any non-dev
+  `APP_ENV`, raises `RuntimeError` at startup if `JWT_SECRET_KEY` is
+  unset or still equals the default public string. Prevents anyone with
+  the source from minting valid tokens.
+- **ENCRYPTION_KEY** (`control-plane/app/config.py`): same fail-fast —
+  credentials at rest must not be decryptable by anyone with the source.
+- **WORKER_SHARED_SECRET** (`control-plane/app/config.py`): in non-dev
+  `APP_ENV`, raises `RuntimeError` if `WORKER_SHARED_SECRET` is empty.
+  Previously empty=disabled meant any pod could call `/internal/heartbeat`,
+  `/internal/checkpoint`, `/internal/event-failed`.
+
+### Fixed (observability — codebase map audit)
+- **Seed health surface** (`control-plane/app/api/monitoring.py`,
+  `control-plane/app/seed/seed_admin.py`): the `/api/v1/monitoring/health`
+  endpoint now includes a `seed` field in the `services` object
+  (`{"services":{"database":"healthy","redis":"healthy","kafka":"healthy",
+  "seed":"applied"}}`). The seed module tracks the last auto-seed outcome
+  in a module-level variable (`applied` / `not_applied` / `skipped` /
+  `not_run`), so operators can detect a failed self-healing seed without
+  scraping logs.
+
+### Changed
+- Bumped FastAPI app `version="1.2.5"` in `control-plane/app/main.py`.
+- Bumped `fusion-cdc` Helm chart to `version: 1.2.5` / `appVersion: "1.2.5"`
+  (`helm/fusion-cdc/Chart.yaml`).
+
+### Notes
+- The Fusion-SPA-side fixes (Dockerfile rebuild, CI freshness check,
+  kernel context scoping, HostPath PV cross-platform) live in the public
+  `dcraft-fusion` repo and ship in its v1.2.5 release.
+
 ## [1.2.4] — 2026-07-22
 
 Follow-up to v1.2.3. The v1.2.3 verification + Fusion UI audit (HTTP-only,

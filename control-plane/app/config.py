@@ -61,16 +61,23 @@ class Settings(BaseSettings):
     KEYCLOAK_REALM: str = "fusion"
     KEYCLOAK_CLIENT_ID: str = "fusion-cdc"
     KEYCLOAK_CLIENT_SECRET: str = ""
-    
-    # JWT
+
+    # JWT — the default is a known public string. In any non-dev APP_ENV we
+    # fail fast at startup if the operator has not overridden it. This
+    # prevents anyone with the source from minting valid tokens.
     JWT_SECRET_KEY: str = "your-super-secret-jwt-key-change-this-in-production"
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRATION_MINUTES: int = 30
-    
-    # Encryption (for sensitive credentials)
+
+    # Encryption (for sensitive credentials at rest). Default is a known
+    # public string — fail fast in non-dev if not overridden so credentials
+    # cannot be decrypted by anyone with the source.
     ENCRYPTION_KEY: str = "your-32-byte-encryption-key-for-aes256"
 
-    # Internal worker API auth (shared secret, empty = disabled)
+    # Internal worker API auth (shared secret). Empty = disabled, which is
+    # fine for dev/test but means any pod can call /internal/heartbeat,
+    # /internal/checkpoint, /internal/event-failed in production. Fail fast
+    # in non-dev if unset.
     WORKER_SHARED_SECRET: str = ""
 
     # CDC Worker HTTP URL for direct start-streaming notification
@@ -81,7 +88,7 @@ class Settings(BaseSettings):
     AIRFLOW_API_URL: str = "http://localhost:8080"
     AIRFLOW_USER: str = "admin"
     AIRFLOW_PASSWORD: str = "admin"
-    
+
     # Application
     APP_ENV: str = "development"
     APP_PORT: int = 8000
@@ -97,14 +104,50 @@ class Settings(BaseSettings):
 
     # Periodic re-introspection interval (spec §3: "e.g. daily")
     SCHEMA_REINTROSPECT_INTERVAL_HOURS: int = 24
-    
+
     # CORS
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173,http://localhost:5174"
-    
+
     @property
     def cors_origins_list(self) -> List[str]:
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
-    
+
+    @model_validator(mode="after")
+    def fail_fast_on_default_secrets_in_production(self) -> "Settings":
+        """Fail fast if production secrets are unset or still at default."""
+        dev_envs = {"dev", "development", "local", "test", "testing", "ci"}
+        env = (self.APP_ENV or "").strip().lower()
+        if env in dev_envs:
+            return self
+
+        if (
+            not self.JWT_SECRET_KEY
+            or self.JWT_SECRET_KEY
+            == "your-super-secret-jwt-key-change-this-in-production"
+        ):
+            raise RuntimeError(
+                "JWT_SECRET_KEY must be set to a non-default value in "
+                f"production (APP_ENV={env})"
+            )
+
+        if (
+            not self.ENCRYPTION_KEY
+            or self.ENCRYPTION_KEY == "your-32-byte-encryption-key-for-aes256"
+        ):
+            raise RuntimeError(
+                "ENCRYPTION_KEY must be set to a non-default value in "
+                f"production (APP_ENV={env})"
+            )
+
+        if not self.WORKER_SHARED_SECRET:
+            raise RuntimeError(
+                "WORKER_SHARED_SECRET must be set in production to protect "
+                "internal APIs (/internal/heartbeat, /internal/checkpoint, "
+                "/internal/event-failed)"
+            )
+
+        return self
+
     class Config:
         env_file = ".env"
         case_sensitive = True

@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 
 SEED_SQL_PATH = Path(__file__).parent / "seed-admin.sql"
 
+# Module-level tracker for the last seed outcome, surfaced via the
+# /api/v1/monitoring/health endpoint so operators can detect a failed
+# auto-seed without scraping logs. Values:
+#   "applied"      — seed ran and connector_definitions is now populated
+#   "not_applied" — seed ran but failed / left connector_definitions empty
+#   "skipped"      — seed skipped because DB was already populated
+#   "not_run"      — run_seed() has not been called yet in this process
+_SEED_STATUS: str = "not_run"
+
+
+def get_seed_status() -> str:
+    """Return the last auto-seed outcome for health-endpoint surfacing."""
+    return _SEED_STATUS
+
 
 def _load_seed_sql() -> str:
     """Read the baked-in seed SQL file. Called once per startup."""
@@ -80,6 +94,7 @@ def run_seed(db: Session, *, force: bool = False) -> bool:
     Logs clearly on every path. Never raises — a seed failure must not crash
     the control-plane startup (operators need the API up to debug).
     """
+    global _SEED_STATUS
     try:
         existing = _connector_definitions_count(db)
     except Exception as exc:
@@ -92,6 +107,7 @@ def run_seed(db: Session, *, force: bool = False) -> bool:
             exc,
             exc_info=True,
         )
+        _SEED_STATUS = "not_applied"
         return False
 
     if not force and existing > 0:
@@ -99,6 +115,7 @@ def run_seed(db: Session, *, force: bool = False) -> bool:
             "Seed: %d connector definition(s) already present, skipping auto-seed.",
             existing,
         )
+        _SEED_STATUS = "skipped"
         return False
 
     logger.info(
@@ -127,6 +144,7 @@ def run_seed(db: Session, *, force: bool = False) -> bool:
             exc,
             exc_info=True,
         )
+        _SEED_STATUS = "not_applied"
         return False
 
     # Verify the seed actually populated connector_definitions.
@@ -140,10 +158,12 @@ def run_seed(db: Session, *, force: bool = False) -> bool:
             "Seed: applied successfully — connector_definitions now has %d row(s).",
             after,
         )
+        _SEED_STATUS = "applied"
     else:
         logger.error(
             "Seed: SQL executed without error but connector_definitions is still "
             "empty (%d). Inspect the seed SQL and the DB schema.",
             after,
         )
+        _SEED_STATUS = "not_applied"
     return True
