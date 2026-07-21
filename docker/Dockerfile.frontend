@@ -9,6 +9,11 @@
 # debian builder — avoids Alpine/musl lightningcss native binary failures
 FROM node:20-bookworm-slim AS builder
 
+# Ensure UTF-8 locale so Vite/esbuild reads source files (which contain
+# non-ASCII emoji/arrows) as UTF-8 regardless of the host locale. Without
+# this, static strings can get re-encoded and render as mojibake (â†', Â·, ðŸ§Š).
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE=
+
 WORKDIR /app
 
 COPY frontend/package.json frontend/package-lock.json* ./

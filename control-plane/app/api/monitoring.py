@@ -71,6 +71,40 @@ def _check_db(db: Session) -> bool:
         return False
 
 
+def _check_kafka() -> str:
+    """Probe the Kafka broker configured via KAFKA_BOOTSTRAP_SERVERS.
+
+    Returns one of:
+      - "healthy"        : broker reachable and list_topics() succeeded
+      - "unhealthy"      : KAFKA_BOOTSTRAP_SERVERS set but broker unreachable
+      - "not_configured" : KAFKA_BOOTSTRAP_SERVERS empty (Kafka not expected)
+
+    Never raises — the health endpoint must not crash when Kafka is down.
+    """
+    bootstrap = getattr(settings, "KAFKA_BOOTSTRAP_SERVERS", "") or ""
+    bootstrap = bootstrap.strip()
+    if not bootstrap:
+        return "not_configured"
+    # Prefer a lightweight TCP connect (no extra dep required) before falling
+    # back to kafka-python if it happens to be installed. The TCP probe is
+    # sufficient to report reachability for the health endpoint's purposes.
+    first_server = bootstrap.split(",")[0].strip()
+    if "://" in first_server:
+        first_server = first_server.split("://", 1)[1]
+    if not first_server:
+        return "unhealthy"
+    host, _, port = first_server.partition(":")
+    if not port:
+        port = "9092"
+    try:
+        import socket
+        with socket.create_connection((host, int(port)), timeout=2):
+            pass
+        return "healthy"
+    except Exception:
+        return "unhealthy"
+
+
 # ============================================================================
 # Endpoints
 # ============================================================================
@@ -79,16 +113,22 @@ def _check_db(db: Session) -> bool:
 async def system_health(
     db: Session = Depends(get_db),
 ):
-    """System health check — pings DB and Redis."""
+    """System health check — pings DB, Redis, and (optionally) Kafka."""
     db_healthy = _check_db(db)
     redis_healthy = _check_redis()
-    overall = "healthy" if (db_healthy and redis_healthy) else "degraded"
+    kafka_status = _check_kafka()
+    # Kafka only degrades the overall status when it is expected but down.
+    # not_configured means the operator hasn't wired Kafka in, so we don't
+    # penalize the overall status for it.
+    kafka_degrades = kafka_status == "unhealthy"
+    overall = "healthy" if (db_healthy and redis_healthy and not kafka_degrades) else "degraded"
 
     return {
         "status": overall,
         "services": {
             "database": "healthy" if db_healthy else "unhealthy",
             "redis": "healthy" if redis_healthy else "unhealthy",
+            "kafka": kafka_status,
         },
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }

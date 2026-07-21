@@ -4,6 +4,69 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.3] — 2026-07-21
+
+Follow-up to v1.2.2. The v1.2.2 remote retest (192.168.1.10) confirmed the
+self-healing seed worked end-to-end (6 connectors, 1 source, 2 destinations,
+1 connection all present — the headline blocker is FIXED), but found 4
+remaining issues. This release fixes the 3 code-side issues found in the
+private repo; the Fusion-kernel-side chart-config fix lives in the public
+`dcraft-fusion` repo.
+
+### Fixed
+- **`/settings/audit-logs` route rendered a blank page (LOW).** The v1.2.1
+  commit removed the `AuditLogsPage` import and the `/settings/audit-logs`
+  route from `frontend/src/App.tsx`, but the router had no catch-all — so
+  direct navigation to `/settings/audit-logs` fell through to the
+  `MainLayout` `<Outlet />` with no matching child route, rendering a blank
+  page with just the "Settings > Audit logs" breadcrumb (computed from the
+  URL by `TopBar.tsx`). Added an explicit
+  `<Route path="settings/audit-logs" element={<Navigate to="/settings" replace />} />`
+  so direct nav redirects to `/settings` instead of rendering blank.
+- **CDC frontend static-text mojibake (LOW, cosmetic).** Static strings in
+  `frontend/src/pages/destinations/CreateDestinationWizard.tsx` had
+  double-encoded bytes (UTF-8 misinterpreted as Windows-1252 then re-encoded
+  as UTF-8): the "Next" button read `Next â†'` (should be `Next →`), the
+  connector capability bullets read `Â·` (should be `·`), the connector
+  emoji icons read `ðŸ§Š` / `ðŸ"Š` / `ðŸŒ` (should be `🧊` / `📊` / `🔌`),
+  the password placeholder read `â€¢â€¢â€¢â€¢â€¢â€¢` (should be `••••••`),
+  and the SCD write-mode description read `wins â€" overwrites` (should be
+  `wins — overwrites`). API-sourced text rendered correctly because it
+  flows through JSON; only the frontend's own bundled strings were
+  mis-encoded. Fixed by replacing the corrupted byte sequences with the
+  correct UTF-8 characters in the source. Also added
+  `ENV LANG=C.UTF-8 LC_ALL=C.UTF-8` to the `docker/Dockerfile.frontend`
+  build stage so Vite/esbuild reads source files as UTF-8 regardless of
+  the host locale (defensive against future re-encoding).
+- **Kafka health not observable in CDC monitoring/health (LOW).**
+  `GET /api/v1/monitoring/health` returned only `database` and `redis`
+  services — Kafka was not listed as a health dependency, so API-level
+  Kafka health was not observable. Added a Kafka health check to
+  `control-plane/app/api/monitoring.py` that probes
+  `KAFKA_BOOTSTRAP_SERVERS` (new setting on `control-plane/app/config.py`)
+  via a lightweight TCP socket open with a 2s timeout. Reports
+  `"kafka": "healthy"` (reachable), `"kafka": "unhealthy"` (configured but
+  unreachable), or `"kafka": "not_configured"` (env var empty). The overall
+  `status` downgrades to `"degraded"` only when Kafka is expected but down;
+  `not_configured` does not penalize the overall status. The health
+  endpoint never crashes if Kafka is down. Added `kafka-python==2.0.2` to
+  `control-plane/requirements.txt` as a soft dependency (the health check
+  falls back to a raw TCP socket probe when the library is unavailable).
+
+### Added
+- **`docs/POST_DEPLOY_CHECKLIST.md`.** Operators MUST run
+  `POST /api/v1/sources/{id}/discover` after seeding before the Create
+  Connection wizard's stream-level Iceberg partition editor can be
+  exercised (the seeded `pg-source` ships with `discovery_cache: null`).
+  This is operational, not a code bug — discovery requires the source DB
+  to be reachable, so it cannot be auto-run in code.
+
+### Changed
+- **FastAPI `version="1.2.2"` → `version="1.2.3"`** in
+  `control-plane/app/main.py` (so `/api/openapi.json` reports `1.2.3`).
+- **`helm/fusion-cdc/Chart.yaml`:** `1.2.2` → `1.2.3` (both `version` and
+  `appVersion`).
+
 ## [1.2.2] — 2026-07-21
 
 Self-healing CDC seed. Fixes the v1.2.1 regression where the CDC metadata DB

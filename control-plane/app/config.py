@@ -90,6 +90,11 @@ class Settings(BaseSettings):
     # Spark consumer webhook URL for schema reload notifications (spec §3)
     SPARK_CONSUMER_URL: str = ""
 
+    # Kafka bootstrap servers — probed by the /api/v1/monitoring/health
+    # endpoint. Empty string means "not configured" (the health check will
+    # report kafka: not_configured instead of unhealthy).
+    KAFKA_BOOTSTRAP_SERVERS: str = ""
+
     # Periodic re-introspection interval (spec §3: "e.g. daily")
     SCHEMA_REINTROSPECT_INTERVAL_HOURS: int = 24
     

@@ -148,7 +148,10 @@ export default function App() {
         <Route path="settings/password" element={<ChangePasswordPage />} />
         <Route path="settings/users" element={<UsersPage />} />
         <Route path="settings/roles" element={<RolesPage />} />
-        {/* Audit Logs route removed in v1.2.1 — no backend endpoint. */}
+        {/* Audit Logs route removed in v1.2.1 — no backend endpoint.
+            v1.2.3: explicit redirect so direct nav to /settings/audit-logs
+            no longer renders a blank page with just a breadcrumb. */}
+        <Route path="settings/audit-logs" element={<Navigate to="/settings" replace />} />
         <Route path="settings/system" element={<SystemConfigPage />} />
         <Route path="settings/system-config" element={<SystemConfigPage />} />
         <Route path="settings/feature-flags" element={<FeatureFlagsPage />} />

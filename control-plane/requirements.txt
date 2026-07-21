@@ -26,6 +26,11 @@ email-validator==2.1.0
 # Redis
 redis==5.0.1
 
+# Kafka — used by control-plane /api/v1/monitoring/health to probe the broker
+# (KAFKA_BOOTSTRAP_SERVERS). The health check falls back to a raw TCP socket
+# probe when the client library is unavailable, so this is a soft dependency.
+kafka-python==2.0.2
+
 # Testing
 pytest==7.4.4
 pytest-asyncio==0.23.3

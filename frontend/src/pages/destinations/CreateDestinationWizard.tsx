@@ -1,4 +1,4 @@
-﻿import { useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api, fetchList } from "@/lib/api";
@@ -64,16 +64,16 @@ export function CreateDestinationWizard() {
       id: c.connector_type ?? c.type,
       connectorId: c.connector_id ?? c.id,
       name: c.connector_name ?? c.name,
-      icon: c.connector_type === "postgresql" || c.connector_type === "postgres" ? "ðŸ˜"
-        : c.connector_type === "iceberg" ? "ðŸ§Š"
-        : c.connector_type === "snowflake" ? "â„ï¸"
-        : c.connector_type === "bigquery" ? "ðŸ“Š"
-        : "ðŸ”Œ",
+      icon: c.connector_type === "postgresql" || c.connector_type === "postgres" ? "🐘"
+        : c.connector_type === "iceberg" ? "🧊"
+        : c.connector_type === "snowflake" ? "❄️"
+        : c.connector_type === "bigquery" ? "📊"
+        : "🔌",
       description: [
         c.supports_cdc && "CDC",
         c.supports_full_refresh && "Full Refresh",
         c.supports_incremental && "Incremental",
-      ].filter(Boolean).join(" Â· ") || c.connector_name,
+      ].filter(Boolean).join(" · ") || c.connector_name,
       disabled: false,
     }));
 
@@ -283,7 +283,7 @@ export function CreateDestinationWizard() {
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium">Password *</label>
-                <Input type="password" value={pgForm.password} onChange={(e) => setPgForm({ ...pgForm, password: e.target.value })} placeholder="â€¢â€¢â€¢â€¢â€¢â€¢" />
+                <Input type="password" value={pgForm.password} onChange={(e) => setPgForm({ ...pgForm, password: e.target.value })} placeholder="••••••" />
               </div>
             </div>
             <div className="space-y-2">
@@ -293,7 +293,7 @@ export function CreateDestinationWizard() {
             <div className="space-y-2">
               <label className="text-sm font-medium">Write Mode</label>
               <div className="space-y-2">
-                {([["scd1", "SCD Type 1 (Upsert)", "Latest value wins â€” overwrites on primary key match"], ["scd2", "SCD Type 2 (History)", "Tracks changes with valid_from/valid_to columns"], ["append", "Append Only", "Inserts all events without deduplication"]] as const).map(([val, label, desc]) => (
+                {([["scd1", "SCD Type 1 (Upsert)", "Latest value wins — overwrites on primary key match"], ["scd2", "SCD Type 2 (History)", "Tracks changes with valid_from/valid_to columns"], ["append", "Append Only", "Inserts all events without deduplication"]] as const).map(([val, label, desc]) => (
                   <label key={val} className={`flex items-start gap-3 rounded-md border p-3 cursor-pointer ${pgForm.write_mode === val ? "border-primary bg-primary/5" : ""}`}>
                     <input type="radio" name="write_mode" value={val} checked={pgForm.write_mode === val} onChange={() => setPgForm({ ...pgForm, write_mode: val })} className="mt-0.5" />
                     <div>
@@ -321,12 +321,12 @@ export function CreateDestinationWizard() {
                         value={pgForm.ssl_mode}
                         onChange={(e) => setPgForm({ ...pgForm, ssl_mode: e.target.value as typeof pgForm.ssl_mode })}
                       >
-                        <option value="disable">disable â€” no TLS</option>
-                        <option value="allow">allow â€” prefer plain, fallback to TLS</option>
-                        <option value="prefer">prefer â€” prefer TLS, fallback to plain</option>
-                        <option value="require">require â€” TLS required, skip cert verify</option>
-                        <option value="verify-ca">verify-ca â€” verify server cert against CA</option>
-                        <option value="verify-full">verify-full â€” verify cert + hostname</option>
+                        <option value="disable">disable — no TLS</option>
+                        <option value="allow">allow — prefer plain, fallback to TLS</option>
+                        <option value="prefer">prefer — prefer TLS, fallback to plain</option>
+                        <option value="require">require — TLS required, skip cert verify</option>
+                        <option value="verify-ca">verify-ca — verify server cert against CA</option>
+                        <option value="verify-full">verify-full — verify cert + hostname</option>
                       </select>
                     </div>
                     {(pgForm.ssl_mode === "verify-ca" || pgForm.ssl_mode === "verify-full") && (
@@ -395,7 +395,7 @@ export function CreateDestinationWizard() {
                     {pgForm.tunnel_auth_method === "password" ? (
                       <div className="space-y-1">
                         <label className="text-xs font-medium">SSH Password *</label>
-                        <Input type="password" value={pgForm.tunnel_password} onChange={(e) => setPgForm({ ...pgForm, tunnel_password: e.target.value })} placeholder="â€¢â€¢â€¢â€¢â€¢â€¢" />
+                        <Input type="password" value={pgForm.tunnel_password} onChange={(e) => setPgForm({ ...pgForm, tunnel_password: e.target.value })} placeholder="••••••" />
                       </div>
                     ) : (
                       <div className="space-y-3">
@@ -419,7 +419,7 @@ export function CreateDestinationWizard() {
                         <Button type="button" size="sm" variant="outline"
                           onClick={() => { setTunnelTestResult(null); tunnelTestMutation.mutate(); }}
                           disabled={tunnelTestMutation.isPending}>
-                          {tunnelTestMutation.isPending ? "Testing tunnelâ€¦" : "Test SSH Tunnel"}
+                          {tunnelTestMutation.isPending ? "Testing tunnel…" : "Test SSH Tunnel"}
                         </Button>
                         {tunnelTestResult && (
                           tunnelTestResult.status === "success"
@@ -481,11 +481,11 @@ export function CreateDestinationWizard() {
       {/* Navigation */}
       <div className="flex justify-between">
         <Button variant="outline" onClick={() => step > 0 ? setStep(step - 1) : navigate("/destinations")}>
-          {step === 0 ? "Cancel" : "â† Back"}
+          {step === 0 ? "Cancel" : "← Back"}
         </Button>
         {step < 2 && (
           <Button onClick={() => { if (step === 0) setStep(1); else if (step === 1) createMutation.mutate(); }} disabled={!canProceed() || createMutation.isPending}>
-            {createMutation.isPending ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Creating...</> : "Next â†’"}
+            {createMutation.isPending ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Creating...</> : "Next →"}
           </Button>
         )}
       </div>
