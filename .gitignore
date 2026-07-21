@@ -21,3 +21,8 @@ coverage/
 .venv-audit/
 _audit_*.py
 
+# Remote-deployment scratch / audit artifacts (not release deliverables)
+.tmp-remote-fixes/
+docs/openapi.json
+docs/API_LIVE_COVERAGE_REMOTE.md
+

@@ -281,7 +281,31 @@ def _diff_discovery_cache(old_cache: dict, new_cache: dict) -> list:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start periodic re-introspection task and scheduler on startup; cancel on shutdown."""
+    """Start periodic re-introspection task and scheduler on startup; cancel on shutdown.
+
+    Also runs the self-healing CDC seed (see app/seed/seed_admin.py) AFTER
+    Alembic migrations have applied (migrations run in the Docker CMD before
+    uvicorn starts). If connector_definitions is empty, the seed SQL is
+    executed to populate roles, admin user, connector definitions, and the
+    sample source/destination/connection. The seed is idempotent and is
+    retried on every pod restart, so the deployment self-heals regardless
+    of deploy.ps1 / kubectl cp / postgres-restart failures.
+    """
+    # ── Self-healing seed (v1.2.2): re-seed if connector_definitions is empty ──
+    # Run before the background tasks so the UI has connectors on first boot.
+    try:
+        from app.database import SessionLocal
+        from app.seed import run_seed
+        _seed_db = SessionLocal()
+        try:
+            run_seed(_seed_db)
+        finally:
+            _seed_db.close()
+    except Exception as exc:
+        # run_seed already swallows errors internally, but guard against import
+        # / session-creation failures too — the app must still start.
+        logger.error("Seed: startup hook crashed — %s", exc, exc_info=True)
+
     task = asyncio.create_task(_periodic_reintrospection())
     logger.info("Periodic schema re-introspection task started")
 
@@ -322,7 +346,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Fusion CDC Engine - Control Plane",
     description="Multi-tenant Change Data Capture Platform API",
-    version="1.2.1",
+    version="1.2.2",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json",

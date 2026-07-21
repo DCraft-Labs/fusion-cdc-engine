@@ -1,0 +1,33 @@
+# Build context exclusions — keep `docker build` context small.
+# The Dockerfiles only COPY frontend/, control-plane/, transform-worker/,
+# migrations/, alembic.ini, schemas/ — everything else is dead weight.
+
+.git
+.github
+.vscode
+.idea
+.tmp
+.venv
+.venv-audit
+__pycache__
+**/__pycache__
+*.pyc
+**/*.pyc
+node_modules
+**/node_modules
+dist
+**/dist
+build
+**/build
+
+# Audit scratch files written into the repo root by the v1.2.0 audit agents.
+_audit_*.py
+docs/openapi.json
+
+# Local dev / IDE state
+*.log
+*.tmp
+.env
+.env.local
+*.swp
+.DS_Store
