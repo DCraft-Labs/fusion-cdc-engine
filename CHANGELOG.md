@@ -4,6 +4,51 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.4] — 2026-07-22
+
+Follow-up to v1.2.3. The v1.2.3 verification + Fusion UI audit (HTTP-only,
+192.168.1.10:8088) found 7 issues. This release fixes the 3 CDC-side issues
+(2 MEDIUM, 1 LOW). The 4 Fusion-SPA-side fixes live in the public
+`dcraft-fusion` repo (crypto polyfill, JWT header injection, Test
+Connection UI, demo-data banner).
+
+### Fixed
+- **`/api/v1/alerts/rules` returned 500 — `alert_rules.scope_id` column
+  missing (MEDIUM).** The `AlertRule` model
+  (`control-plane/app/models/alerting.py`) declares
+  `scope_id = Column(UUID(as_uuid=True), nullable=True)`, but the original
+  `2512af1df83a_add_alerting_tables` migration never created this column.
+  Every POST/GET to `/alerts/rules` raised
+  `psycopg2.errors.UndefinedColumn: column alert_rules.scope_id does not
+  exist`. Added migration `d5e6f7a8b9c0_add_alert_rules_scope_id` (revises
+  `c4d5e6f7a8b9`) that adds the nullable UUID column plus an index on it,
+  mirroring the `c4d5e6f7a8b9_add_dq_policies_deleted_at` pattern.
+- **`/alerts/statistics|dashboard|suppressions` returned 422 — route
+  shadowed by `/alerts/{alert_id}` (MEDIUM).** FastAPI matches routes in
+  declaration order; the GET `/{alert_id}` route (with `alert_id: UUID`)
+  was declared before the static `/statistics`, `/dashboard`, and
+  `/suppressions` routes, so requests to those static paths matched
+  `/{alert_id}` first and 422'd on UUID validation of `"statistics"` etc.
+  Moved the `get_alert` GET `/{alert_id}` handler to the END of
+  `control-plane/app/api/alerting.py` so all static sub-paths
+  (`/channels`, `/rules`, `/suppressions`, `/statistics`, `/dashboard`)
+  are registered first. The `/{alert_id}/acknowledge|resolve|history|
+  notifications` sub-routes were left in place since they don't shadow any
+  static path.
+- **Dashboard "System Health" widget didn't surface Kafka (LOW).**
+  `frontend/src/pages/dashboard/DashboardPage.tsx` only rendered
+  PostgreSQL, Redis, and CDC Workers rows, even though
+  `/api/v1/monitoring/health` already returns `services.kafka`. Added a
+  Kafka row that reads `health?.services?.kafka` and renders the three
+  possible states (`healthy` → green "OK", `unhealthy` → amber, and
+  `not_configured` → slate "n/a" so an operator who hasn't wired Kafka
+  doesn't see a false alarm).
+
+### Changed
+- Bumped FastAPI app `version="1.2.4"` in `control-plane/app/main.py`.
+- Bumped `fusion-cdc` Helm chart to `version: 1.2.4` / `appVersion: "1.2.4"`
+  (`helm/fusion-cdc/Chart.yaml`).
+
 ## [1.2.3] — 2026-07-21
 
 Follow-up to v1.2.2. The v1.2.2 remote retest (192.168.1.10) confirmed the

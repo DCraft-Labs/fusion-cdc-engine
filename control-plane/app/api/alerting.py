@@ -906,21 +906,6 @@ async def list_alerts(
     )
 
 
-@router.get(
-    "/{alert_id}",
-    response_model=AlertResponse,
-)
-async def get_alert(
-    alert_id: UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Get alert details"""
-    
-    alert = _get_alert_by_id(db, alert_id, current_user)
-    return alert
-
-
 @router.post(
     "/{alert_id}/acknowledge",
     response_model=AlertResponse,
@@ -1405,3 +1390,24 @@ async def get_alert_dashboard(
         unacknowledged_critical=unacknowledged_critical,
         trend=trend,
     )
+
+
+# ============================================================================
+# Single-alert lookup — declared AFTER all static sub-paths so that GET
+# /alerts/{statistics|dashboard|suppressions|channels|rules} are not shadowed
+# by the {alert_id} path parameter (which would 422 on UUID validation).
+# ============================================================================
+
+@router.get(
+    "/{alert_id}",
+    response_model=AlertResponse,
+)
+async def get_alert(
+    alert_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get alert details"""
+
+    alert = _get_alert_by_id(db, alert_id, current_user)
+    return alert

@@ -48,6 +48,7 @@ export function DashboardPage() {
   // Derive health service status from API response
   const dbStatus      = health?.services?.database ?? "unknown";
   const redisStatus   = health?.services?.redis     ?? "unknown";
+  const kafkaStatus   = health?.services?.kafka     ?? "unknown";
   const workersStatus = workerCount > 0 ? "healthy" : "unknown";
 
   const dqScore = dqMetrics?.overall_score
@@ -218,19 +219,28 @@ export function DashboardPage() {
               {[
                 { name: "PostgreSQL Meta DB", status: dbStatus },
                 { name: "Redis", status: redisStatus },
+                { name: "Kafka", status: kafkaStatus },
                 { name: "CDC Workers", status: workersStatus },
               ].map((svc) => (
                 <div key={svc.name} className="flex items-center justify-between text-sm">
                   <div className="flex items-center gap-2">
                     <div className={`h-2 w-2 rounded-full ${
-                      svc.status === "healthy" || svc.status === "ok" ? "bg-emerald-500" : "bg-amber-500"
+                      svc.status === "healthy" || svc.status === "ok" ? "bg-emerald-500"
+                      : svc.status === "not_configured" ? "bg-slate-400"
+                      : "bg-amber-500"
                     }`} />
                     <span>{svc.name}</span>
                   </div>
                   <span className={`text-xs font-medium ${
-                    svc.status === "healthy" || svc.status === "ok" ? "text-emerald-600" : "text-amber-600"
+                    svc.status === "healthy" || svc.status === "ok" ? "text-emerald-600"
+                    : svc.status === "not_configured" ? "text-slate-500"
+                    : svc.status === "unknown" ? "text-muted-foreground"
+                    : "text-amber-600"
                   }`}>
-                    {svc.status === "healthy" || svc.status === "ok" ? "OK" : svc.status === "unknown" ? "—" : svc.status.toUpperCase()}
+                    {svc.status === "healthy" || svc.status === "ok" ? "OK"
+                      : svc.status === "unknown" ? "—"
+                      : svc.status === "not_configured" ? "n/a"
+                      : svc.status.toUpperCase()}
                   </span>
                 </div>
               ))}
