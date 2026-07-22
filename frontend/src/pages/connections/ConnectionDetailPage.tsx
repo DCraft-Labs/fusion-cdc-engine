@@ -103,6 +103,29 @@ export function ConnectionDetailPage() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["connections", id] }),
   });
 
+  // v1.2.18: retry the initial-load snapshot without deleting + recreating the
+  // connection. Calls POST /connections/{id}/retry-initial-load and surfaces
+  // the result as a toast/alert.
+  const [retryMsg, setRetryMsg] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const retryInitialLoadMutation = useMutation({
+    mutationFn: () => api.post(`/connections/${id}/retry-initial-load`),
+    onSuccess: (res) => {
+      const d = res.data ?? {};
+      setRetryMsg({
+        kind: "success",
+        text: d.message ?? `Enqueued ${d.tasks_enqueued ?? 0} initial-load task(s).`,
+      });
+      queryClient.invalidateQueries({ queryKey: ["connections", id] });
+      queryClient.invalidateQueries({ queryKey: ["connections", id, "runs"] });
+    },
+    onError: (err: any) => {
+      setRetryMsg({
+        kind: "error",
+        text: err.response?.data?.detail ?? err.message ?? "Retry failed",
+      });
+    },
+  });
+
   const deleteMutation = useMutation({
     mutationFn: () => api.delete(`/connections/${id}`),
     onSuccess: () => navigate("/connections"),
@@ -207,6 +230,19 @@ export function ConnectionDetailPage() {
         <Button variant="outline" onClick={() => syncMutation.mutate()} disabled={syncMutation.isPending}>
           <RefreshCw className="mr-2 h-4 w-4" />Trigger Sync
         </Button>
+        <Button
+          variant="outline"
+          onClick={() => {
+            if (!confirm("Re-enqueue the initial-load snapshot tasks for this connection? Only needed if the initial load failed or never started.")) return;
+            setRetryMsg(null);
+            retryInitialLoadMutation.mutate();
+          }}
+          disabled={retryInitialLoadMutation.isPending}
+          title="Re-enqueue the initial-load snapshot tasks (v1.2.18+)"
+        >
+          <RefreshCw className="mr-2 h-4 w-4" />
+          {retryInitialLoadMutation.isPending ? "Retrying…" : "Retry Initial Load"}
+        </Button>
         <Button variant="outline" onClick={() => navigate(`/connections/${id}/edit`)}>
           <Pencil className="mr-2 h-4 w-4" />Edit
         </Button>
@@ -214,6 +250,21 @@ export function ConnectionDetailPage() {
           <Trash2 className="mr-2 h-4 w-4" />Delete
         </Button>
       </div>
+
+      {/* Retry Initial Load feedback */}
+      {retryMsg && (
+        <div
+          role="alert"
+          className={
+            retryMsg.kind === "success"
+              ? "rounded-md border border-green-500/50 bg-green-500/10 p-3 text-sm text-green-700 dark:text-green-400"
+              : "rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+          }
+        >
+          {retryMsg.kind === "success" ? "✓ " : "✗ "}
+          {retryMsg.text}
+        </div>
+      )}
 
       {/* Quick Config */}
       <Card>

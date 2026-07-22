@@ -4,6 +4,74 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.18] — 2026-07-23
+
+Follow-up to v1.2.17 (which fixed the `fetchall()` OOM regression in the
+transform-worker). v1.2.18 fixes the chart + UX issues found in the user
+investigation of v1.2.16 that prevented the transform-worker from starting
+at all and blocked the user from recovering a failed initial load without
+deleting + recreating the connection.
+
+### Removed
+- **`cdc-workers/cdc_consumer.py` deleted.** It was orphaned dead code:
+  the chart's `Dockerfile.cdc-worker` runs `python -m cdc_worker.worker`,
+  which never imported `cdc_consumer.py`. The connector classes
+  (`connectors/mysql.py`, etc.) only implement `stream_events()` (binlog
+  tailing) — no snapshot method — so the `inline` snapshot_mode (the
+  previous default) did nothing. The transform-worker is now the canonical
+  snapshot path.
+
+### Changed
+- **Default `snapshot_mode` is now `transform_worker`** in
+  `control-plane/app/api/connections.py` (`_enqueue_initial_load_tasks`).
+  Previously the default was `inline`, which was a no-op (cdc_consumer.py
+  was never invoked). If a destination's `connection_config.snapshot_mode`
+  is explicitly set to `inline`, a warning is logged and the producer falls
+  back to `transform_worker` so the snapshot still runs.
+- **`METADATA_DB_DSN` renamed to `DATABASE_URL`** in
+  `transform-worker/worker.py` to match the env var the public Helm chart
+  already injects via the `fusion-cdc-secrets` Secret. The previous
+  mismatch broke the transform-worker on the public chart
+  (`CreateContainerConfigError` / missing env var) unless the operator
+  manually applied `patch-cdc-worker-metadata-dsn.json`. `METADATA_DB_DSN`
+  is still accepted as a fallback for older deployments.
+- Bumped `control-plane/app/main.py` FastAPI `version` → `1.2.18`.
+- Bumped private `helm/fusion-cdc/Chart.yaml` → `version: 1.2.18` /
+  `appVersion: "1.2.18"`.
+
+### Added
+- **`POST /api/v1/connections/{id}/retry-initial-load`** endpoint in
+  `control-plane/app/api/connections.py`. Resets
+  `initial_load_completed = false` and `initial_load_started_at = now()`,
+  then re-invokes `_enqueue_initial_load_tasks`. Only valid for
+  CDC/REALTIME connections (BATCH/SCHEDULED use Airflow). Returns
+  `{ "ok": true, "tasks_enqueued": n }`.
+- **`snapshot_mode` select field** in the Iceberg destination form
+  (`frontend/src/components/iceberg/IcebergDestinationForm.tsx`) and the
+  `IcebergDestinationConfig` type
+  (`frontend/src/lib/iceberg-config.ts`). Options: `transform_worker`
+  (default, label "Transform Worker (recommended)") and `inline` (label
+  "Inline (deprecated — does nothing)"). The form sends `snapshot_mode`
+  inside `connection_config` when creating/updating the destination.
+- **"Retry Initial Load" button** on the connection detail page
+  (`frontend/src/pages/connections/ConnectionDetailPage.tsx`). Calls the
+  new endpoint and surfaces success/failure as an alert.
+
+### Fixed
+- The transform-worker now actually starts on the public Helm chart
+  (combined with the public-chart `podSecurityContext` + `DATABASE_URL`
+  fixes shipped in the public repo v1.2.18).
+
+### Known gaps (honest)
+- The private `kubernetes/base/cdc-consumer.yaml` manifest still references
+  the deleted `cdc_consumer.py`. It is legacy (the public chart does not
+  use it) and is left untouched in v1.2.18 to keep the diff surgical. It
+  will be removed in a future cleanup release.
+- `cdc_worker/worker.py` (the CDC worker, not transform-worker) does not
+  read `METADATA_DB_DSN` or `DATABASE_URL` (it uses `CONTROL_PLANE_URL` +
+  `WORKER_TOKEN` to fetch sources via the control-plane API), so no rename
+  was needed there.
+
 ## [1.2.17] — 2026-07-23
 
 Fixes the v1.2.16 transform-worker initial-load regression. The v1.2.16

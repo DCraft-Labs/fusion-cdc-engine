@@ -91,6 +91,11 @@ export interface IcebergDestinationConfig {
   cdc_apply_strategy?: "upsert" | "append";
   write_metadata_delete_after_commit?: boolean;
 
+  // v1.2.18: snapshot mode — where the initial-load snapshot runs.
+  //   transform_worker  → transform-worker performs the snapshot (canonical, recommended)
+  //   inline            → deprecated, cdc_consumer.py removed in v1.2.18 (no-op, falls back)
+  snapshot_mode?: "transform_worker" | "inline";
+
   // Advanced (optional Spark legacy)
   spark_master?: string;
   spark_image?: string;
@@ -111,6 +116,8 @@ export const ICEBERG_DEFAULTS: IcebergDestinationConfig = {
   cdc_apply_strategy: "upsert",
   sse_type: "none",
   s3_path_style: false,
+  // v1.2.18: transform-worker is the canonical snapshot path.
+  snapshot_mode: "transform_worker",
 };
 
 /** Normalize `s3a://` → `s3://` for PyIceberg. */

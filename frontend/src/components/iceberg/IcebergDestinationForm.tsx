@@ -318,6 +318,22 @@ export default function IcebergDestinationForm({ form, setForm }: Props) {
           <input type="checkbox" checked={Boolean(form.write_metadata_delete_after_commit)} onChange={(e) => set({ write_metadata_delete_after_commit: e.target.checked })} />
           Delete metadata after commit
         </label>
+        <Field
+          label="Snapshot mode"
+          required
+          help="Where the initial-load snapshot runs. 'Transform Worker' enqueues the snapshot to the transform-worker (canonical, recommended). 'Inline' is deprecated — cdc_consumer.py was removed in v1.2.18 and selecting it falls back to Transform Worker."
+        >
+          <Select
+            value={form.snapshot_mode ?? "transform_worker"}
+            onValueChange={(v) => set({ snapshot_mode: v as "transform_worker" | "inline" })}
+          >
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="transform_worker">Transform Worker (recommended)</SelectItem>
+              <SelectItem value="inline">Inline (deprecated — does nothing)</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
       </Section>
 
       <details className="rounded-md border p-3">

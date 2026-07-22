@@ -36,7 +36,18 @@ NORMAL_QUEUE = os.environ.get("NORMAL_PRIORITY_QUEUE", "fusion:transforms:normal
 WORKER_ID = os.environ.get("WORKER_ID", "transform-worker-0")
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://fusion-control-plane-svc.fusion.svc.cluster.local:8000")
 ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"]
-METADATA_DB_DSN = os.environ["METADATA_DB_DSN"]
+# v1.2.18: renamed from METADATA_DB_DSN to DATABASE_URL to match the env var
+# the Helm chart already injects via the fusion-cdc-secrets Secret. The old
+# name broke the transform-worker on the public chart (CreateContainerConfigError
+# / missing env var) unless the operator manually applied
+# patch-cdc-worker-metadata-dsn.json. DATABASE_URL is now the canonical name;
+# METADATA_DB_DSN is still accepted as a fallback for older deployments.
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("METADATA_DB_DSN")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "transform-worker: DATABASE_URL env var is required "
+        "(or METADATA_DB_DSN for legacy deployments)."
+    )
 
 _shutdown = False
 
@@ -54,7 +65,7 @@ def main():
 
     r = redis.from_url(REDIS_URL, decode_responses=True)
     engine = DuckDBTransformEngine(
-        metadata_db_dsn=METADATA_DB_DSN,
+        metadata_db_dsn=DATABASE_URL,
         encryption_key=ENCRYPTION_KEY,
         control_plane_url=CONTROL_PLANE_URL,
         worker_id=WORKER_ID,
