@@ -851,7 +851,21 @@ def get_transform_route(
         # transform_overrides shape: {"transforms": [{...}, ...]}
         to = stream.transform_overrides or {}
         steps = to.get("transforms", []) if isinstance(to, dict) else []
-        dest_config = dest.connection_config or {}
+        # Build a connection_config copy with the decrypted plaintext password
+        # so the transform-worker can derive a usable Postgres DSN without
+        # needing the Fernet key. The stored row keeps password_encrypted only;
+        # the plaintext never leaves this response (sent over the internal
+        # worker API, authenticated via X-Worker-Token).
+        dest_config = dict(dest.connection_config or {})
+        enc = dest_config.get("password_encrypted")
+        if enc and not dest_config.get("password"):
+            try:
+                dest_config["password"] = _decrypt_password(enc)
+            except Exception:
+                # If decryption fails, leave password empty — the
+                # transform-worker will surface a connection error rather
+                # than crash here.
+                pass
         routes.append(TransformRoute(
             connection_id=str(conn.connection_id),
             destination={

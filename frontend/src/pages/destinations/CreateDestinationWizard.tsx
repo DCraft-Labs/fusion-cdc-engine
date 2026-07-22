@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api, fetchList } from "@/lib/api";
+import { formatApiDetail } from "@/lib/api-errors";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
@@ -52,6 +53,10 @@ export function CreateDestinationWizard() {
   const [testChecks, setTestChecks] = useState<TestCheck[]>([]);
   const [sslOpen, setSslOpen] = useState(false);
   const [tunnelTestResult, setTunnelTestResult] = useState<any>(null);
+  // validate-write state — drives whether "Finish Setup" is enabled.
+  // Status: "idle" | "running" | "success" | "error".
+  const [validateWriteStatus, setValidateWriteStatus] = useState<"idle" | "running" | "success" | "error">("idle");
+  const [validateWriteError, setValidateWriteError] = useState<string | null>(null);
 
   const { data: connectors = [] } = useQuery({
     queryKey: ["connector-definitions"],
@@ -124,11 +129,16 @@ export function CreateDestinationWizard() {
   const testMutation = useMutation({
     mutationFn: () => api.post(`/destinations/${destId}/test-connection`),
     onMutate: () => {
+      // Reset validate-write state — a fresh test run invalidates the prior
+      // validate-write result.
+      setValidateWriteStatus("idle");
+      setValidateWriteError(null);
       if (destType === "iceberg") {
         setTestChecks([
           { label: "Resolve Iceberg catalog", status: "running" },
           { label: "List namespace", status: "pending" },
           { label: "S3 HeadBucket / warehouse prefix", status: "pending" },
+          { label: "Write permission", status: "pending" },
         ]);
       } else {
         setTestChecks([
@@ -143,26 +153,95 @@ export function CreateDestinationWizard() {
       const isSuccess = d.status === "success";
       const checks = d.checks ?? [];
       if (destType === "iceberg" && checks.length) {
-        setTestChecks(checks.map((c: any) => ({
-          label: c.label,
-          status: c.ok ? "success" : "error",
-          message: c.message,
-        })));
+        // Iceberg test-connection returns real per-check results. Mirror them
+        // and append a "Write permission" row that the validate-write mutation
+        // will fill in.
+        setTestChecks([
+          ...checks.map((c: any) => ({
+            label: c.label,
+            status: c.ok ? "success" : "error",
+            message: c.message,
+          })),
+          { label: "Write permission", status: "pending" },
+        ]);
+        if (isSuccess) {
+          // Auto-trigger validate-write after a successful test.
+          validateWriteMutation.mutate();
+        } else {
+          setValidateWriteStatus("error");
+          setValidateWriteError(d.message ?? d.error_details ?? "Connection test failed");
+        }
         return;
       }
       const msg = d.message ?? d.error_details ?? undefined;
       setTestChecks([
         { label: "Network connectivity", status: isSuccess ? "success" : "error", message: isSuccess ? undefined : msg },
         { label: "Authentication", status: isSuccess ? "success" : "error" },
-        { label: "Write permission", status: isSuccess ? "success" : "error" },
+        { label: "Write permission", status: isSuccess ? "running" : "error", message: isSuccess ? "Validating write permissions..." : undefined },
       ]);
+      if (isSuccess) {
+        // Auto-trigger validate-write after a successful test.
+        validateWriteMutation.mutate();
+      } else {
+        setValidateWriteStatus("error");
+        setValidateWriteError(msg ?? "Connection test failed");
+      }
     },
     onError: (err: any) => {
+      setValidateWriteStatus("error");
+      setValidateWriteError(formatApiDetail(err));
       setTestChecks([
         { label: "Network connectivity", status: "error", message: err.response?.data?.detail ?? err.message },
         { label: "Authentication", status: "pending" },
         { label: "Write permission", status: "pending" },
       ]);
+    },
+  });
+
+  // validate-write mutation — calls POST /destinations/{id}/validate-write-permissions
+  // after a successful test-connection. Blocks "Finish Setup" until it returns ok.
+  const validateWriteMutation = useMutation({
+    mutationFn: () => api.post(`/destinations/${destId}/validate-write-permissions`),
+    onMutate: () => {
+      setValidateWriteStatus("running");
+      setValidateWriteError(null);
+      setTestChecks((prev) =>
+        prev.map((c) =>
+          c.label === "Write permission"
+            ? { ...c, status: "running", message: "Validating write permissions..." }
+            : c,
+        ),
+      );
+    },
+    onSuccess: (res) => {
+      const d = res.data ?? {};
+      // Iceberg returns {ok, can_write, can_create_table, can_insert, can_delete, checks, error, message}
+      // Postgres/MySQL return {has_write_permissions, message, destination_id}
+      const ok = d.ok === true || d.has_write_permissions === true;
+      const msg = d.message ?? d.error ?? undefined;
+      setValidateWriteStatus(ok ? "success" : "error");
+      if (!ok) {
+        setValidateWriteError(msg ?? "Write permission check failed");
+      }
+      setTestChecks((prev) =>
+        prev.map((c) =>
+          c.label === "Write permission"
+            ? { ...c, status: ok ? "success" : "error", message: ok ? undefined : msg }
+            : c,
+        ),
+      );
+    },
+    onError: (err: any) => {
+      const detail = formatApiDetail(err);
+      setValidateWriteStatus("error");
+      setValidateWriteError(detail);
+      setTestChecks((prev) =>
+        prev.map((c) =>
+          c.label === "Write permission"
+            ? { ...c, status: "error", message: detail }
+            : c,
+        ),
+      );
     },
   });
 
@@ -468,11 +547,45 @@ export function CreateDestinationWizard() {
                 <p className="text-sm text-muted-foreground">Click "Run Test" to verify your destination connection.</p>
               )}
             </div>
+
+            {/* Validate-write error — block Finish Setup until it passes */}
+            {validateWriteStatus === "error" && validateWriteError && (
+              <div
+                role="alert"
+                className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+              >
+                <p className="font-medium">Write permission validation failed</p>
+                <p className="mt-1 text-xs whitespace-pre-wrap break-words">{validateWriteError}</p>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Fix the destination credentials/permissions and click "Run Test" again to retry.
+                </p>
+              </div>
+            )}
+
+            {validateWriteStatus === "success" && (
+              <div
+                role="alert"
+                className="rounded-md border border-green-500/50 bg-green-500/10 p-3 text-sm text-green-700 dark:text-green-400"
+              >
+                <p className="font-medium">Write permissions validated</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  The destination credentials can create tables, insert, and update rows. You can finish setup now.
+                </p>
+              </div>
+            )}
+
             <div className="flex gap-2">
-              <Button onClick={() => testMutation.mutate()} disabled={testMutation.isPending}>
+              <Button onClick={() => testMutation.mutate()} disabled={testMutation.isPending || validateWriteMutation.isPending}>
                 {testMutation.isPending ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Testing...</> : "Run Test"}
               </Button>
-              <Button variant="outline" onClick={() => navigate(`/destinations/${destId}`)}>Finish Setup</Button>
+              <Button
+                variant="outline"
+                onClick={() => navigate(`/destinations/${destId}`)}
+                disabled={validateWriteStatus !== "success"}
+                title={validateWriteStatus !== "success" ? "Finish Setup is disabled until write permissions are validated" : undefined}
+              >
+                {validateWriteMutation.isPending ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Validating write permissions...</> : "Finish Setup"}
+              </Button>
             </div>
           </CardContent>
         </Card>

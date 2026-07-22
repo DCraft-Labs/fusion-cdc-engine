@@ -150,12 +150,23 @@ class CDCTransformTask:
         connection_id = task["connection_id"]
         events = task.get("events", [])   # list of CDC row dicts
         steps = task.get("transform_steps", [])
-        dest_dsn = task.get("dest_dsn", "")
+        dest = task.get("destination") or {}
+        connector_type = dest.get("connector_type") or task.get("dest_connector_type", "postgres")
         schema = task.get("dest_schema", "dw")
         table = task.get("dest_table", "data")
         pk_col = task.get("primary_key", "id")
-        dest = task.get("destination") or {}
-        connector_type = dest.get("connector_type") or task.get("dest_connector_type", "postgres")
+
+        # Derive the destination DSN. Prefer an explicit dest_dsn on the task
+        # (legacy path); otherwise build it from the destination block's
+        # connection_config — which the control-plane transform-route endpoint
+        # now populates with a decrypted plaintext password. Without this,
+        # Postgres-bound CDC silently no-ops because dest_dsn is empty and the
+        # upsert branch is skipped (see the `elif dest_dsn:` guard below).
+        dest_dsn = task.get("dest_dsn", "")
+        if not dest_dsn and connector_type != "iceberg":
+            dest_dsn = self._pg_dsn_from_dest(dest)
+            if dest_dsn:
+                log.debug("CDCTransform derived dest_dsn from destination block for connection=%s", connection_id)
 
         log.info("CDCTransform connection=%s events=%d dest=%s", connection_id, len(events), connector_type)
 
@@ -173,6 +184,42 @@ class CDCTransformTask:
             self._apply_to_iceberg(to_upsert, to_delete_pks, dest, table, pk_col)
         elif dest_dsn:
             self._upsert(to_upsert, to_delete_pks, dest_dsn, schema, table, pk_col)
+        else:
+            log.error(
+                "CDCTransform connection=%s cannot write to %s destination: "
+                "no dest_dsn and destination block missing/incomplete — "
+                "dropping %d events",
+                connection_id, connector_type, len(events),
+            )
+
+    @staticmethod
+    def _pg_dsn_from_dest(dest: dict) -> str:
+        """Build a PostgreSQL DSN from a destination block.
+
+        The destination block shape (produced by the control-plane
+        ``/internal/workers/{id}/transform-route/...`` endpoint) is::
+
+            {"connector_type": "postgres",
+             "connection_config": {"host": ..., "port": ..., "database_name": ...,
+                                    "username": ..., "password": ...}}
+
+        Returns an empty string if any required field is missing so the caller
+        can fall back to logging an error instead of raising.
+        """
+        cfg = (dest.get("connection_config") or dest.get("config") or {})
+        host = cfg.get("host") or ""
+        port = cfg.get("port") or 5432
+        database = (cfg.get("database_name") or cfg.get("database")
+                    or cfg.get("dbname") or "")
+        user = cfg.get("username") or cfg.get("user") or ""
+        password = cfg.get("password") or ""
+        if not host or not database or not user:
+            return ""
+        from urllib.parse import quote_plus
+        return (
+            f"postgresql://{quote_plus(user)}:{quote_plus(password)}@"
+            f"{host}:{port}/{quote_plus(database)}"
+        )
 
     def _apply_to_iceberg(self, rows: list[dict], delete_pks: list,
                           dest: dict, table: str, pk_col: str):

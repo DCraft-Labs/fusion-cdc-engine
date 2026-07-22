@@ -4,6 +4,53 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.13] — 2026-07-23
+
+Closes the three honest gaps the v1.2.12 worker audit flagged. No new
+features — only the wiring needed to make Postgres-bound CDC actually
+sync and the frontend wizard actually block on write-permission failure.
+
+### Fixed
+- **Postgres-bound CDC now derives `dest_dsn` from the destination block.**
+  The `cdc_transform` task payload produced by
+  `cdc_worker/transform_bridge.py` included the destination block but not
+  `dest_dsn`, and `transform-worker/loader.py:CDCTransformTask.run` read
+  `task.get("dest_dsn", "")` — so for any Postgres destination the upsert
+  branch was silently skipped (`elif dest_dsn:` was false) and CDC events
+  were dropped. Two fixes:
+  - `control-plane/app/api/internal.py:get_transform_route` now decrypts the
+    destination's `password_encrypted` and includes the plaintext `password`
+    in the `connection_config` copy sent to the transform-worker (the stored
+    row still keeps only `password_encrypted`).
+  - `transform-worker/loader.py:CDCTransformTask.run` now derives
+    `dest_dsn = "postgresql://{user}:{password}@{host}:{port}/{database}"`
+    from the destination block when `dest_dsn` is not explicitly set on the
+    task, via the new `_pg_dsn_from_dest` helper. If the destination block is
+    missing/incomplete it logs an error and drops the batch instead of
+    silently no-op'ing.
+- **Frontend Create Destination wizard now calls validate-write.** The
+  backend `POST /destinations/{id}/validate-write-permissions` endpoint
+  existed since v1.2.12 but the wizard's "Finish Setup" button proceeded
+  without ever calling it. The wizard now auto-triggers validate-write
+  after a successful test-connection, shows a "Validating write permissions..."
+  loading state, disables "Finish Setup" until validate-write returns
+  `ok: true`, and renders a clear error (via `formatApiDetail` from
+  `lib/api-errors.ts`) if it fails (`frontend/src/pages/destinations/
+  CreateDestinationWizard.tsx`).
+
+### Added
+- `.tmp/v113-verify/verify_v113.py` — live E2E verification script the
+  operator runs after deploying v1.2.13. Logs in as admin, finds the seeded
+  Iceberg destination, asserts test-connection returns `ok: true` with
+  populated `checks`, asserts validate-write returns `ok: true`, creates a
+  Postgres source + Postgres destination + connection, triggers sync, and
+  documents the manual `kubectl exec ... psql -c 'INSERT ...'` step plus
+  the destination-side `SELECT` to confirm the row landed.
+
+### Changed
+- Bumped `control-plane/app/main.py` FastAPI `version` to `1.2.13`.
+- Bumped `helm/fusion-cdc/Chart.yaml` to `version: 1.2.13` / `appVersion: "1.2.13"`.
+
 ## [1.2.12] — 2026-07-23
 
 Real Iceberg Test Connection, real Iceberg write-permission check, and a
