@@ -17,6 +17,100 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Destination DSN builders — derive a SQLAlchemy-style DSN from a destination
+# block produced by the control-plane transform-route endpoint. The block
+# shape is:
+#   {"connector_type": "postgresql" | "mysql" | "mongodb" | "iceberg" | ...,
+#    "connection_config": {"host": ..., "port": ..., "database_name": ...,
+#                          "username": ..., "password": <decrypted plaintext>}}
+#
+# Each builder returns "" when a required field is missing so the caller can
+# log + drop the batch instead of raising. The dispatcher returns "" for
+# unknown types and for "iceberg" (which is handled by a separate writer).
+# ---------------------------------------------------------------------------
+
+def _pg_dsn_from_dest(dest: dict) -> str:
+    """Build a PostgreSQL DSN: postgresql://{user}:{password}@{host}:{port}/{database}."""
+    cfg = (dest.get("connection_config") or dest.get("config") or {})
+    host = cfg.get("host") or ""
+    port = cfg.get("port") or 5432
+    database = (cfg.get("database_name") or cfg.get("database")
+                or cfg.get("dbname") or "")
+    user = cfg.get("username") or cfg.get("user") or ""
+    password = cfg.get("password") or ""
+    if not host or not database or not user:
+        return ""
+    from urllib.parse import quote_plus
+    return (
+        f"postgresql://{quote_plus(user)}:{quote_plus(password)}@"
+        f"{host}:{port}/{quote_plus(database)}"
+    )
+
+
+def _mysql_dsn_from_dest(dest: dict) -> str:
+    """Build a MySQL DSN: mysql+pymysql://{user}:{password}@{host}:{port}/{database}."""
+    cfg = (dest.get("connection_config") or dest.get("config") or {})
+    host = cfg.get("host") or ""
+    port = cfg.get("port") or 3306
+    database = (cfg.get("database_name") or cfg.get("database")
+                or cfg.get("dbname") or "")
+    user = cfg.get("username") or cfg.get("user") or ""
+    password = cfg.get("password") or ""
+    if not host or not database or not user:
+        return ""
+    from urllib.parse import quote_plus
+    return (
+        f"mysql+pymysql://{quote_plus(user)}:{quote_plus(password)}@"
+        f"{host}:{port}/{quote_plus(database)}"
+    )
+
+
+def _mongo_dsn_from_dest(dest: dict) -> str:
+    """Build a MongoDB URI: mongodb://{user}:{password}@{host}:{port}/{database}?authSource=admin.
+
+    Mirrors the format already used by ``cdc_consumer._do_initial_load_mongodb``
+    so the destination side stays consistent with the source side. Returns ""
+    when host is missing.
+    """
+    cfg = (dest.get("connection_config") or dest.get("config") or {})
+    host = cfg.get("host") or ""
+    port = cfg.get("port") or 27017
+    database = (cfg.get("database_name") or cfg.get("database") or "")
+    user = cfg.get("username") or cfg.get("user") or ""
+    password = cfg.get("password") or ""
+    auth_source = (cfg.get("auth_source") if isinstance(cfg.get("auth_source"), str)
+                   else "admin") or "admin"
+    if not host:
+        return ""
+    from urllib.parse import quote_plus
+    path = f"/{quote_plus(database)}" if database else "/"
+    if user and password:
+        return (
+            f"mongodb://{quote_plus(user)}:{quote_plus(password)}@"
+            f"{host}:{port}{path}?authSource={auth_source}"
+        )
+    return f"mongodb://{host}:{port}{path}?authSource={auth_source}"
+
+
+def _dest_dsn_from_dest(dest: dict) -> str:
+    """Dispatch on destination connector_type and return the right DSN.
+
+    Returns "" for unknown types and for "iceberg" (the Iceberg writer is a
+    separate code path that does not use a SQL DSN). Callers must treat an
+    empty string as "cannot route this batch" and log + drop.
+    """
+    ctype = (dest.get("connector_type") or "").lower()
+    if ctype in ("postgres", "postgresql"):
+        return _pg_dsn_from_dest(dest)
+    if ctype == "mysql":
+        return _mysql_dsn_from_dest(dest)
+    if ctype == "mongodb":
+        return _mongo_dsn_from_dest(dest)
+    # iceberg / unknown → no SQL DSN
+    return ""
+
+
 class InitialLoadTask:
     """
     Handles one chunk of an initial 100M-row load:
@@ -65,7 +159,24 @@ class InitialLoadTask:
                 if child_rows:
                     self._write_to_iceberg(child_rows, dest, child_name)
         else:
-            dest_dsn = self._get_dest_dsn(connection_id)
+            # Derive the destination DSN from the destination block included
+            # in the task payload (mirrors CDCTransformTask.run in v1.2.13).
+            # The control-plane transform-route endpoint populates
+            # connection_config.password with the decrypted plaintext, so the
+            # worker never needs the Fernet key or a separate /dest-dsn call
+            # (the previous implementation called a non-existent
+            # /internal/connections/{id}/dest-dsn endpoint and 404'd on every
+            # initial-load chunk — see Gap 1 in the v1.2.14 release notes).
+            dest_dsn = _dest_dsn_from_dest(dest)
+            if not dest_dsn:
+                log.error(
+                    "InitialLoad connection=%s chunk=%d cannot derive dest_dsn for "
+                    "connector_type=%s — destination block missing/incomplete. "
+                    "Dropping %d rows.",
+                    connection_id, chunk_seq, connector_type, len(transformed),
+                )
+                self._mark_chunk_done(connection_id, chunk_seq, 0, last_pk=pk_end)
+                return
             rows_written = self._copy_to_postgres(transformed, dest_dsn, schema, table)
             for child_name, child_rows in child_tables.items():
                 if child_rows:
@@ -93,13 +204,6 @@ class InitialLoadTask:
         }, timeout=300)
         resp.raise_for_status()
         return resp.json().get("rows", [])
-
-    def _get_dest_dsn(self, connection_id: str) -> str:
-        import requests
-        url = f"{self.engine.control_plane_url}/internal/connections/{connection_id}/dest-dsn"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        return resp.json()["dsn"]
 
     def _copy_to_postgres(self, rows: list[dict], dsn: str, schema: str, table: str) -> int:
         if not rows:
@@ -158,13 +262,16 @@ class CDCTransformTask:
 
         # Derive the destination DSN. Prefer an explicit dest_dsn on the task
         # (legacy path); otherwise build it from the destination block's
-        # connection_config — which the control-plane transform-route endpoint
-        # now populates with a decrypted plaintext password. Without this,
-        # Postgres-bound CDC silently no-ops because dest_dsn is empty and the
-        # upsert branch is skipped (see the `elif dest_dsn:` guard below).
+        # connection_config via the type-aware dispatcher — the control-plane
+        # transform-route endpoint populates connection_config.password with
+        # the decrypted plaintext so the worker can build a usable DSN for
+        # Postgres / MySQL / MongoDB without the Fernet key. Without this,
+        # CDC silently no-ops because dest_dsn is empty and the upsert branch
+        # is skipped (see the `elif dest_dsn:` guard below). Unknown
+        # destination types return "" so the batch is logged + dropped.
         dest_dsn = task.get("dest_dsn", "")
         if not dest_dsn and connector_type != "iceberg":
-            dest_dsn = self._pg_dsn_from_dest(dest)
+            dest_dsn = _dest_dsn_from_dest(dest)
             if dest_dsn:
                 log.debug("CDCTransform derived dest_dsn from destination block for connection=%s", connection_id)
 
@@ -187,39 +294,10 @@ class CDCTransformTask:
         else:
             log.error(
                 "CDCTransform connection=%s cannot write to %s destination: "
-                "no dest_dsn and destination block missing/incomplete — "
-                "dropping %d events",
+                "no dest_dsn and destination block missing/incomplete or "
+                "connector_type unsupported — dropping %d events",
                 connection_id, connector_type, len(events),
             )
-
-    @staticmethod
-    def _pg_dsn_from_dest(dest: dict) -> str:
-        """Build a PostgreSQL DSN from a destination block.
-
-        The destination block shape (produced by the control-plane
-        ``/internal/workers/{id}/transform-route/...`` endpoint) is::
-
-            {"connector_type": "postgres",
-             "connection_config": {"host": ..., "port": ..., "database_name": ...,
-                                    "username": ..., "password": ...}}
-
-        Returns an empty string if any required field is missing so the caller
-        can fall back to logging an error instead of raising.
-        """
-        cfg = (dest.get("connection_config") or dest.get("config") or {})
-        host = cfg.get("host") or ""
-        port = cfg.get("port") or 5432
-        database = (cfg.get("database_name") or cfg.get("database")
-                    or cfg.get("dbname") or "")
-        user = cfg.get("username") or cfg.get("user") or ""
-        password = cfg.get("password") or ""
-        if not host or not database or not user:
-            return ""
-        from urllib.parse import quote_plus
-        return (
-            f"postgresql://{quote_plus(user)}:{quote_plus(password)}@"
-            f"{host}:{port}/{quote_plus(database)}"
-        )
 
     def _apply_to_iceberg(self, rows: list[dict], delete_pks: list,
                           dest: dict, table: str, pk_col: str):

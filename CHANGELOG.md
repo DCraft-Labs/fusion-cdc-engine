@@ -4,6 +4,57 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.14] — 2026-07-23
+
+Closes the two real gaps the v1.2.13 audit flagged after shipping. The
+initial-load (snapshot) path was broken — the transform-worker
+`InitialLoadTask` called a non-existent control-plane endpoint to fetch the
+destination DSN, so every initial-load chunk 404'd and the snapshot never
+completed. This is *more* critical than the CDC path because initial load is
+the first thing that happens when a connection is created — without it, CDC
+never starts. The second gap: the v1.2.13 `dest_dsn` derivation only handled
+Postgres, so MySQL/MongoDB destinations could not be routed.
+
+### Fixed
+- **Initial-load `dest_dsn` is now derived from the task payload (Gap 1).**
+  `transform-worker/loader.py:InitialLoadTask._get_dest_dsn` previously called
+  `GET /internal/connections/{id}/dest-dsn`, an endpoint that does not exist
+  on the control-plane internal router (mounted at `/api/v1/internal/*` —
+  see `control-plane/app/main.py:505`). Every initial-load chunk therefore
+  raised `requests.exceptions.HTTPError` on the 404 and the snapshot failed.
+  The fix mirrors the v1.2.13 CDC pattern: the destination block (with the
+  decrypted plaintext `password` in `connection_config`) is already part of
+  the task payload, so `InitialLoadTask.run` now derives the DSN locally via
+  the new `_dest_dsn_from_dest` dispatcher and the dead `_get_dest_dsn`
+  method has been removed. If the destination block is missing/incomplete or
+  the connector_type is unsupported, the chunk logs an error and drops the
+  rows instead of crashing or silently no-op'ing.
+- **MySQL and MongoDB DSN builders added (Gap 2).** The v1.2.13 fix only
+  handled Postgres (`_pg_dsn_from_dest`). New module-level builders
+  `_mysql_dsn_from_dest` (`mysql+pymysql://{user}:{password}@{host}:{port}/{database}`)
+  and `_mongo_dsn_from_dest` (`mongodb://{user}:{password}@{host}:{port}/{database}?authSource=admin`,
+  mirroring the existing source-side Mongo URI in `cdc_consumer.py`) have been
+  added, plus a dispatcher `_dest_dsn_from_dest(dest)` that branches on
+  `dest.connector_type`. `CDCTransformTask.run` and `InitialLoadTask.run`
+  both call the dispatcher instead of the Postgres-only helper. Unknown
+  connector types return `""` so the batch is logged + dropped. Note: MySQL
+  and MongoDB destination connector definitions are not seeded in
+  `seed-admin.sql` today (they are source-only connectors); the builders are
+  in place for when those destination definitions are added.
+
+### Added
+- `.tmp/v114-verify/verify_v114.py` — live E2E verification script the
+  operator runs after deploying v1.2.14. Extends the v1.2.13 script with:
+  (a) DSN-builder unit assertions for Postgres / MySQL / MongoDB, including
+  the unknown-type log+drop path; (b) a Postgres initial-load (snapshot)
+  E2E that creates a fresh connection, triggers sync, and polls the
+  initial-load status endpoint until the snapshot is reported complete
+  (the critical Gap 1 regression check).
+
+### Changed
+- Bumped `control-plane/app/main.py` FastAPI `version` to `1.2.14`.
+- Bumped `helm/fusion-cdc/Chart.yaml` to `version: 1.2.14` / `appVersion: "1.2.14"`.
+
 ## [1.2.13] — 2026-07-23
 
 Closes the three honest gaps the v1.2.12 worker audit flagged. No new

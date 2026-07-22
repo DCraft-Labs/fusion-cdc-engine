@@ -4,8 +4,8 @@ description: >
   Fusion CDC Engine â€” Multi-tenant Change Data Capture platform.
   Deploys control-plane, cdc-workers (postgres/mysql/mongodb), spark-consumer, and Redis.
 type: application
-version: 1.2.13
-appVersion: "1.2.13"
+version: 1.2.14
+appVersion: "1.2.14"
 keywords:
   - cdc
   - change-data-capture
