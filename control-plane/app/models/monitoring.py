@@ -345,6 +345,15 @@ class InitialLoadCheckpoint(BaseModel):
     started_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     completed_at = Column(DateTime(timezone=True), nullable=True)
     error = Column(Text, nullable=True)
+    # v1.2.17: PK-bounded chunked initial load resume state.
+    # chunk_seq     — last completed chunk sequence (0 = no chunk done yet)
+    # last_pk       — stringified last PK value processed (NULL = none yet)
+    # total_chunks  — total chunk count (NULL when unknown / no pre-count)
+    # current_chunk — 1-based index of the chunk currently in flight
+    chunk_seq = Column(BigInteger, nullable=False, server_default=text("0"))
+    last_pk = Column(Text, nullable=True)
+    total_chunks = Column(BigInteger, nullable=True)
+    current_chunk = Column(BigInteger, nullable=False, server_default=text("0"))
 
     def __repr__(self) -> str:
         return f"<InitialLoadCheckpoint(connection={self.connection_id}, table={self.source_table})>"

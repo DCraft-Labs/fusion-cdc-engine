@@ -512,6 +512,9 @@ def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
                 "chunk_seq": 0,
                 "pk_start": None,
                 "pk_end": None,
+                # v1.2.17: PK-bounded chunk size (rows per chunk). The worker
+                # loops internally and resumes from last_pk on restart.
+                "chunk_size": int(os.environ.get("INITIAL_LOAD_CHUNK_SIZE", "10000")),
                 "transform_steps": steps,
                 "destination": dest_block,
                 "source": source_block,

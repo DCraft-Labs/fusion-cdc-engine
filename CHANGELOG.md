@@ -4,6 +4,63 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.17] — 2026-07-23
+
+Fixes the v1.2.16 transform-worker initial-load regression. The v1.2.16
+`InitialLoadTask` fetched the **entire source table into memory** for all
+three connector types (Postgres `SELECT * … fetchall()`, MySQL
+`SELECT * … list(fetchall())`, MongoDB `list(find(no_cursor_timeout=True))`),
+which OOM-killed the worker on any table larger than ~1 GB. The producer
+also enqueued a single chunk per stream with `pk_start=None, pk_end=None`,
+so there was no way to resume a partial load.
+
+### Added
+- **PK-bounded chunked initial load in the transform-worker.**
+  `transform-worker/loader.py:InitialLoadTask.run` now loops over
+  PK-bounded chunks of `chunk_size` rows (default 10000, configurable via
+  `INITIAL_LOAD_CHUNK_SIZE` env var on the control-plane producer). Each
+  connector has a dedicated chunked fetch:
+  - Postgres `_fetch_pg_chunk`: `SELECT * FROM t WHERE pk > $last ORDER BY pk LIMIT $n`
+  - MySQL `_fetch_mysql_chunk`: `SELECT * FROM t WHERE pk > $last ORDER BY pk LIMIT $n`
+  - MongoDB `_fetch_mongo_chunk`: `find({_id: {$gt: last}}).sort({_id:1}).limit(n)`
+  Memory is now bounded to one chunk (~a few MB) instead of the whole table.
+- **Checkpoint resume.** New control-plane endpoint
+  `GET /internal/load-checkpoints/last/{connection_id}/{stream_id}` returns
+  the last checkpoint for a stream. `InitialLoadTask.run` calls it at start
+  and resumes from `last_pk + 1` when `status != completed`. The existing
+  `POST /internal/load-checkpoints` endpoint now persists `last_pk`,
+  `chunk_seq`, and `current_chunk` after every chunk.
+- **Alembic migration `b4c5d6e7f8a9`** adds four columns to
+  `initial_load_checkpoints`: `chunk_seq`, `last_pk`, `total_chunks`,
+  `current_chunk`. The model `InitialLoadCheckpoint` in
+  `control-plane/app/models/monitoring.py` is updated to match.
+- **Graceful drain.** `transform-worker/worker.py` now sets a module-level
+  `STOP_EVENT` on SIGTERM/SIGINT; the chunk loop in `InitialLoadTask.run`
+  checks it after each chunk and exits cleanly, leaving the checkpoint in
+  `running` state so the next worker resumes from the last completed chunk.
+
+### Fixed
+- **OOM on large initial loads.** A 2 GB source table no longer
+  materializes into a Python list of dicts in the transform-worker; it is
+  streamed one chunk at a time. The inline `cdc_consumer.py` path already
+  streamed via server-side cursors (SSDictCursor / Mongo cursor) and is
+  unchanged — only the transform-worker regression is fixed here.
+
+### Known gaps (honest)
+- `total_chunks` is left `NULL` because the producer does not pre-count
+  the source table (a `COUNT(*)` on a 2 GB table is expensive and would
+  block the producer). Progress is reported as `chunk_seq` /
+  `current_chunk` only.
+- The inline `cdc_consumer.py` path streams but does **not** PK-chunk and
+  does **not** resume mid-table — a crash mid-load re-TRUNCATEs and
+  re-does the whole table. This is a pre-existing limitation, not a
+  regression; the transform-worker path now does better.
+- If the transform-worker pod is force-killed (SIGKILL, not SIGTERM) the
+  in-flight chunk's rows are lost and the checkpoint is not advanced; the
+  next run resumes from the last **completed** chunk, re-doing the
+  in-flight chunk. Idempotent because the destination uses COPY into a
+  TRUNCATEd table per stream (no duplicates).
+
 ## [1.2.16] — 2026-07-23
 
 Closes the three remaining gaps from v1.2.14. The transform-worker

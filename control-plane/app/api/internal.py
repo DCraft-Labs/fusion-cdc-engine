@@ -898,6 +898,14 @@ class LoadCheckpointRequest(PydanticModel):
     rows_written: int = 0
     last_pk: Optional[Any] = None
     state: str = "done"   # "done" | "running" | "failed"
+    # v1.2.17: PK-bounded chunked resume fields. ``current_chunk`` is the
+    # 1-based index of the chunk just completed (or in flight when
+    # state="running"); ``total_chunks`` is optional and NULL when the
+    # producer did not pre-count the table. ``rows_written`` is treated as
+    # the *cumulative* total for the stream when ``state`` is "running" or
+    # "done" (replacing the prior value), matching the worker's accounting.
+    current_chunk: Optional[int] = None
+    total_chunks: Optional[int] = None
 
 
 class LoadCheckpointResponse(PydanticModel):
@@ -958,6 +966,15 @@ def upsert_load_checkpoint(
     if existing is not None:
         existing.rows_written = (existing.rows_written or 0) + payload.rows_written
         existing.status = status
+        # v1.2.17: persist chunk-resume fields so a worker restart can
+        # resume from the last processed PK instead of re-doing the table.
+        existing.chunk_seq = payload.chunk_seq
+        if payload.last_pk is not None:
+            existing.last_pk = str(payload.last_pk)
+        if payload.current_chunk is not None:
+            existing.current_chunk = payload.current_chunk
+        if payload.total_chunks is not None:
+            existing.total_chunks = payload.total_chunks
         if status == "completed":
             existing.completed_at = now
         db.commit()
@@ -971,6 +988,80 @@ def upsert_load_checkpoint(
         status=status,
         started_at=now,
         completed_at=now if status == "completed" else None,
+        chunk_seq=payload.chunk_seq,
+        last_pk=(str(payload.last_pk) if payload.last_pk is not None else None),
+        current_chunk=(payload.current_chunk if payload.current_chunk is not None else 0),
+        total_chunks=payload.total_chunks,
     ))
     db.commit()
     return LoadCheckpointResponse(ok=True, upserted=1)
+
+
+# ---------------------------------------------------------------------------
+# v1.2.17: GET the last checkpoint for a (connection_id, stream_id) pair so
+# the transform-worker can resume a chunked initial load from the last
+# processed PK after a restart / OOM-kill. Returns 404 when no checkpoint
+# row exists yet (first run).
+# ---------------------------------------------------------------------------
+
+class LoadCheckpointSnapshot(PydanticModel):
+    connection_id: str
+    stream_id: Optional[str] = None
+    source_table: Optional[str] = None
+    status: str
+    rows_written: int
+    chunk_seq: int
+    last_pk: Optional[Any] = None
+    current_chunk: int
+    total_chunks: Optional[int] = None
+
+
+@router.get(
+    "/load-checkpoints/last/{connection_id}/{stream_id}",
+    response_model=LoadCheckpointSnapshot,
+    summary="Fetch last initial-load checkpoint for resume (v1.2.17)",
+)
+def get_last_load_checkpoint(
+    connection_id: str,
+    stream_id: str,
+    db: Session = Depends(get_db),
+    _token: str = Depends(_verify_worker_token),
+) -> LoadCheckpointSnapshot:
+    """Return the latest ``initial_load_checkpoints`` row for the given
+    (connection_id, stream_id) pair. The transform-worker calls this at
+    the start of an ``initial_load`` task to decide whether to resume from
+    ``last_pk`` or start from the beginning.
+    """
+    from uuid import UUID
+    from app.models.monitoring import InitialLoadCheckpoint
+
+    try:
+        conn_uuid = UUID(connection_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="connection_id must be a valid UUID")
+    try:
+        stream_uuid = UUID(stream_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="stream_id must be a valid UUID")
+
+    row = (
+        db.query(InitialLoadCheckpoint)
+        .filter(
+            InitialLoadCheckpoint.connection_id == conn_uuid,
+            InitialLoadCheckpoint.stream_id == stream_uuid,
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="no checkpoint for this stream")
+    return LoadCheckpointSnapshot(
+        connection_id=str(row.connection_id),
+        stream_id=str(row.stream_id),
+        source_table=row.source_table,
+        status=row.status,
+        rows_written=row.rows_written or 0,
+        chunk_seq=row.chunk_seq or 0,
+        last_pk=row.last_pk,
+        current_chunk=row.current_chunk or 0,
+        total_chunks=row.total_chunks,
+    )

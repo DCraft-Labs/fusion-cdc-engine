@@ -6,8 +6,8 @@ from __future__ import annotations
 import io
 import logging
 import os
-import time
-from typing import TYPE_CHECKING
+import threading
+from typing import TYPE_CHECKING, Any
 
 import psycopg2
 import redis
@@ -16,6 +16,16 @@ if TYPE_CHECKING:
     from engine import DuckDBTransformEngine
 
 log = logging.getLogger(__name__)
+
+# v1.2.17: module-level stop event. The worker process sets this on SIGTERM /
+# SIGINT so a long-running chunked initial-load loop can drain gracefully
+# after the current chunk instead of being killed mid-table by k8s.
+STOP_EVENT = threading.Event()
+
+# Default chunk size for PK-bounded initial loads (rows per chunk). The
+# producer can override per-task via ``chunk_size``; this default keeps
+# memory bounded to ~a few MB per chunk for typical row widths.
+DEFAULT_CHUNK_SIZE = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +123,18 @@ def _dest_dsn_from_dest(dest: dict) -> str:
 
 
 class InitialLoadTask:
-    """
-    Handles one chunk of an initial 100M-row load:
-      1. Fetch rows from source (via control-plane proxy or direct DSN)
-      2. Apply all N transform steps via DuckDB engine
-      3. Bulk COPY to destination Postgres
-      4. Write checkpoint (last_pk processed)
+    """v1.2.17: PK-bounded chunked initial load with checkpoint resume.
+
+    The producer enqueues ONE task per stream (chunk_seq=0, pk bounds unset).
+    This task internally loops over PK-bounded chunks of ``chunk_size`` rows,
+    writing each chunk to the destination and reporting a checkpoint after
+    every chunk. On worker restart / OOM-kill, the task reads the last
+    checkpoint from the control-plane and resumes from ``last_pk + 1``
+    instead of re-doing the whole table.
+
+    Memory is bounded to one chunk (~``chunk_size`` rows) at a time — no
+    more full-table ``fetchall()`` OOMs that the v1.2.16 single-chunk path
+    caused for 2GB+ tables.
     """
 
     def __init__(self, engine: "DuckDBTransformEngine", redis_client: redis.Redis):
@@ -127,74 +143,113 @@ class InitialLoadTask:
 
     def run(self, task: dict):
         connection_id = task["connection_id"]
-        chunk_seq = task.get("chunk_seq", 0)
-        pk_start = task.get("pk_start")
-        pk_end = task.get("pk_end")
+        stream_id = task.get("stream_id")
         steps = task.get("transform_steps", [])
         source = task.get("source") or {}
         source_schema = task.get("source_schema") or ""
         source_table = task.get("source_table") or ""
-        stream_id = task.get("stream_id")
+        chunk_size = int(task.get("chunk_size") or DEFAULT_CHUNK_SIZE)
+        # Primary key column used for PK-bounded chunking. The producer sends
+        # ``primary_key`` as a comma-joined string for composite PKs; we chunk
+        # on the first PK column (correct for identity-style composite PKs).
+        pk_raw = task.get("primary_key") or "id"
+        pk_col = str(pk_raw).split(",")[0].strip() or "id"
 
-        log.info("InitialLoad connection=%s chunk=%d pk=[%s, %s] table=%s.%s",
-                 connection_id, chunk_seq, pk_start, pk_end, source_schema, source_table)
+        ctype = (source.get("connector_type") or "").lower()
+        # MongoDB always chunks on the immutable _id field regardless of the
+        # user-declared PK.
+        if ctype == "mongodb":
+            pk_col = "_id"
 
-        # Fetch source rows directly from the source DB (the task payload
-        # includes the source block with a decrypted plaintext password, so
-        # the worker does not need to proxy through the control-plane). The
-        # previous implementation called a non-existent
-        # /internal/data-proxy/fetch endpoint and 404'd on every chunk — see
-        # Gap 3 in the v1.2.16 release notes.
-        rows = self._fetch_rows(source, source_schema, source_table, pk_start, pk_end)
-        if not rows:
-            log.info("No rows in range — chunk %d complete", chunk_seq)
-            self._mark_chunk_done(connection_id, stream_id, source_table, chunk_seq, 0)
-            return
-
-        # Apply transforms
-        if steps:
-            transformed, child_tables = self.engine.execute_pipeline(rows, steps)
-        else:
-            transformed, child_tables = rows, {}
-
-        # Write to destination — route by connector_type
         dest = task.get("destination") or {}
         connector_type = dest.get("connector_type") or task.get("dest_connector_type", "postgres")
-        schema = task.get("dest_schema", "dw")
-        table = task.get("dest_table", "data")
+        dest_schema = task.get("dest_schema", "dw")
+        dest_table = task.get("dest_table", "data")
 
-        if connector_type == "iceberg":
-            rows_written = self._write_to_iceberg(transformed, dest, table)
-            for child_name, child_rows in child_tables.items():
-                if child_rows:
-                    self._write_to_iceberg(child_rows, dest, child_name)
-        else:
-            # Derive the destination DSN from the destination block included
-            # in the task payload (mirrors CDCTransformTask.run in v1.2.13).
-            # The control-plane transform-route endpoint populates
-            # connection_config.password with the decrypted plaintext, so the
-            # worker never needs the Fernet key or a separate /dest-dsn call
-            # (the previous implementation called a non-existent
-            # /internal/connections/{id}/dest-dsn endpoint and 404'd on every
-            # initial-load chunk — see Gap 1 in the v1.2.14 release notes).
-            dest_dsn = _dest_dsn_from_dest(dest)
-            if not dest_dsn:
-                log.error(
-                    "InitialLoad connection=%s chunk=%d cannot derive dest_dsn for "
-                    "connector_type=%s — destination block missing/incomplete. "
-                    "Dropping %d rows.",
-                    connection_id, chunk_seq, connector_type, len(transformed),
-                )
-                self._mark_chunk_done(connection_id, stream_id, source_table, chunk_seq, 0, last_pk=pk_end)
+        log.info("InitialLoad connection=%s table=%s.%s pk=%s chunk_size=%d dest=%s",
+                 connection_id, source_schema, source_table, pk_col, chunk_size, connector_type)
+
+        # ── Resume: fetch the last checkpoint for this stream ──────────────
+        last_pk = None
+        chunk_seq = 0
+        prior_rows = 0
+        ckpt = self._get_last_checkpoint(connection_id, stream_id)
+        if ckpt is not None:
+            if ckpt.get("status") == "completed":
+                log.info("InitialLoad connection=%s stream=%s already completed (%d rows) — skipping",
+                         connection_id, stream_id, ckpt.get("rows_written", 0))
                 return
-            rows_written = self._copy_to_postgres(transformed, dest_dsn, schema, table)
-            for child_name, child_rows in child_tables.items():
-                if child_rows:
-                    self._copy_to_postgres(child_rows, dest_dsn, schema, child_name)
+            last_pk = ckpt.get("last_pk")
+            chunk_seq = int(ckpt.get("chunk_seq") or 0)
+            prior_rows = int(ckpt.get("rows_written") or 0)
+            log.info("InitialLoad connection=%s stream=%s resuming from chunk_seq=%d last_pk=%s (%d rows already written)",
+                     connection_id, stream_id, chunk_seq, last_pk, prior_rows)
 
-        # Checkpoint
-        self._mark_chunk_done(connection_id, stream_id, source_table, chunk_seq, rows_written, last_pk=pk_end)
-        log.info("InitialLoad chunk=%d done — %d rows written", chunk_seq, rows_written)
+        total_rows = prior_rows
+        # ── PK-bounded chunk loop ───────────────────────────────────────────
+        while not STOP_EVENT.is_set():
+            rows = self._fetch_chunk(source, source_schema, source_table,
+                                     pk_col, last_pk, chunk_size, ctype)
+            if not rows:
+                log.info("InitialLoad connection=%s table=%s.%s — no more rows, load complete",
+                         connection_id, source_schema, source_table)
+                break
+
+            # Apply transforms
+            if steps:
+                transformed, child_tables = self.engine.execute_pipeline(rows, steps)
+            else:
+                transformed, child_tables = rows, {}
+
+            # Write to destination
+            if connector_type == "iceberg":
+                rows_written = self._write_to_iceberg(transformed, dest, dest_table)
+                for child_name, child_rows in child_tables.items():
+                    if child_rows:
+                        self._write_to_iceberg(child_rows, dest, child_name)
+            else:
+                dest_dsn = _dest_dsn_from_dest(dest)
+                if not dest_dsn:
+                    log.error(
+                        "InitialLoad connection=%s cannot derive dest_dsn for "
+                        "connector_type=%s — destination block missing/incomplete. "
+                        "Stopping load after %d rows.",
+                        connection_id, connector_type, total_rows,
+                    )
+                    self._report_checkpoint(connection_id, stream_id, source_table,
+                                            chunk_seq, 0, last_pk, state="failed")
+                    return
+                rows_written = self._copy_to_postgres(transformed, dest_dsn, dest_schema, dest_table)
+                for child_name, child_rows in child_tables.items():
+                    if child_rows:
+                        self._copy_to_postgres(child_rows, dest_dsn, dest_schema, child_name)
+
+            total_rows += rows_written
+            chunk_seq += 1
+            # Advance last_pk to the PK of the last row in this chunk.
+            last_pk = self._extract_pk(rows[-1], pk_col, ctype)
+
+            # Report checkpoint as "running" so a restart resumes here.
+            self._report_checkpoint(connection_id, stream_id, source_table,
+                                    chunk_seq, rows_written, last_pk, state="running")
+            log.info("InitialLoad connection=%s chunk=%d done — %d rows (total %d) last_pk=%s",
+                     connection_id, chunk_seq, rows_written, total_rows, last_pk)
+
+            # A short chunk means we've reached the end of the table.
+            if len(rows) < chunk_size:
+                break
+
+        if STOP_EVENT.is_set():
+            log.warning("InitialLoad connection=%s stopped mid-load after chunk %d — checkpoint saved, will resume on restart",
+                        connection_id, chunk_seq)
+            # Leave status as "running" so a restart resumes; do not mark completed.
+            return
+
+        # ── Mark the stream completed ───────────────────────────────────────
+        self._report_checkpoint(connection_id, stream_id, source_table,
+                                chunk_seq, 0, last_pk, state="done")
+        log.info("InitialLoad connection=%s DONE — %d rows across %d chunks",
+                 connection_id, total_rows, chunk_seq)
 
     def _write_to_iceberg(self, rows: list[dict], dest: dict, table_name: str) -> int:
         """Write rows to Iceberg via PyIceberg (DuckDB lake path)."""
@@ -203,110 +258,130 @@ class InitialLoadTask:
         writer = IcebergWriter(dest_config)
         return writer.write_batch(rows, table_name=table_name)
 
-    def _fetch_rows(self, source: dict, schema_name: str, table_name: str,
-                    pk_start=None, pk_end=None) -> list[dict]:
-        """Fetch rows directly from the source DB using the source block in
-        the task payload.
+    def _fetch_chunk(self, source: dict, schema_name: str, table_name: str,
+                    pk_col: str, last_pk, chunk_size: int, ctype: str) -> list[dict]:
+        """Fetch the next PK-bounded chunk of rows from the source DB.
 
-        The source block shape:
-          {"connector_type": "postgres"|"mysql"|"mongodb",
-           "host": ..., "port": ..., "database_name": ..., "username": ...,
-           "password": <decrypted plaintext>, "config": {...}}
-
-        For Postgres/MySQL we issue a parameterised SELECT against
-        ``{schema}.{table}`` (or just ``{table}`` when schema is empty). For
-        MongoDB we cursor the collection and project documents to plain dicts.
-
-        ``pk_start`` / ``pk_end`` are optional PK bounds. When both are None
-        the entire table is fetched (used by the single-chunk initial-load
-        producer in v1.2.16). Returns ``[]`` when the table is empty or when
-        the source block is incomplete.
+        Returns up to ``chunk_size`` rows ordered by ``pk_col`` ASC, with
+        ``pk_col > last_pk`` when ``last_pk`` is not None (resume). Returns
+        ``[]`` when the table is empty / exhausted or the source block is
+        incomplete.
         """
         if not source or not table_name:
             return []
-
-        ctype = (source.get("connector_type") or "").lower()
         host = source.get("host") or ""
         port = source.get("port")
         database = source.get("database_name") or source.get("database") or ""
         user = source.get("username") or source.get("user") or ""
         password = source.get("password") or ""
         cfg = source.get("config") or {}
-
         if not host or not database:
-            log.error("_fetch_rows: source block missing host/database — cannot fetch")
+            log.error("_fetch_chunk: source block missing host/database — cannot fetch")
             return []
-
         try:
             if ctype in ("postgres", "postgresql"):
-                return self._fetch_pg(host, port or 5432, database, user, password,
-                                      schema_name, table_name, pk_start, pk_end)
+                return self._fetch_pg_chunk(host, port or 5432, database, user, password,
+                                             schema_name, table_name, pk_col, last_pk, chunk_size)
             if ctype == "mysql":
-                return self._fetch_mysql(host, port or 3306, database, user, password,
-                                          schema_name, table_name, pk_start, pk_end)
+                return self._fetch_mysql_chunk(host, port or 3306, database, user, password,
+                                                schema_name, table_name, pk_col, last_pk, chunk_size)
             if ctype == "mongodb":
-                return self._fetch_mongo(host, port or 27017, database, user, password,
-                                         cfg, table_name)
-            log.error("_fetch_rows: unsupported source connector_type=%s", ctype)
+                return self._fetch_mongo_chunk(host, port or 27017, database, user, password,
+                                                cfg, table_name, last_pk, chunk_size)
+            log.error("_fetch_chunk: unsupported source connector_type=%s", ctype)
             return []
         except Exception:
-            log.exception("_fetch_rows: failed to fetch from %s.%s on %s",
+            log.exception("_fetch_chunk: failed to fetch from %s.%s on %s",
                          schema_name, table_name, ctype)
             return []
 
-    def _fetch_pg(self, host, port, database, user, password,
-                  schema_name, table_name, pk_start, pk_end) -> list[dict]:
+    def _fetch_pg_chunk(self, host, port, database, user, password,
+                        schema_name, table_name, pk_col, last_pk, chunk_size) -> list[dict]:
         import psycopg2
         import psycopg2.extras
-        qualified = f"{schema_name}.{table_name}" if schema_name else table_name
-        # v1.2.16 producer enqueues a single chunk per stream with pk bounds
-        # unset, so the entire table is fetched in one SELECT. Chunked PK
-        # ranges are a future enhancement; for now we keep the signature but
-        # ignore the bounds.
-        sql = f"SELECT * FROM {qualified}"
+        qualified = (f'"{schema_name}"."{table_name}"'
+                     if schema_name else f'"{table_name}"')
+        pk_q = f'"{pk_col}"'
+        if last_pk is None:
+            sql = f"SELECT * FROM {qualified} ORDER BY {pk_q} ASC LIMIT %s"
+            params: tuple = (chunk_size,)
+        else:
+            sql = (f"SELECT * FROM {qualified} WHERE {pk_q} > %s "
+                   f"ORDER BY {pk_q} ASC LIMIT %s")
+            params = (last_pk, chunk_size)
         with psycopg2.connect(host=host, port=port, dbname=database,
                               user=user, password=password,
                               connect_timeout=10) as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql)
+                cur.execute(sql, params)
                 return [dict(r) for r in cur.fetchall()]
 
-    def _fetch_mysql(self, host, port, database, user, password,
-                     schema_name, table_name, pk_start, pk_end) -> list[dict]:
+    def _fetch_mysql_chunk(self, host, port, database, user, password,
+                           schema_name, table_name, pk_col, last_pk, chunk_size) -> list[dict]:
         import pymysql
         import pymysql.cursors
-        qualified = f"`{schema_name}`.`{table_name}`" if schema_name else f"`{table_name}`"
-        sql = f"SELECT * FROM {qualified}"
+        qualified = (f"`{schema_name}`.`{table_name}`"
+                     if schema_name else f"`{table_name}`")
+        pk_q = f"`{pk_col}`"
+        if last_pk is None:
+            sql = f"SELECT * FROM {qualified} ORDER BY {pk_q} ASC LIMIT %s"
+            params: tuple = (chunk_size,)
+        else:
+            sql = (f"SELECT * FROM {qualified} WHERE {pk_q} > %s "
+                   f"ORDER BY {pk_q} ASC LIMIT %s")
+            params = (last_pk, chunk_size)
         with pymysql.connect(host=host, port=int(port), database=database,
                              user=user, password=password,
                              cursorclass=pymysql.cursors.DictCursor,
                              connect_timeout=10) as conn:
             with conn.cursor() as cur:
-                cur.execute(sql)
+                cur.execute(sql, params)
                 return list(cur.fetchall())
 
-    def _fetch_mongo(self, host, port, database, user, password,
-                     cfg, collection_name) -> list[dict]:
+    def _fetch_mongo_chunk(self, host, port, database, user, password,
+                           cfg, collection_name, last_id, chunk_size) -> list[dict]:
         from urllib.parse import quote_plus
         from pymongo import MongoClient
+        from bson import ObjectId
         auth_source = (cfg.get("auth_source") if isinstance(cfg, dict) else None) or "admin"
         if user and password:
             uri = (f"mongodb://{quote_plus(user)}:{quote_plus(password)}@"
                    f"{host}:{port}/{database}?authSource={auth_source}")
         else:
             uri = f"mongodb://{host}:{port}/{database}?authSource={auth_source}"
+        # ``last_id`` may arrive as a stringified ObjectId (from the row dict
+        # or from the JSON checkpoint on resume). Convert it back to a real
+        # ObjectId so the ``$gt`` comparison matches BSON type ordering
+        # (ObjectId vs String would never match and silently terminate the
+        # load after the first chunk).
+        if last_id is not None and not isinstance(last_id, ObjectId):
+            try:
+                last_id = ObjectId(str(last_id))
+            except Exception:
+                last_id = None
         client = MongoClient(uri, serverSelectionTimeoutMS=10000)
         try:
             db = client[database]
-            docs = list(db[collection_name].find(no_cursor_timeout=True))
-            # Convert ObjectId / datetime to serialisable forms
+            query = {"_id": {"$gt": last_id}} if last_id is not None else {}
+            cursor = (db[collection_name].find(query)
+                      .sort("_id", 1)
+                      .batch_size(min(chunk_size, 1000))
+                      .limit(chunk_size))
             out: list[dict] = []
-            for d in docs:
+            for d in cursor:
                 row = {k: (str(v) if k == "_id" else v) for k, v in d.items()}
                 out.append(row)
             return out
         finally:
             client.close()
+
+    def _extract_pk(self, row: dict, pk_col: str, ctype: str) -> Any:
+        """Pull the PK value from the last row of a chunk for resume."""
+        if not row:
+            return None
+        if ctype == "mongodb" and "_id" in row:
+            return row["_id"]
+        return row.get(pk_col)
 
     def _copy_to_postgres(self, rows: list[dict], dsn: str, schema: str, table: str) -> int:
         if not rows:
@@ -327,14 +402,41 @@ class InitialLoadTask:
                 conn.commit()
         return len(rows)
 
-    def _mark_chunk_done(self, connection_id: str, stream_id, source_table: str,
-                         chunk_seq: int, rows_written: int, last_pk=None):
-        """Report chunk progress to the control-plane /internal/load-checkpoints
-        endpoint (added in v1.2.16), which upserts into initial_load_checkpoints.
+    def _get_last_checkpoint(self, connection_id: str, stream_id) -> dict | None:
+        """v1.2.17: fetch the last checkpoint for this stream so the worker
+        can resume a chunked initial load from ``last_pk + 1``. Returns
+        ``None`` when no checkpoint row exists yet (first run) or when the
+        control-plane is unreachable (treated as a fresh start).
+        """
+        import requests
+        if not stream_id:
+            return None
+        try:
+            resp = requests.get(
+                f"{self.engine.control_plane_url}/internal/load-checkpoints/last/"
+                f"{connection_id}/{stream_id}",
+                headers={"X-Worker-Token": os.environ.get("WORKER_SHARED_SECRET", "")},
+                timeout=10,
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            log.warning("_get_last_checkpoint: failed to fetch checkpoint for connection=%s stream=%s — treating as fresh start",
+                        connection_id, stream_id, exc_info=True)
+            return None
 
-        The previous implementation called a non-existent endpoint and 404'd
-        silently on every chunk. We now pass stream_id + source_table so the
-        control-plane can upsert by (connection_id, stream_id).
+    def _report_checkpoint(self, connection_id: str, stream_id, source_table: str,
+                           chunk_seq: int, rows_written: int, last_pk,
+                           state: str = "done"):
+        """Report chunk progress to the control-plane
+        ``/internal/load-checkpoints`` endpoint (added in v1.2.16, extended in
+        v1.2.17 with ``last_pk`` / ``chunk_seq`` / ``current_chunk``).
+
+        ``rows_written`` is the count for THIS chunk only — the endpoint
+        accumulates into the cumulative stream total. ``state`` is one of
+        ``running`` (mid-load), ``done`` (stream completed), or ``failed``.
         """
         import requests
         try:
@@ -347,13 +449,14 @@ class InitialLoadTask:
                     "chunk_seq": chunk_seq,
                     "rows_written": rows_written,
                     "last_pk": last_pk,
-                    "state": "done",
+                    "state": state,
+                    "current_chunk": chunk_seq,
                 },
                 headers={"X-Worker-Token": os.environ.get("WORKER_SHARED_SECRET", "")},
                 timeout=10,
             )
         except Exception:
-            log.warning("_mark_chunk_done: failed to report checkpoint for connection=%s chunk=%s",
+            log.warning("_report_checkpoint: failed to report checkpoint for connection=%s chunk=%s",
                         connection_id, chunk_seq, exc_info=True)
 
 

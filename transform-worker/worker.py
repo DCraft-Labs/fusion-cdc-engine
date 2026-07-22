@@ -21,7 +21,7 @@ import time
 import redis
 
 from engine import DuckDBTransformEngine
-from loader import InitialLoadTask, CDCTransformTask
+from loader import InitialLoadTask, CDCTransformTask, STOP_EVENT
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -43,8 +43,9 @@ _shutdown = False
 
 def _handle_signal(sig, _frame):
     global _shutdown
-    log.info("Received signal %s — draining current task then shutting down", sig)
+    log.info("Received signal %s — draining current chunk then shutting down", sig)
     _shutdown = True
+    STOP_EVENT.set()
 
 
 def main():
