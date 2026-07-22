@@ -4,6 +4,23 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.11] — 2026-07-22
+
+Coordinated re-tag with the public `dcraft-fusion` v1.2.11. The v1.2.10 tag in
+the public repo shipped corrupted Helm `values.yaml` files (UTF-8 mojibake
+from a PowerShell re-encode pass) which failed `helm lint` in the `Publish
+Helm charts` workflow. v1.2.11 re-tags the CDC images to `1.2.11` so the
+public chart's image references resolve to a green, lint-passing release.
+
+### Changed
+- Bumped FastAPI app `version="1.2.10"` → `"1.2.11"`
+  (`control-plane/app/main.py`).
+- Bumped `fusion-cdc` Helm chart to `version: 1.2.11` / `appVersion: "1.2.11"`
+  (`helm/fusion-cdc/Chart.yaml`).
+
+No semantic code changes vs v1.2.10 — all seven blocker fixes from v1.2.10
+are unchanged.
+
 ## [1.2.10] — 2026-07-22
 
 CDC runtime + local-dev infrastructure repair release. v1.2.9 verified the UI
