@@ -4,6 +4,116 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.20] — 2026-07-23
+
+**Bulletproof connection lifecycle for every source × destination combo.**
+This release closes the architectural gaps that left 4 of the 6
+source × destination combinations silently broken (Iceberg destinations,
+Postgres sources). The routing decision is now centralized in a single
+helper (`_dest_needs_transform_worker`) that the producer, the CDC
+stream consumer, and the transform-worker all consult, so they can
+never disagree on who owns a connection.
+
+### Added (Fix B — Postgres source initial load)
+- **`cdc_consumer._do_initial_load_postgres`** (`cdc-workers/cdc_consumer.py`):
+  new initial-load path for Postgres sources. Uses a psycopg2 **server-side
+  cursor** (named cursor, `itersize=10000`) so multi-GB tables stream from
+  the source without being materialised in memory — the Postgres equivalent
+  of MySQL's `SSDictCursor`. Honours per-stream checkpointing, column
+  mapping, selected-columns whitelist and transform overrides exactly like
+  the MySQL/Mongo paths. Before this, a Postgres source fell through to
+  `_do_initial_load_mysql` (wrong driver, wrong SQL) and crashed at connect
+  time.
+- **`_do_initial_load` router** now dispatches on `postgres`/`postgresql`
+  to the new Postgres loader.
+
+### Fixed (Fix C — route CDC streaming by destination type)
+- **Double-write bug for Postgres destinations.** Before this release the
+  `cdc-worker` published every CDC event to BOTH the `cdc:*` Redis streams
+  (consumed by `cdc_consumer.py`) AND the `fusion:transforms:normal` list
+  (consumed by `transform-worker`). For Postgres destinations both
+  consumers wrote the same row → duplicates. The
+  `control-plane/app/api/internal.py::get_transform_route` resolver now
+  skips connections whose destination is Postgres with
+  `snapshot_mode=inline` (cdc_consumer.py owns those), so the
+  transform-worker only receives events for Iceberg / MySQL / Mongo
+  destinations and Postgres-`transform_worker` destinations.
+- **Silent no-op for Iceberg destinations with default `snapshot_mode`.**
+  Before this release an Iceberg destination with the default
+  `snapshot_mode=inline` was handed to `cdc_consumer.py`, which can only
+  write to Postgres — the load silently failed. `control-plane/app/api/
+  connections.py::_enqueue_initial_load_tasks` now enqueues initial-load
+  tasks for Iceberg / MySQL / Mongo destinations **regardless of
+  `snapshot_mode`**, so the transform-worker always owns non-Postgres
+  destinations.
+- **`cdc_consumer.py` skips connections owned by the transform-worker.**
+  `cdc_consumer.py` now consults `_dest_needs_transform_worker` at
+  startup and in the new-connection poller, and skips any connection
+  whose destination is Iceberg / MySQL / Mongo or Postgres with
+  `snapshot_mode=transform_worker`. This prevents the consumer from
+  trying to connect to an Iceberg catalog as if it were a Postgres host
+  (which logged a confusing "Cannot connect to destination" error on
+  every poll cycle).
+
+### Added (Fix D — connection lifecycle ordering)
+- The connection-create → initial-load → CDC ordering was already
+  enforced by `_trigger_dag_or_worker` calling
+  `_enqueue_initial_load_tasks` after publishing the start-streaming
+  command. This release adds a **contract test**
+  (`tests/integration/test_connection_lifecycle.py`) that pins the
+  ordering so a future refactor cannot silently drop the
+  `_enqueue_initial_load_tasks` call and leave Iceberg destinations
+  empty.
+
+### Tests (regression net)
+- `control-plane/tests/test_connections/test_routing_v120.py` — 37 unit
+  tests pinning the `_dest_needs_transform_worker` rule across all three
+  call sites (cdc_consumer, connections, internal) and every
+  source × destination combination.
+- `cdc-workers/tests/test_initial_load_postgres.py` — 6 unit tests for
+  the new `_do_initial_load_postgres` (router dispatch, server-side
+  cursor streaming, checkpoint skip, no-streams short-circuit).
+- `tests/integration/test_connection_lifecycle.py` — 19 contract tests
+  asserting every (source, dest) combination has a capable consumer,
+  the initial-load path is wired, the CDC streaming path is wired, and
+  the lifecycle ordering is enforced.
+- `.github/workflows/publish-images.yml` — new `test` job runs all three
+  test suites before the `publish` job, so images cannot ship if any
+  routing/contract test fails.
+
+### Changed
+- `control-plane/app/main.py` FastAPI `version` → `1.2.20`.
+- `helm/fusion-cdc/Chart.yaml` `version` / `appVersion` → `1.2.20`.
+
+### Architecture (chosen flow)
+```
+connection create (POST /connections, status=active)
+  └─ _trigger_dag_or_worker
+       ├─ publish start-streaming → cdc-worker (Redis pub/sub + HTTP)
+       └─ _enqueue_initial_load_tasks
+            └─ if dest needs transform-worker (Iceberg/MySQL/Mongo, or
+                Postgres+transform_worker): LPUSH initial_load task →
+                fusion:transforms:high → transform-worker InitialLoadTask
+            └─ else (Postgres+inline): no task; cdc_consumer.py owns the
+                snapshot on its next poll
+
+CDC streaming (continuous):
+  cdc-worker publishes event →
+    ├─ XADD cdc:{bank}:{tenant}:{source}:{schema}:{table}  (Redis stream)
+    └─ TransformBridge.publish_event
+         └─ GET /internal/workers/{id}/transform-route/...
+              └─ returns [] for Postgres-inline (cdc_consumer owns it)
+              └─ returns route for Iceberg/MySQL/Mongo/PG-transform_worker
+                   → LPUSH cdc_transform task → fusion:transforms:normal
+                   → transform-worker CDCTransformTask
+
+Consumers:
+  cdc_consumer.py        → reads cdc:* streams → writes to Postgres ONLY
+                          (skips Iceberg/MySQL/Mongo/PG-transform_worker)
+  transform-worker       → reads fusion:transforms:* lists → writes to
+                          Postgres / MySQL / Mongo / Iceberg
+```
+
 ## [1.2.19] — 2026-07-23
 
 CRITICAL FIX: restore `cdc_consumer.py` (wrongly deleted in v1.2.18).

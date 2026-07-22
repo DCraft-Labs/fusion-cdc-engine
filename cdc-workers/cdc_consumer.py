@@ -499,17 +499,67 @@ def _get_active_cdc_connections(meta) -> List[Dict]:
                 cd.connector_type AS src_connector_type,
                 CAST(s.bank_id AS TEXT)       AS bank_id,
                 CAST(s.sub_tenant_id AS TEXT) AS tenant_id,
-                d.connection_config AS dest_config
+                d.connection_config AS dest_config,
+                cdd.connector_type AS dest_connector_type
             FROM connections c
             JOIN sources s                ON s.source_id           = c.source_id
             JOIN connector_definitions cd ON cd.connector_id       = s.connector_definition_id
             JOIN destinations d           ON d.destination_id      = c.destination_id
+            JOIN connector_definitions cdd ON cdd.connector_id      = d.connector_definition_id
             WHERE c.is_deleted = false
               AND UPPER(c.sync_type) IN ('CDC', 'REALTIME')
               AND s.is_deleted = false
               AND d.is_deleted = false
         """)
         return [dict(r) for r in cur.fetchall()]
+
+
+def _dest_needs_transform_worker(dest_connector_type: str, snapshot_mode: str) -> bool:
+    """v1.2.20: decide which consumer owns a connection's snapshot + CDC.
+
+    Routing rules (bulletproof across every source × destination combo):
+
+      * Iceberg / MySQL / MongoDB destinations → **always** the
+        transform-worker. ``cdc_consumer.py`` can only write to Postgres
+        (``_build_dest_dsn`` builds a Postgres DSN, ``_apply_row`` /
+        ``_copy_batch_to_pg`` use psycopg2), so any non-Postgres
+        destination MUST go through the transform-worker whose
+        ``InitialLoadTask`` / ``CDCTransformTask`` dispatch on
+        ``connector_type`` and can write to Iceberg (``iceberg_writer``)
+        or build a MySQL/Mongo DSN.
+
+      * Postgres destinations → transform-worker ONLY when the
+        destination's ``snapshot_mode`` is ``transform_worker``. The
+        default ``inline`` mode keeps ``cdc_consumer.py`` as the owner
+        (legacy / production path deployed via
+        ``kubernetes/base/cdc-consumer.yaml``).
+
+    This function is the single source of truth for the routing decision;
+    the control-plane ``_enqueue_initial_load_tasks`` producer and the
+    ``get_transform_route`` resolver use the same rule so the producer,
+    the CDC stream consumer, and the transform-worker all agree on who
+    owns each connection.
+    """
+    ctype = (dest_connector_type or "").lower()
+    if ctype in ("iceberg", "mysql", "mongodb", "mongo"):
+        return True
+    if ctype in ("postgres", "postgresql"):
+        return str(snapshot_mode or "inline").lower() == "transform_worker"
+    # Unknown destination type → default to transform-worker (safer;
+    # cdc_consumer.py cannot handle it).
+    return True
+
+
+def _conn_snapshot_mode(conn_cfg: dict) -> str:
+    """Extract the destination snapshot_mode from a connection config row."""
+    dest_cfg = conn_cfg.get("dest_config") or {}
+    if isinstance(dest_cfg, str):
+        try:
+            import json as _j
+            dest_cfg = _j.loads(dest_cfg)
+        except Exception:
+            dest_cfg = {}
+    return str(dest_cfg.get("snapshot_mode") or "inline").lower()
 
 
 def _get_streams_for_connection(meta, connection_id: str) -> List[Dict]:
@@ -1010,10 +1060,17 @@ def _apply_transform_steps(row: dict, steps: list) -> dict:
 
 
 def _do_initial_load(conn_cfg: dict, dest_conn, meta, dest_schema_fallback: str = "public") -> int:
-    """Route to MongoDB or MySQL initial load based on connector_type."""
+    """Route to the source-specific initial load based on connector_type.
+
+    v1.2.20: added Postgres source support (``_do_initial_load_postgres``).
+    Before this, a Postgres source connection fell through to the MySQL
+    loader (wrong driver, wrong SQL) and crashed at connect time.
+    """
     connector_type = (conn_cfg.get("src_connector_type") or "").lower()
     if "mongo" in connector_type:
         return _do_initial_load_mongodb(conn_cfg, dest_conn, meta, dest_schema_fallback)
+    if connector_type in ("postgres", "postgresql"):
+        return _do_initial_load_postgres(conn_cfg, dest_conn, meta, dest_schema_fallback)
     return _do_initial_load_mysql(conn_cfg, dest_conn, meta, dest_schema_fallback)
 
 
@@ -1336,6 +1393,255 @@ def _do_initial_load_mongodb(conn_cfg: dict, dest_conn, meta, dest_schema_fallba
                 res.close()
             except Exception:
                 pass
+
+    return total
+
+
+def _do_initial_load_postgres(conn_cfg: dict, dest_conn, meta, dest_schema_fallback: str = "public") -> int:
+    """
+    v1.2.20: Postgres source → Postgres destination initial full load.
+
+    Mirrors ``_do_initial_load_mysql`` but uses a psycopg2 **server-side
+    cursor** (named cursor) so the full table is never materialised in
+    memory — the driver streams rows from the source in chunks controlled
+    by ``itersize``. This is the Postgres equivalent of MySQL's
+    ``SSDictCursor`` and is essential for multi-GB tables.
+
+    Per-stream checkpointing, column mapping, selected-columns whitelist
+    and transform overrides are honoured exactly like the MySQL path.
+    """
+    import json as _json
+
+    cid     = str(conn_cfg["connection_id"])
+    src_pw  = _decrypt(conn_cfg.get("src_pw_enc") or "")
+    streams = _get_streams_for_connection(meta, cid)
+    if not streams:
+        log.warning("[pg-load] No streams for connection %s", cid)
+        return 0
+
+    BATCH_SIZE = 10000
+
+    with meta.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT stream_id::text, rows_written, status FROM initial_load_checkpoints "
+            "WHERE connection_id = %s", (cid,)
+        )
+        checkpoints = {r["stream_id"]: dict(r) for r in cur.fetchall()}
+
+    total = 0
+    for stream in streams:
+        sid         = str(stream["stream_id"])
+        src_schema  = stream["schema_name"] or "public"
+        src_table   = stream["table_name"]
+        dst_schema  = stream.get("destination_schema_name") or dest_schema_fallback
+        dst_table   = stream.get("destination_table_name") or src_table
+        pk_raw      = stream.get("primary_key") or []
+        if isinstance(pk_raw, str):
+            try:
+                pk_raw = _json.loads(pk_raw)
+            except Exception:
+                pk_raw = [pk_raw] if pk_raw else []
+        pk_cols = list(pk_raw)
+
+        col_map: dict = {}
+        raw_col_map = stream.get("column_mapping") or {}
+        if isinstance(raw_col_map, str):
+            try:
+                raw_col_map = _json.loads(raw_col_map)
+            except Exception:
+                raw_col_map = {}
+        col_map = raw_col_map
+
+        selected: list = []
+        raw_sel = stream.get("selected_columns") or []
+        if isinstance(raw_sel, str):
+            try:
+                raw_sel = _json.loads(raw_sel)
+            except Exception:
+                raw_sel = []
+        selected = list(raw_sel)
+
+        transform_steps: list = []
+        raw_to = stream.get("transform_overrides") or {}
+        if isinstance(raw_to, str):
+            try:
+                raw_to = _json.loads(raw_to)
+            except Exception:
+                raw_to = {}
+        transform_steps = raw_to.get("transforms", []) if isinstance(raw_to, dict) else []
+        if transform_steps:
+            log.info("[pg-load] %s.%s — %d transform step(s) active",
+                     src_schema, src_table, len(transform_steps))
+
+        ckpt = checkpoints.get(sid)
+        if ckpt and ckpt["status"] == "done":
+            log.info("[pg-load] ⏭  %s.%s already done (%d rows) — skipping",
+                     src_schema, src_table, ckpt["rows_written"])
+            total += ckpt["rows_written"]
+            continue
+
+        with meta.cursor() as cur:
+            cur.execute("""
+                INSERT INTO initial_load_checkpoints
+                    (connection_id, stream_id, source_table, rows_written, status)
+                VALUES (%s, %s, %s, 0, 'running')
+                ON CONFLICT (connection_id, stream_id)
+                DO UPDATE SET status='running', rows_written=0, started_at=now(), error=null
+            """, (cid, sid, src_table))
+        meta.commit()
+
+        log.info("[pg-load] %s.%s — connecting to Postgres %s:%s/%s",
+                 src_schema, src_table, conn_cfg["src_host"], conn_cfg["src_port"], conn_cfg["src_db"])
+
+        pg_host = conn_cfg["src_host"]
+        pg_port = int(conn_cfg["src_port"] or 5432)
+        src_ssh_cfg = conn_cfg.get("src_ssh_config") or {}
+        _tunnel_resources: list = []
+        stream_count = 0
+
+        try:
+            if src_ssh_cfg.get("tunnel_host"):
+                local_port, lsock, ssh_cl = _start_ssh_port_forward(
+                    src_ssh_cfg, pg_host, pg_port
+                )
+                _tunnel_resources.extend([lsock, ssh_cl])
+                import time as _t; _t.sleep(0.2)
+                pg_host, pg_port = "127.0.0.1", local_port
+
+            src = psycopg2.connect(
+                host=pg_host,
+                port=pg_port,
+                dbname=conn_cfg["src_db"],
+                user=conn_cfg["src_user"],
+                password=src_pw,
+                connect_timeout=10,
+                application_name="fusion-cdc-initial-load",
+            )
+
+            ts_ms = int(datetime.utcnow().timestamp() * 1000)
+            cols_initialized = False
+            cols: List[str] = []
+            dest_cols: List[str] = []
+            upsert_sql = ""
+
+            try:
+                # Server-side cursor: named cursors stream results from the
+                # server in batches of ``itersize`` instead of fetching the
+                # whole result set into memory.
+                with src.cursor("pg_initial_load", cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.itersize = BATCH_SIZE
+                    qualified = f'"{src_schema}"."{src_table}"'
+                    cur.execute(f"SELECT * FROM {qualified}")
+                    batch: List[tuple] = []
+
+                    for raw_row in cur:
+                        if not cols_initialized:
+                            all_src_cols = list(raw_row.keys())
+                            if selected:
+                                all_src_cols = [c for c in all_src_cols if c in selected]
+                            cols = []
+                            dest_cols = []
+                            for c in all_src_cols:
+                                mapped = col_map.get(c, c)
+                                if mapped is None:
+                                    continue
+                                cols.append(c)
+                                dest_cols.append(mapped)
+                            if col_map:
+                                log.info(
+                                    "[pg-load] %s.%s — column mapping active: "
+                                    "%d src cols → %d dest cols",
+                                    src_schema, src_table, len(all_src_cols), len(cols)
+                                )
+                            pk_dest = [col_map.get(p, p) for p in pk_cols if col_map.get(p, p) is not None]
+                            _ensure_dest_table(dest_conn, dst_schema, dst_table, dest_cols, pk_dest)
+                            with dest_conn.cursor() as tc:
+                                tc.execute(f'TRUNCATE TABLE "{dst_schema}"."{dst_table}"')
+                            dest_conn.commit()
+                            col_str      = ", ".join(f'"{c}"' for c in dest_cols)
+                            col_str_full = col_str + ', _cdc_op, _cdc_ts'
+                            if pk_dest:
+                                conflict = ", ".join(f'"{c}"' for c in pk_dest)
+                                non_pk   = [c for c in dest_cols if c not in pk_dest]
+                                upd = (
+                                    ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in non_pk) + ", "
+                                    if non_pk else ""
+                                )
+                                upd += "_cdc_op=EXCLUDED._cdc_op, _cdc_ts=EXCLUDED._cdc_ts, _cdc_loaded_at=now()"
+                                conflict_clause = f"ON CONFLICT ({conflict}) DO UPDATE SET {upd}"
+                            else:
+                                conflict_clause = ""
+                            upsert_sql = f"""
+                                INSERT INTO "{dst_schema}"."{dst_table}" ({col_str_full})
+                                VALUES %s
+                                {conflict_clause}
+                            """
+                            cols_initialized = True
+
+                        working_row = dict(raw_row)
+                        if transform_steps:
+                            working_row = _apply_transform_steps(working_row, transform_steps)
+
+                        vals = tuple(
+                            (str(v) if v is not None else None)
+                            for k, v in working_row.items()
+                            if k in cols
+                        ) + ("r", ts_ms)
+                        batch.append(vals)
+
+                        if len(batch) >= BATCH_SIZE:
+                            _copy_batch_to_pg(dest_conn, dst_schema, dst_table, dest_cols, batch, upsert_sql, BATCH_SIZE)
+                            dest_conn.commit()
+                            stream_count += len(batch)
+                            if stream_count % 50000 == 0:
+                                log.info("[pg-load] %s.%s … %d rows written",
+                                         src_schema, src_table, stream_count)
+                                with meta.cursor() as mc:
+                                    mc.execute(
+                                        "UPDATE initial_load_checkpoints SET rows_written=%s "
+                                        "WHERE connection_id=%s AND stream_id=%s",
+                                        (stream_count, cid, sid)
+                                    )
+                                meta.commit()
+                            batch = []
+
+                    if batch:
+                        _copy_batch_to_pg(dest_conn, dst_schema, dst_table, dest_cols, batch, upsert_sql, BATCH_SIZE)
+                        dest_conn.commit()
+                        stream_count += len(batch)
+
+            finally:
+                src.close()
+
+        except Exception as exc:
+            log.error("[pg-load] Postgres read failed for %s.%s: %s", src_schema, src_table, exc)
+            with meta.cursor() as mc:
+                mc.execute(
+                    "UPDATE initial_load_checkpoints SET status='failed', error=%s "
+                    "WHERE connection_id=%s AND stream_id=%s",
+                    (str(exc), cid, sid)
+                )
+            meta.commit()
+            raise
+        finally:
+            for res in _tunnel_resources:
+                try:
+                    res.close()
+                except Exception:
+                    pass
+
+        with meta.cursor() as mc:
+            mc.execute(
+                "UPDATE initial_load_checkpoints "
+                "SET status='done', rows_written=%s, completed_at=now() "
+                "WHERE connection_id=%s AND stream_id=%s",
+                (stream_count, cid, sid)
+            )
+        meta.commit()
+
+        total += stream_count
+        log.info("[pg-load] ✅ %s.%s → %d rows written to %s.%s",
+                 src_schema, src_table, stream_count, dst_schema, dst_table)
 
     return total
 
@@ -1804,6 +2110,23 @@ def main() -> None:
         cid  = str(conn_cfg["connection_id"])
         name = conn_cfg["connection_name"]
 
+        # v1.2.20: route at the consumer. If this connection's destination
+        # is owned by the transform-worker (Iceberg / MySQL / Mongo, or
+        # Postgres with snapshot_mode=transform_worker), skip it entirely
+        # — cdc_consumer.py only handles the Postgres-inline path. This
+        # prevents the double-write bug where both cdc_consumer.py and
+        # the transform-worker applied the same CDC event to the same
+        # Postgres destination.
+        dest_ctype = conn_cfg.get("dest_connector_type") or ""
+        snap_mode = _conn_snapshot_mode(conn_cfg)
+        if _dest_needs_transform_worker(dest_ctype, snap_mode):
+            log.info(
+                "Skipping '%s' (connection=%s): destination type=%s snapshot_mode=%s "
+                "→ owned by transform-worker, not cdc_consumer.py",
+                name, cid, dest_ctype, snap_mode,
+            )
+            continue
+
         dest_config = conn_cfg["dest_config"]
         if isinstance(dest_config, str):
             dest_config = json.loads(dest_config)
@@ -1932,6 +2255,20 @@ def main() -> None:
                     cid  = str(conn_cfg["connection_id"])
                     name = conn_cfg["connection_name"]
                     known_cids.add(cid)  # register immediately to avoid double-processing
+
+                    # v1.2.20: skip connections owned by the transform-worker
+                    # (Iceberg / MySQL / Mongo, or Postgres transform_worker
+                    # mode). cdc_consumer.py only handles the Postgres-inline
+                    # path; the transform-worker owns the rest.
+                    dest_ctype = conn_cfg.get("dest_connector_type") or ""
+                    snap_mode = _conn_snapshot_mode(conn_cfg)
+                    if _dest_needs_transform_worker(dest_ctype, snap_mode):
+                        log.info(
+                            "[poller] Skipping '%s' (connection=%s): destination type=%s "
+                            "snapshot_mode=%s → owned by transform-worker",
+                            name, cid, dest_ctype, snap_mode,
+                        )
+                        continue
 
                     dest_config = conn_cfg["dest_config"]
                     if isinstance(dest_config, str):

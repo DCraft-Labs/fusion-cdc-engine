@@ -58,6 +58,26 @@ def _verify_worker_token(x_worker_token: str = Header(...)) -> str:
     return x_worker_token
 
 
+def _dest_needs_transform_worker(dest_connector_type: str, snapshot_mode: str) -> bool:
+    """v1.2.20: single source of truth for the CDC routing decision.
+
+    Returns True when the transform-worker should own this connection's
+    snapshot + CDC streaming; False when ``cdc_consumer.py`` owns it
+    (Postgres destination with ``snapshot_mode=inline``).
+
+    Mirrors ``cdc_consumer._dest_needs_transform_worker`` and
+    ``connections._dest_needs_transform_worker`` so the producer, the
+    CDC stream consumer, and the transform-worker all agree on who owns
+    each connection. See the v1.2.20 release notes for the full matrix.
+    """
+    ctype = (dest_connector_type or "").lower()
+    if ctype in ("iceberg", "mysql", "mongodb", "mongo"):
+        return True
+    if ctype in ("postgres", "postgresql"):
+        return str(snapshot_mode or "inline").lower() == "transform_worker"
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -840,6 +860,28 @@ def get_transform_route(
     for conn, stream, dest in rows:
         s_schema = (stream.source_schema_name or "")
         if schema_name and s_schema and s_schema != schema_name:
+            continue
+        # v1.2.20: route at the producer. Skip connections whose destination
+        # is owned by cdc_consumer.py (Postgres with snapshot_mode=inline).
+        # The transform-worker must NOT receive CDC events for those —
+        # otherwise both consumers write the same event to the same
+        # Postgres table (double-write bug). Iceberg / MySQL / Mongo
+        # destinations and Postgres-transform_worker destinations are
+        # always bridged to the transform-worker.
+        dest_connector_type = (
+            dest.connector_definition.connector_type
+            if dest.connector_definition else "postgres"
+        )
+        dest_config_raw = dest.connection_config or {}
+        if isinstance(dest_config_raw, str):
+            try:
+                import json as _json
+                dest_config_raw = _json.loads(dest_config_raw)
+            except Exception:
+                dest_config_raw = {}
+        snapshot_mode = str(dest_config_raw.get("snapshot_mode") or "inline").lower()
+        if not _dest_needs_transform_worker(dest_connector_type, snapshot_mode):
+            # Postgres-inline → cdc_consumer.py owns this connection.
             continue
         pk = stream.primary_keys
         if isinstance(pk, list):

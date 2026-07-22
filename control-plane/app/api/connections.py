@@ -372,6 +372,27 @@ def _stop_worker_streaming(connection: Connection) -> None:
 # Initial-load producer (transform-worker snapshot path)
 # ===========================
 
+def _dest_needs_transform_worker(dest_connector_type: str, snapshot_mode: str) -> bool:
+    """v1.2.20: single source of truth for the CDC routing decision.
+
+    Returns True when the transform-worker should own this connection's
+    snapshot + CDC streaming; False when ``cdc_consumer.py`` owns it
+    (Postgres destination with ``snapshot_mode=inline``).
+
+    Mirrors ``cdc_consumer._dest_needs_transform_worker`` and
+    ``internal._dest_needs_transform_worker`` so the producer, the CDC
+    stream consumer, and the transform-worker all agree on who owns each
+    connection. See the v1.2.20 release notes for the full
+    source × destination matrix.
+    """
+    ctype = (dest_connector_type or "").lower()
+    if ctype in ("iceberg", "mysql", "mongodb", "mongo"):
+        return True
+    if ctype in ("postgres", "postgresql"):
+        return str(snapshot_mode or "inline").lower() == "transform_worker"
+    return True
+
+
 def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
     """Enqueue ``initial_load`` tasks to ``fusion:transforms:high`` when the
     connection's destination is configured with ``snapshot_mode=transform_worker``.
@@ -426,9 +447,20 @@ def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
                 dest_config_raw = _json.loads(dest_config_raw)
             except Exception:
                 dest_config_raw = {}
+        dest_connector_type = "postgres"
+        if dest.connector_definition:
+            dest_connector_type = dest.connector_definition.connector_type
         snapshot_mode = str(dest_config_raw.get("snapshot_mode") or "inline").lower()
-        if snapshot_mode != "transform_worker":
-            return 0  # inline mode: cdc_consumer.py handles the snapshot
+        # v1.2.20: route the initial load to the transform-worker whenever
+        # the destination is NOT a Postgres-inline connection. Iceberg /
+        # MySQL / Mongo destinations always go to the transform-worker
+        # (cdc_consumer.py cannot write to them), and Postgres destinations
+        # go to the transform-worker only when snapshot_mode=transform_worker.
+        # This closes the gap where an Iceberg destination with the default
+        # snapshot_mode=inline was wrongly handed to cdc_consumer.py (which
+        # cannot write to Iceberg) and silently no-op'd.
+        if not _dest_needs_transform_worker(dest_connector_type, snapshot_mode):
+            return 0  # inline Postgres mode: cdc_consumer.py handles the snapshot
 
         source = (
             db.query(Source)
@@ -450,9 +482,7 @@ def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
                 dest_config["password"] = _decrypt_password(enc)
             except Exception:
                 pass
-        dest_connector_type = "postgres"
-        if dest.connector_definition:
-            dest_connector_type = dest.connector_definition.connector_type
+        # dest_connector_type already resolved above (v1.2.20 routing check)
         dest_block = {
             "connector_type": dest_connector_type,
             "connection_config": dest_config,
