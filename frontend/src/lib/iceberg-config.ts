@@ -120,6 +120,41 @@ export function normalizeWarehouse(warehouse: string): string {
   return warehouse;
 }
 
+/**
+ * Catalog-type-aware warehouse placeholder + help text.
+ *
+ * For `nessie` / `rest` catalogs the `warehouse` field is the
+ * Nessie-registered warehouse NAME (e.g. `iceberg-warehouse`), NOT an S3
+ * path — Nessie resolves the name to the physical S3 location via its own
+ * config. For `hive` / `glue` / `sql` / `dynamodb` the warehouse is an S3
+ * path used as the default location for new tables (accepts `s3://` or
+ * `s3a://`, normalized to `s3://`).
+ */
+export function warehouseHint(catalogType: CatalogType): { placeholder: string; help: string } {
+  switch (catalogType) {
+    case "nessie":
+    case "rest":
+      return {
+        placeholder: "iceberg-warehouse",
+        help:
+          "Nessie-registered warehouse name (e.g. `iceberg-warehouse`), not an S3 path — Nessie resolves it to the physical S3 location.",
+      };
+    case "hive":
+    case "glue":
+    case "sql":
+    case "dynamodb":
+      return {
+        placeholder: "s3://iceberg-warehouse/fusion-cdc/",
+        help: "S3 warehouse path (accepts s3:// or s3a://, normalized to s3://).",
+      };
+    default:
+      return {
+        placeholder: "s3://iceberg-warehouse/fusion-cdc/",
+        help: "Accepts s3:// or s3a:// (normalized to s3://).",
+      };
+  }
+}
+
 export function buildConnectionConfig(form: IcebergDestinationConfig): IcebergDestinationConfig {
   return {
     ...form,

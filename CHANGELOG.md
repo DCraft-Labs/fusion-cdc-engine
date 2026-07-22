@@ -4,6 +4,52 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.15] — 2026-07-23
+
+Fixes the Iceberg write path so the validate-write endpoint AND the real
+CDC write path actually commit rows to an Iceberg table backed by
+Nessie/REST + MinIO/S3. Two bugs broke writes end-to-end; a frontend
+warehouse-hint tweak prevents operators from mis-configuring the warehouse
+field for Nessie/REST catalogs.
+
+### Fixed
+- **`ImportError: cannot import name 'TableNotFound' from 'pyiceberg.exceptions'`
+  in the Iceberg validate-write path.**
+  `control-plane/app/utils/iceberg_tester.py:327` imported `TableNotFound`,
+  which does not exist in pyiceberg 0.7.1 (only `NoSuchTableError` is defined
+  there). The import raised `ImportError` before the test-connection /
+  write-permission check could run, so every Iceberg destination validation
+  500'd. Dropped `TableNotFound` from the import; the `except` clause now
+  catches only `NoSuchTableError` (the only exception actually raised by
+  `catalog.load_table` for a missing table in 0.7.1).
+- **`ModuleNotFoundError: No module named 's3fs'` on `table.append()` /
+  `table.upsert()` / `table.delete()` for Nessie/REST + MinIO/S3.**
+  pyiceberg 0.7.1 resolves to the fsspec-based S3 FileIO
+  (`pyiceberg.io.fsspec.FsspecFileIO`) for Nessie/REST/Hive catalogs backed
+  by S3 / MinIO, and fsspec's S3 implementation lives in the separate
+  `s3fs` package — which was not pinned in either requirements file. The
+  very first write therefore failed for BOTH the control-plane
+  validate-write endpoint (`iceberg_tester.py`) AND the real CDC write path
+  (`transform-worker/iceberg_writer.py:IcebergWriter._apply`). Added
+  `s3fs==2024.6.1` (latest stable; compatible with
+  `fsspec==2024.6.1.*` and pyiceberg 0.7.1's `fsspec>=2023.1.0` pin) to both
+  `control-plane/requirements.txt` and `transform-worker/requirements.txt`.
+
+### Changed
+- **Catalog-type-aware warehouse hint in the Create Destination form.**
+  For `nessie` / `rest` catalogs the `warehouse` field is the
+  Nessie-registered warehouse NAME (e.g. `iceberg-warehouse`), NOT an S3
+  path — Nessie resolves the name to the physical S3 location. The previous
+  placeholder (`s3://iceberg-warehouse/fusion-cdc/`) was wrong for these
+  catalog types and caused Nessie `load_catalog` to fail with
+  "warehouse not found". Added `warehouseHint(catalogType)` to
+  `frontend/src/lib/iceberg-config.ts` and wired
+  `IcebergDestinationForm.tsx` to use it for the Warehouse field's
+  placeholder + help text. `hive` / `glue` / `sql` / `dynamodb` keep the
+  S3-path placeholder.
+- Bumped `control-plane/app/main.py` FastAPI `version` to `1.2.15`.
+- Bumped `helm/fusion-cdc/Chart.yaml` to `version: 1.2.15` / `appVersion: "1.2.15"`.
+
 ## [1.2.14] — 2026-07-23
 
 Closes the two real gaps the v1.2.13 audit flagged after shipping. The

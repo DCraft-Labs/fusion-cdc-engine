@@ -3,6 +3,7 @@ import {
   type CatalogType,
   type AuthMode,
   type SseType,
+  warehouseHint,
 } from "@/lib/iceberg-config";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -136,8 +137,8 @@ export default function IcebergDestinationForm({ form, setForm }: Props) {
       </Section>
 
       <Section title="Storage (S3 / MinIO)">
-        <Field label="Warehouse" required help="Accepts s3:// or s3a:// (normalized to s3://)">
-          <Input value={form.warehouse} onChange={(e) => set({ warehouse: e.target.value })} placeholder="s3://iceberg-warehouse/fusion-cdc/" />
+        <Field label="Warehouse" required help={warehouseHint(form.catalog_type).help}>
+          <Input value={form.warehouse} onChange={(e) => set({ warehouse: e.target.value })} placeholder={warehouseHint(form.catalog_type).placeholder} />
         </Field>
         <Field label="S3 region">
           <Input value={form.s3_region ?? ""} onChange={(e) => set({ s3_region: e.target.value })} placeholder="us-east-1" />

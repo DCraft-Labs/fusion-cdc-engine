@@ -12,3 +12,10 @@ alembic==1.13.1
 boto3==1.34.101
 tenacity==8.3.0
 prometheus-client==0.20.0
+# s3fs is required by PyIceberg's fsspec-based S3 FileIO — the IO backend
+# pyiceberg 0.7.1 resolves to for Nessie/REST/Hive catalogs backed by
+# MinIO/S3. Without it, table.append()/upsert()/delete() raise
+# "ModuleNotFoundError: No module named 's3fs'" on the first CDC write
+# (iceberg_writer.py IcebergWriter._apply). 2024.6.1 is the latest stable
+# compatible with fsspec==2024.6.1.* and pyiceberg 0.7.1.
+s3fs==2024.6.1

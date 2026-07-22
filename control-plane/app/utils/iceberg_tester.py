@@ -324,10 +324,10 @@ def test_iceberg_write(dest_config: dict) -> dict:
 
     # Create test table + append + delete + drop
     try:
-        from pyiceberg.exceptions import NoSuchTableError, TableNotFound
+        from pyiceberg.exceptions import NoSuchTableError
         try:
             table = catalog.load_table(f"{test_ns}.{test_table}")
-        except (NoSuchTableError, TableNotFound):
+        except NoSuchTableError:
             schema = pa.schema([("id", pa.int64())])
             table = catalog.create_table(
                 identifier=f"{test_ns}.{test_table}",

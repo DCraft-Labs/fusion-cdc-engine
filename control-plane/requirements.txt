@@ -55,3 +55,11 @@ paramiko==3.4.0
 pyiceberg[glue,s3]==0.7.1
 pyarrow==16.0.0
 boto3==1.34.101
+# s3fs is required by PyIceberg's fsspec-based S3 FileIO, which is the IO
+# backend pyiceberg 0.7.1 resolves to for Nessie/REST/Hive catalogs backed by
+# MinIO/S3. Without it, table.append() / upsert() raise
+# "ModuleNotFoundError: No module named 's3fs'" on the very first write
+# (both the validate-write endpoint and the real CDC write path).
+# 2024.6.1 is the latest stable compatible with fsspec==2024.6.1.* and
+# pyiceberg 0.7.1 (which pins fsspec>=2023.1.0).
+s3fs==2024.6.1
