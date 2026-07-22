@@ -321,16 +321,16 @@ export default function IcebergDestinationForm({ form, setForm }: Props) {
         <Field
           label="Snapshot mode"
           required
-          help="Where the initial-load snapshot runs. 'Transform Worker' enqueues the snapshot to the transform-worker (canonical, recommended). 'Inline' is deprecated — cdc_consumer.py was removed in v1.2.18 and selecting it falls back to Transform Worker."
+          help="Where the initial-load snapshot runs. 'Inline (cdc_consumer — default)' is the production path: cdc_consumer.py performs the snapshot directly (deployed via kubernetes/base/cdc-consumer.yaml). 'Transform Worker (for Iceberg/lake)' enqueues the snapshot to the transform-worker — opt-in for Iceberg/lake destinations where DuckDB/PyIceberg is needed."
         >
           <Select
-            value={form.snapshot_mode ?? "transform_worker"}
+            value={form.snapshot_mode ?? "inline"}
             onValueChange={(v) => set({ snapshot_mode: v as "transform_worker" | "inline" })}
           >
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="transform_worker">Transform Worker (recommended)</SelectItem>
-              <SelectItem value="inline">Inline (deprecated — does nothing)</SelectItem>
+              <SelectItem value="inline">Inline (cdc_consumer — default)</SelectItem>
+              <SelectItem value="transform_worker">Transform Worker (for Iceberg/lake)</SelectItem>
             </SelectContent>
           </Select>
         </Field>

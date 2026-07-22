@@ -4,6 +4,63 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.19] — 2026-07-23
+
+CRITICAL FIX: restore `cdc_consumer.py` (wrongly deleted in v1.2.18).
+`cdc_consumer.py` is the CDC consumer (destination side of the pipeline)
+deployed via `kubernetes/base/cdc-consumer.yaml` with
+`command: ["python", "cdc_consumer.py"]`. It is **NOT** orphaned — the
+v1.2.18 deletion was a regression. This release reverts that deletion and
+restores the original `inline` snapshot-mode default, while keeping every
+other v1.2.18 fix.
+
+### Fixed (P0 regression)
+- **`cdc-workers/cdc_consumer.py` restored** from v1.2.17 (commit `929f16a`).
+  The file is 2051 lines, syntax-checked, and reads `METADATA_DB_DSN` from
+  env (per the `kubernetes/base/cdc-consumer.yaml` secret injection). The
+  `kubernetes/base/cdc-consumer.yaml` manifest
+  (`command: ["python", "cdc_consumer.py"]`) is once again valid.
+- **`snapshot_mode` default reverted to `inline`** in
+  `control-plane/app/api/connections.py` (`_enqueue_initial_load_tasks`).
+  The v1.2.18 change that made `transform_worker` the default and treated
+  `inline` as deprecated has been reverted. Both modes are valid:
+  - `inline` (default) = `cdc_consumer.py` performs the initial load
+    (the original, production path via `kubernetes/base/cdc-consumer.yaml`).
+  - `transform_worker` (opt-in) = `transform-worker/loader.py:InitialLoadTask`
+    performs the initial load (the new path, useful for Iceberg/lake
+    destinations where DuckDB/PyIceberg is needed).
+  The deprecation warning that fired when `snapshot_mode=inline` was
+  selected has been removed; `inline` is the canonical default again.
+- **`snapshot_mode` UI labels corrected** in
+  `frontend/src/components/iceberg/IcebergDestinationForm.tsx` and
+  `frontend/src/lib/iceberg-config.ts`: `inline` is now labeled
+  "Inline (cdc_consumer — default)" and `transform_worker` is labeled
+  "Transform Worker (for Iceberg/lake)". The previous "deprecated — does
+  nothing" / "recommended" labeling has been removed. The form default is
+  `inline`.
+
+### Kept from v1.2.18 (unrelated to the deletion, all correct)
+- `POST /connections/{id}/retry-initial-load` API + UI button (Issue 2).
+- Chart `podSecurityContext` for transformWorker (Issue 3a).
+- `METADATA_DB_DSN` → `DATABASE_URL` rename in `transform-worker/worker.py`
+  (Issue 3b). `cdc_consumer.py` is **intentionally left** reading
+  `METADATA_DB_DSN` — it is deployed via `kubernetes/base/cdc-consumer.yaml`
+  which injects `METADATA_DB_DSN`.
+- LimitRange max memory 1Gi → 2Gi (Issue 4).
+- `snapshot_mode` UI field on the destination form (Issue 5) — labels
+  corrected as above.
+
+### Honest acknowledgment
+The v1.2.18 release notes claimed `cdc_consumer.py` was "orphaned dead code"
+because the chart's `Dockerfile.cdc-worker` runs `python -m cdc_worker.worker`
+and never imports it. That was wrong: `cdc_consumer.py` is a standalone
+script deployed via its own manifest (`kubernetes/base/cdc-consumer.yaml`),
+not via `Dockerfile.cdc-worker`. It is the destination side of the CDC
+pipeline. The deletion broke the inline snapshot path and invalidated the
+`cdc-consumer.yaml` manifest. Apologies for the regression; the v1.2.19
+release restores the file and the original `inline` default while keeping
+the unrelated v1.2.18 fixes.
+
 ## [1.2.18] — 2026-07-23
 
 Follow-up to v1.2.17 (which fixed the `fetchall()` OOM regression in the

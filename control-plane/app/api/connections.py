@@ -248,12 +248,14 @@ def _trigger_dag_or_worker(connection: Connection, db: Session) -> None:
         except Exception as exc:
             log.warning("Could not notify worker via HTTP (connection=%s): %s", connection_id, exc)
 
-    # v1.2.18: transform-worker is now the canonical snapshot path. The
-    # control-plane enqueues initial_load tasks to fusion:transforms:high so
-    # the transform-worker performs the snapshot. The legacy "inline" mode
-    # (cdc_consumer.py) has been removed — cdc_consumer.py was orphaned dead
-    # code (the chart's Dockerfile.cdc-worker runs `python -m cdc_worker.worker`,
-    # which never imported it). See Issue 1 in the v1.2.18 release notes.
+    # v1.2.16+: when the destination's snapshot_mode is "transform_worker",
+    # enqueue initial_load tasks to fusion:transforms:high so the
+    # transform-worker performs the snapshot instead of cdc_consumer.py.
+    # No-op when mode is "inline" (the default — cdc_consumer.py owns the
+    # snapshot). See Gap 1 in the v1.2.16 release notes.
+    # v1.2.19: cdc_consumer.py is NOT orphaned — it is the inline snapshot
+    # path deployed via kubernetes/base/cdc-consumer.yaml. The v1.2.18
+    # deletion was a regression and has been reverted.
     try:
         _enqueue_initial_load_tasks(connection, db)
     except Exception as exc:
@@ -371,19 +373,21 @@ def _stop_worker_streaming(connection: Connection) -> None:
 # ===========================
 
 def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
-    """Enqueue ``initial_load`` tasks to ``fusion:transforms:high``.
+    """Enqueue ``initial_load`` tasks to ``fusion:transforms:high`` when the
+    connection's destination is configured with ``snapshot_mode=transform_worker``.
 
-    v1.2.18: ``transform_worker`` is now the default and canonical snapshot
-    mode. The legacy ``inline`` mode (performed by ``cdc_consumer.py``) has
-    been removed — ``cdc_consumer.py`` was orphaned dead code (the chart's
-    ``Dockerfile.cdc-worker`` runs ``python -m cdc_worker.worker``, which
-    never imported it). If a destination's ``connection_config.snapshot_mode``
-    is explicitly set to ``inline``, a warning is logged and the producer
-    falls back to ``transform_worker`` so the snapshot still runs.
-
-    This producer builds one ``initial_load`` task per enabled stream and
-    LPUSHes it to the high-priority Redis list consumed by
+    The default snapshot mode is ``inline`` — the cdc_consumer.py process
+    performs the full-table snapshot directly (see ``cdc_consumer._do_initial_load``).
+    Setting ``snapshot_mode`` to ``transform_worker`` in the destination's
+    ``connection_config`` JSONB opts a connection into the transform-worker
+    snapshot path: this producer builds one ``initial_load`` task per enabled
+    stream and LPUSHes it to the high-priority Redis list consumed by
     ``transform-worker/worker.py`` (``InitialLoadTask``).
+
+    v1.2.19: ``inline`` is the canonical default again (reverting the v1.2.18
+    change that wrongly treated cdc_consumer.py as orphaned). Both modes are
+    valid: ``inline`` for the production cdc_consumer.py path, ``transform_worker``
+    as an opt-in for Iceberg/lake destinations where DuckDB/PyIceberg is needed.
 
     The task payload includes:
       - ``source`` block (host/port/database/username + decrypted password) so
@@ -395,9 +399,8 @@ def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
       - ``transform_steps`` from the stream's ``transform_overrides.transforms``.
       - ``source_schema`` / ``source_table`` / ``dest_schema`` / ``dest_table``.
 
-    Returns the number of tasks LPUSHed (0 on error or when no enabled
-    streams exist). Never raises — the transform-worker path remains the
-    canonical fallback.
+    Returns the number of tasks LPUSHed (0 when mode is inline or on error).
+    Never raises — the inline path remains the canonical fallback.
     """
     import os
     import json as _json
@@ -423,24 +426,9 @@ def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
                 dest_config_raw = _json.loads(dest_config_raw)
             except Exception:
                 dest_config_raw = {}
-        snapshot_mode = str(dest_config_raw.get("snapshot_mode") or "transform_worker").lower()
-        if snapshot_mode == "inline":
-            # v1.2.18: inline mode (cdc_consumer.py) is removed. Fall back to
-            # transform_worker so the snapshot still runs.
-            log.warning(
-                "initial_load producer: destination %s has snapshot_mode=inline "
-                "(deprecated, cdc_consumer.py removed in v1.2.18) — falling back "
-                "to transform_worker",
-                dest.destination_id,
-            )
-            snapshot_mode = "transform_worker"
+        snapshot_mode = str(dest_config_raw.get("snapshot_mode") or "inline").lower()
         if snapshot_mode != "transform_worker":
-            log.warning(
-                "initial_load producer: destination %s has unknown snapshot_mode=%r "
-                "— falling back to transform_worker",
-                dest.destination_id, snapshot_mode,
-            )
-            snapshot_mode = "transform_worker"
+            return 0  # inline mode: cdc_consumer.py handles the snapshot
 
         source = (
             db.query(Source)
@@ -1395,10 +1383,9 @@ async def retry_initial_load(
 
     v1.2.18: ``_enqueue_initial_load_tasks`` previously only fired once at
     connection creation. If it failed (e.g. the transform-worker wasn't
-    ready, Redis was down, or the destination's ``snapshot_mode`` was left
-    at the deprecated ``inline`` default), users had to delete + recreate
-    the connection to retry. This endpoint lets them retry without that
-    destructive workaround.
+    ready, Redis was down, or the destination's ``snapshot_mode`` was
+    misconfigured), users had to delete + recreate the connection to retry.
+    This endpoint lets them retry without that destructive workaround.
 
     Resets ``initial_load_completed = false`` and
     ``initial_load_started_at = now()``, then re-invokes
