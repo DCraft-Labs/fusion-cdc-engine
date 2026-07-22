@@ -677,12 +677,59 @@ async def test_destination_connection(
     Can provide override parameters for testing without saving them.
     """
     destination = _get_destination_by_id(db, destination_id, current_user)
-    
+
     # Build test parameters
     override_params = None
     if test_params:
         override_params = test_params.model_dump(exclude_unset=True)
-    
+
+    connector_type = ""
+    if destination.connector_definition:
+        connector_type = (destination.connector_definition.connector_type or "").lower()
+
+    # Iceberg has a real multi-check tester (catalog + namespace + S3 HeadBucket)
+    # that returns a per-check breakdown the frontend renders as a checklist.
+    if "iceberg" in connector_type:
+        from app.utils.iceberg_tester import test_iceberg_connection
+
+        config = destination.connection_config or {}
+        if override_params:
+            config = {**config, **override_params}
+        start = time.time()
+        result = test_iceberg_connection(config)
+        latency_ms = int((time.time() - start) * 1000)
+        success = bool(result.get("ok"))
+        message = result.get("error") or ("Connection successful" if success else "Connection failed")
+
+        if not override_params:
+            destination.connection_test_status = "success" if success else "failed"
+            destination.connection_test_error = None if success else message
+            destination.connection_test_at = datetime.utcnow()
+            _maybe_activate_destination(destination, db)
+            db.commit()
+
+        record_audit(
+            db,
+            "destination.test",
+            user=current_user,
+            resource_type="destination",
+            resource_id=str(destination.destination_id),
+            status="success" if success else "failure",
+            details={"message": message, "latency_ms": latency_ms, "checks": result.get("checks")},
+        )
+
+        return ConnectionTestResponse(
+            status="success" if success else "failed",
+            message=message,
+            error_details=None if success else message,
+            connection_test_at=datetime.utcnow(),
+            latency_ms=latency_ms,
+            checks=result.get("checks"),
+            catalog_reachable=result.get("catalog_reachable"),
+            warehouse_reachable=result.get("warehouse_reachable"),
+            auth_ok=result.get("auth_ok"),
+        )
+
     # Test connection
     success, message, latency_ms = _test_database_connection(destination, override_params)
 
@@ -728,7 +775,41 @@ async def validate_write_permissions(
     - Update data (for upsert mode)
     """
     destination = _get_destination_by_id(db, destination_id, current_user)
-    
+
+    connector_type = ""
+    if destination.connector_definition:
+        connector_type = (destination.connector_definition.connector_type or "").lower()
+
+    # Iceberg has a real write-permission tester that creates a throwaway
+    # namespace + table, appends a row, deletes it, then drops both.
+    if "iceberg" in connector_type:
+        from app.utils.iceberg_tester import test_iceberg_write
+
+        config = destination.connection_config or {}
+        result = test_iceberg_write(config)
+        success = bool(result.get("ok"))
+
+        if success:
+            if not destination.connection_config:
+                destination.connection_config = {}
+            destination.connection_config = {**destination.connection_config, "write_permissions_validated": True}
+            _maybe_activate_destination(destination, db)
+            db.commit()
+
+        return {
+            "destination_id": destination_id,
+            "has_write_permissions": success,
+            "ok": success,
+            "can_write": result.get("can_write"),
+            "can_create_table": result.get("can_create_table"),
+            "can_insert": result.get("can_insert"),
+            "can_delete": result.get("can_delete"),
+            "message": result.get("error") or ("Write permissions validated" if success else "Write permission check failed"),
+            "error": result.get("error"),
+            "checks": result.get("checks"),
+            "validated_at": datetime.utcnow(),
+        }
+
     success, message = _validate_write_permissions(destination)
     
     # Store result in connection_config so auto-activate can check it

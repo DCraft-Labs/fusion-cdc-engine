@@ -195,12 +195,19 @@ class ConnectionTestRequest(BaseModel):
 
 class ConnectionTestResponse(BaseModel):
     """Schema for connection test result"""
-    
+
     status: str = Field(..., description="success or failed")
     message: str
     error_details: Optional[str] = None
     connection_test_at: datetime
     latency_ms: Optional[int] = None
+    # Iceberg (and other multi-check destinations) return a per-check breakdown
+    # that the frontend renders as a checklist. Each item: {label, ok, message}.
+    checks: Optional[List[Dict[str, Any]]] = None
+    # Iceberg-specific structured fields (ignored by non-Iceberg clients).
+    catalog_reachable: Optional[bool] = None
+    warehouse_reachable: Optional[bool] = None
+    auth_ok: Optional[bool] = None
 
 
 # ===========================

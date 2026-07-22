@@ -26,6 +26,7 @@ from cdc_worker.heartbeat import HeartbeatSender
 from cdc_worker.metrics import METRICS, start_metrics_server
 from cdc_worker.redis_publisher import RedisStreamPublisher
 from cdc_worker.routing import RoutingTable
+from cdc_worker.transform_bridge import TransformBridge
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +82,15 @@ class Worker:
             control_plane_url=self._cfg.CONTROL_PLANE_URL,
             worker_token=self._cfg.WORKER_TOKEN,
             worker_id=self._cfg.WORKER_ID,
+        )
+        # CDC → transform-worker bridge (LPUSH cdc_transform tasks to
+        # fusion:transforms:normal so the transform-worker BRPOPs them).
+        # Shares the publisher's redis client so we don't open a second pool.
+        self._bridge = TransformBridge(
+            control_plane_url=self._cfg.CONTROL_PLANE_URL,
+            worker_token=self._cfg.WORKER_TOKEN,
+            worker_id=self._cfg.WORKER_ID,
+            redis_client=self._publisher._client,
         )
         self._running = False
         self._source_tasks: Dict[str, asyncio.Task] = {}
@@ -156,6 +166,11 @@ class Worker:
             routing = await self._get_routing(source_id, event.schema_name, event.table_name)
             if routing:
                 self._publisher.publish(event, routing=routing)
+                # Bridge into the transform-worker queue (best-effort, never raises).
+                try:
+                    self._bridge.publish_event(event)
+                except Exception as exc:
+                    log.debug("transform bridge skipped event %s: %s", event.event_id, exc)
                 # Record metrics for the event
                 METRICS.record_event(
                     tenant=event.tenant_id,

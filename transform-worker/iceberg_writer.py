@@ -78,15 +78,28 @@ def load_catalog(dest_config: dict):
 
 
 def _resolve_credentials(dest_config: dict) -> dict:
-    """Resolve auth mode a/b/c into a boto-style credential dict."""
+    """Resolve auth mode a/b/c into a boto-style credential dict.
+
+    ``static`` is the mode used by the seeded MinIO Iceberg destination: the
+    S3 access key / secret are placed directly in ``s3_access_key_id`` /
+    ``s3_secret_access_key`` (no STS / IRSA). It is treated like access_key
+    but reads the ``s3_*`` keys so the seeded destination works out of the
+    box. Mirrored in control-plane/app/utils/iceberg_tester.py.
+    """
     mode = (dest_config.get("auth_mode") or "access_key").lower()
     region = dest_config.get("aws_region") or dest_config.get("s3_region") or "us-east-1"
     out = {"region": region}
 
-    if mode == "access_key":
-        out["access_key_id"] = dest_config.get("aws_access_key_id")
-        out["secret_access_key"] = dest_config.get("aws_secret_access_key")
-        out["session_token"] = dest_config.get("aws_session_token")
+    if mode in ("access_key", "static"):
+        out["access_key_id"] = (
+            dest_config.get("aws_access_key_id")
+            or dest_config.get("s3_access_key_id")
+        )
+        out["secret_access_key"] = (
+            dest_config.get("aws_secret_access_key")
+            or dest_config.get("s3_secret_access_key")
+        )
+        out["session_token"] = dest_config.get("aws_session_token") or dest_config.get("s3_session_token")
     elif mode == "sts_assume":
         # Parent → target STS chain. Caller (transform-worker) is expected to have
         # resolved temp creds before invoking the writer; if pre-resolved creds are

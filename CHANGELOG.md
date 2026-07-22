@@ -4,6 +4,54 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.12] — 2026-07-23
+
+Real Iceberg Test Connection, real Iceberg write-permission check, and a
+CDC → transform-worker bridge so CDC events actually reach the destination.
+
+### Fixed
+- **Iceberg Test Connection is now real.** The control-plane
+  `POST /destinations/{id}/test-connection` endpoint previously had no
+  Iceberg branch — Iceberg destinations fell through to a generic
+  `socket.create_connection((host, port))` on an empty host, so the test
+  never validated the catalog, the S3 warehouse, or the credentials. Added
+  `control-plane/app/utils/iceberg_tester.py` (mirroring the catalog factory
+  from `transform-worker/iceberg_writer.py`) which loads the PyIceberg
+  catalog, lists namespaces, and runs `HeadBucket` on the warehouse bucket.
+  The endpoint now returns a structured `checks` array the frontend renders
+  as a checklist (`destinations.py`, `schemas/destination.py`).
+- **Iceberg write-permission check is now real.** The
+  `POST /destinations/{id}/validate-write-permissions` endpoint had no
+  Iceberg branch — it returned `has_write_permissions: true` without doing
+  anything. The new tester creates a throwaway `__dcraft_test` namespace +
+  `__write_check` table, appends one row, deletes it, then drops both,
+  returning `{can_create_table, can_insert, can_delete}`.
+- **CDC now bridges into the transform-worker queue.** The cdc-worker
+  published CDC events to Redis Streams (`cdc:*` via XADD) but the
+  transform-worker only reads Redis lists (`fusion:transforms:*` via BRPOP) —
+  different data structures / key namespaces, so CDC events were never
+  consumed and CDC never synced. Added `cdc_worker/transform_bridge.py`
+  which resolves `(source, schema, table) → Connection/Destination/Stream`
+  via a new control-plane internal endpoint
+  `GET /api/v1/internal/workers/{id}/transform-route/...` and LPUSHes a
+  `cdc_transform` task to `fusion:transforms:normal` for each event. The
+  original XADD to `cdc:*` is kept for metrics/observability.
+- **Seeded Iceberg `auth_mode: "static"` now resolves.** The seeded MinIO
+  Iceberg destination uses `auth_mode: "static"` with `s3_access_key_id` /
+  `s3_secret_access_key`, which the writer's `_resolve_credentials`
+  rejected. Both `transform-worker/iceberg_writer.py` and the new
+  `control-plane/app/utils/iceberg_tester.py` now treat `static` like
+  `access_key` and read the `s3_*` keys.
+
+### Changed
+- Bumped FastAPI app `version="1.2.11"` → `"1.2.12"`
+  (`control-plane/app/main.py`).
+- Bumped `fusion-cdc` Helm chart to `version: 1.2.12` / `appVersion: "1.2.12"`
+  (`helm/fusion-cdc/Chart.yaml`).
+- Added `pyiceberg[glue,s3]==0.7.1`, `pyarrow==16.0.0`, `boto3==1.34.101`
+  to `control-plane/requirements.txt` so the control-plane can run a real
+  Iceberg Test Connection / write check in-process.
+
 ## [1.2.11] — 2026-07-22
 
 Coordinated re-tag with the public `dcraft-fusion` v1.2.11. The v1.2.10 tag in

@@ -103,6 +103,9 @@ def _make_worker(**kwargs) -> Worker:
     worker._routing_table.start_auto_refresh = MagicMock()
     # Patch central sync
     worker._central_sync.push = AsyncMock()
+    # Patch transform bridge so tests don't make real HTTP calls to the CP
+    worker._bridge = MagicMock()
+    worker._bridge.publish_event = MagicMock(return_value=0)
     return worker
 
 

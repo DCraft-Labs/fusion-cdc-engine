@@ -47,3 +47,11 @@ strawberry-graphql[fastapi]==0.219.2
 # SSH Tunnel support
 sshtunnel==0.4.0
 paramiko==3.4.0
+
+# Iceberg destination Test Connection / write-permission validation
+# (mirrors transform-worker/iceberg_writer.py catalog factory). Used lazily
+# by app/utils/iceberg_tester.py so the control-plane still boots if these
+# are absent; the Iceberg test endpoints surface a clear error instead.
+pyiceberg[glue,s3]==0.7.1
+pyarrow==16.0.0
+boto3==1.34.101

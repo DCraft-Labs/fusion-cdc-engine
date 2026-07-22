@@ -771,3 +771,97 @@ def run_complete(
         connection_id, job_status, payload.rows_synced,
     )
     return {"ok": True, "status": job_status}
+
+
+# ---------------------------------------------------------------------------
+# Transform-route resolver — used by the cdc-worker to bridge CDC events into
+# the transform-worker's Redis list queue (fusion:transforms:normal).
+# See cdc_worker/transform_bridge.py and transform-worker/worker.py.
+# ---------------------------------------------------------------------------
+
+class TransformRoute(PydanticModel):
+    connection_id: str
+    destination: Dict[str, Any]
+    dest_schema: str
+    dest_table: str
+    primary_key: str
+    transform_steps: List[Dict[str, Any]] = []
+
+
+@router.get(
+    "/workers/{worker_id}/transform-route/{source_id}/{schema_name}/{table_name}",
+    response_model=List[TransformRoute],
+    summary="Resolve CDC event → transform-worker task route",
+)
+def get_transform_route(
+    worker_id: str,
+    source_id: str,
+    schema_name: str,
+    table_name: str,
+    db: Session = Depends(get_db),
+    _token: str = Depends(_verify_worker_token),
+) -> List[TransformRoute]:
+    """
+    For a given (source_id, schema, table), return the list of active
+    Connection→Destination→Stream routes that the cdc-worker should bridge
+    into ``fusion:transforms:normal`` as ``cdc_transform`` tasks.
+
+    The transform-worker's ``CDCTransformTask`` consumes these and writes to
+    Postgres or Iceberg. This closes the architectural gap where the
+    cdc-worker published to Redis Streams (``cdc:*``) but the transform-worker
+    only reads from Redis lists (``fusion:transforms:*``).
+    """
+    from sqlalchemy.orm import joinedload
+    from app.models.source_destination import Destination
+    from app.models.connection import Connection, Stream
+
+    try:
+        src_uuid = UUID(source_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid source_id")
+
+    # Active connections for this source, with their enabled streams matching
+    # the requested (schema, table). A wildcard schema ("") matches any.
+    rows = (
+        db.query(Connection, Stream, Destination)
+        .join(Stream, Stream.connection_id == Connection.connection_id)
+        .join(Destination, Destination.destination_id == Connection.destination_id)
+        .filter(
+            Connection.source_id == src_uuid,
+            Connection.is_deleted == False,
+            Connection.status == "active",
+            Stream.is_enabled == True,
+            Stream.source_table_name == table_name,
+        )
+        .all()
+    )
+    # Filter by schema (allow "" / None as wildcard)
+    routes: List[TransformRoute] = []
+    for conn, stream, dest in rows:
+        s_schema = (stream.source_schema_name or "")
+        if schema_name and s_schema and s_schema != schema_name:
+            continue
+        pk = stream.primary_keys
+        if isinstance(pk, list):
+            pk_str = ",".join(str(k) for k in pk) if pk else "id"
+        elif isinstance(pk, dict):
+            pk_str = ",".join(str(k) for k in pk.keys()) if pk else "id"
+        else:
+            pk_str = str(pk) if pk else "id"
+        # transform_overrides shape: {"transforms": [{...}, ...]}
+        to = stream.transform_overrides or {}
+        steps = to.get("transforms", []) if isinstance(to, dict) else []
+        dest_config = dest.connection_config or {}
+        routes.append(TransformRoute(
+            connection_id=str(conn.connection_id),
+            destination={
+                "connector_type": (dest.connector_definition.connector_type
+                                   if dest.connector_definition else "postgres"),
+                "connection_config": dest_config,
+            },
+            dest_schema=stream.destination_schema_name or "dw",
+            dest_table=stream.destination_table_name or table_name,
+            primary_key=pk_str,
+            transform_steps=steps,
+        ))
+    return routes
