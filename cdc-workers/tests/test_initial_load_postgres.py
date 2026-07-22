@@ -45,6 +45,22 @@ def _install_stubs():
             }),
             "from_url": lambda *a, **k: None,
         })
+    # cdc_consumer._decrypt() does `from cryptography.fernet import Fernet`
+    # at call time. cryptography is NOT installed in the bare CI test image
+    # (only pytest is), so we stub it here to keep the import from raising.
+    # The tests never exercise real decryption (src_pw_enc="").
+    if "cryptography" not in sys.modules:
+        crypto_stub = _stub_module("cryptography")
+        fernet_stub = _stub_module("cryptography.fernet")
+        class _FakeFernet:
+            def __init__(self, *a, **k):
+                pass
+            def decrypt(self, data):
+                return b""
+        fernet_stub.Fernet = _FakeFernet
+        crypto_stub.fernet = fernet_stub
+        sys.modules["cryptography"] = crypto_stub
+        sys.modules["cryptography.fernet"] = fernet_stub
     # psycopg2 is imported by the module AND used inside the function under
     # test, so we keep a real-enough stub whose connect() returns a mock.
     if "psycopg2" not in sys.modules:

@@ -4,6 +4,29 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.21] — 2026-07-23
+
+**CI fix for v1.2.20.** The v1.2.20 `test` CI job failed because
+`cdc_consumer._decrypt()` does `from cryptography.fernet import Fernet` at
+call time, and `cryptography` is not installed in the bare CI test image
+(only `pytest` is). The 3 `test_do_initial_load_postgres_*` tests that
+exercise `_do_initial_load_postgres` hit this import and failed with
+`ModuleNotFoundError: No module named 'cryptography'`. (Locally the tests
+passed because `cryptography` was installed.)
+
+### Fixed
+- **`cdc-workers/tests/test_initial_load_postgres.py`** `_install_stubs()`
+  now also installs a lightweight `cryptography.fernet.Fernet` stub so the
+  import inside `_decrypt` succeeds in the bare CI environment. The tests
+  never exercise real decryption (`src_pw_enc=""` short-circuits at
+  `if not ciphertext: return ""` before `Fernet()` is instantiated), so the
+  stub is safe. Verified by running the suite with `cryptography` blocked
+  via a meta-path finder — all 6 tests pass.
+
+### Changed
+- `control-plane/app/main.py` FastAPI `version` → `1.2.21`.
+- `helm/fusion-cdc/Chart.yaml` `version` / `appVersion` → `1.2.21`.
+
 ## [1.2.20] — 2026-07-23
 
 **Bulletproof connection lifecycle for every source × destination combo.**
