@@ -24,7 +24,7 @@ export function CreateDestinationWizard() {
   const [step, setStep] = useState(0);
   const [destType, setDestType] = useState("");
   const [pgForm, setPgForm] = useState({
-    name: "", host: "localhost", port: "5433", database: "", schema: "public", username: "", password: "", write_mode: "scd1",
+    name: "", host: "localhost", port: "5432", database: "", schema: "public", username: "", password: "", write_mode: "scd1",
     // SSL/TLS (separate from SSH)
     ssl_enabled: false,
     ssl_mode: "require" as "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full",
@@ -269,7 +269,7 @@ export function CreateDestinationWizard() {
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium">Port *</label>
-                <Input value={pgForm.port} onChange={(e) => setPgForm({ ...pgForm, port: e.target.value })} placeholder="5433" />
+                <Input value={pgForm.port} onChange={(e) => setPgForm({ ...pgForm, port: e.target.value })} placeholder="5432" />
               </div>
             </div>
             <div className="space-y-2">

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api, fetchList } from "@/lib/api";
@@ -9,6 +9,20 @@ import { Badge } from "@/components/ui/badge";
 import { CheckCircle, Circle, Loader2, Plug, Plus, X } from "lucide-react";
 
 const STEPS = ["Select Connector", "Configure", "Test Connection", "Discover Tables"];
+
+// v1.2.10: per-connector default ports. The form previously defaulted every
+// source to 3306 (the MySQL port), which was wrong for Postgres (5432) and
+// MongoDB (27017). These defaults are applied when the user picks a connector
+// in step 1 and has not yet customised the port.
+const DEFAULT_PORT_BY_CONNECTOR: Record<string, string> = {
+  postgres: "5432",
+  postgresql: "5432",
+  "postgres-wal": "5432",
+  mysql: "3306",
+  "mysql-binlog": "3306",
+  mongodb: "27017",
+  mongo: "27017",
+};
 
 export function CreateSourceWizard() {
   const navigate = useNavigate();
@@ -50,7 +64,35 @@ export function CreateSourceWizard() {
     read_preference: "",
     extra_uri_params: "",
     sample_size: "500",
+    // v1.2.10: Postgres CDC replication slot + publication, and MySQL server_id.
+    // These are CDC-critical fields that were previously only settable via the
+    // API; the wizard now exposes them so users can configure pg/mysql CDC
+    // without dropping to a raw API call.
+    replication_slot: "cdc_slot",
+    publication: "fusion_pub",
+    server_id: "",
   });
+
+  // v1.2.10: when the user selects a connector, set the port default and the
+  // MySQL server_id default. We only overwrite the port if the user hasn't
+  // already changed it from a prior connector's default (avoids clobbering a
+  // manually-typed port when flipping between connectors in step 1).
+  useEffect(() => {
+    if (!connectorType) return;
+    const defaultPort = DEFAULT_PORT_BY_CONNECTOR[connectorType] ?? "3306";
+    const priorDefault = DEFAULT_PORT_BY_CONNECTOR[
+      Object.keys(DEFAULT_PORT_BY_CONNECTOR).find((k) => form.port === DEFAULT_PORT_BY_CONNECTOR[k]) ?? ""
+    ];
+    if (!priorDefault || form.port === priorDefault) {
+      setForm((f) => ({ ...f, port: defaultPort }));
+    }
+    // MySQL: default server_id to a random int in the valid range (1 – 2^32-1).
+    if (connectorType === "mysql" && !form.server_id) {
+      const randomId = Math.floor(Math.random() * 4294967295) + 1;
+      setForm((f) => ({ ...f, server_id: String(randomId) }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectorType]);
   const [mongoExtraHosts, setMongoExtraHosts] = useState<Array<{host: string; port: string}>>([]);
   const [batchOpen, setBatchOpen] = useState(false);
   const [sslOpen, setSslOpen] = useState(false);
@@ -101,6 +143,15 @@ export function CreateSourceWizard() {
         partition_column: form.partition_column || undefined,
         lower_bound: form.lower_bound || undefined,
         upper_bound: form.upper_bound || undefined,
+        // v1.2.10: pg CDC fields
+        ...((connectorType === "postgres" || connectorType === "postgresql" || connectorType === "postgres-wal") ? {
+          replication_slot: form.replication_slot || "cdc_slot",
+          publication: form.publication || "fusion_pub",
+        } : {}),
+        // v1.2.10: mysql CDC server_id
+        ...(connectorType === "mysql" ? {
+          server_id: form.server_id ? parseInt(form.server_id) : undefined,
+        } : {}),
         ...(connectorType === "mongodb" ? {
           auth_source: form.auth_source || "admin",
           replica_set: form.replica_set || undefined,
@@ -352,6 +403,61 @@ export function CreateSourceWizard() {
                     <p className="text-xs text-muted-foreground">
                       Number of documents sampled per collection to infer field types (50 – 10,000).
                       Uses <code>$sample</code> aggregation — fast even on large collections.
+                    </p>
+                  </div>
+                </div>
+              </details>
+            )}
+            {(connectorType === "postgres" || connectorType === "postgresql" || connectorType === "postgres-wal") && (
+              <details className="rounded-md border p-3" open>
+                <summary className="cursor-pointer text-sm font-medium">Postgres CDC Settings</summary>
+                <div className="mt-3 space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium">Replication Slot</label>
+                      <Input
+                        value={form.replication_slot}
+                        onChange={(e) => setForm({ ...form, replication_slot: e.target.value })}
+                        placeholder="cdc_slot"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Logical replication slot the CDC worker reads from. Must already exist on the source
+                        (created by <code>pg_create_logical_replication_slot</code>). Default: <code>cdc_slot</code>.
+                      </p>
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium">Publication</label>
+                      <Input
+                        value={form.publication}
+                        onChange={(e) => setForm({ ...form, publication: e.target.value })}
+                        placeholder="fusion_pub"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Publication whose member tables the CDC worker streams. Default: <code>fusion_pub</code>.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </details>
+            )}
+            {connectorType === "mysql" && (
+              <details className="rounded-md border p-3" open>
+                <summary className="cursor-pointer text-sm font-medium">MySQL CDC Settings</summary>
+                <div className="mt-3 space-y-4">
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium">Replication Server ID</label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={4294967295}
+                      value={form.server_id}
+                      onChange={(e) => setForm({ ...form, server_id: e.target.value })}
+                      placeholder="Random 1 – 4294967295"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Unique ID this connector presents to the MySQL binlog as a replica. Must be non-zero and
+                      unique across all connectors reading the same MySQL server. A random value is pre-filled;
+                      override if you have a fixed replica ID scheme.
                     </p>
                   </div>
                 </div>

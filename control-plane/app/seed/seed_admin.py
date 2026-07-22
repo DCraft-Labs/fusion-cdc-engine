@@ -167,3 +167,70 @@ def run_seed(db: Session, *, force: bool = False) -> bool:
         )
         _SEED_STATUS = "not_applied"
     return True
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Self-healing: ensure the seeded Iceberg destination has a non-empty
+# connection_config. Prior releases (≤ v1.2.9) seeded this row with an
+# empty config, leaving the destination a non-functional shell. This runs
+# on EVERY startup (not just when the DB is empty) so existing clusters
+# are repaired without a manual re-seed.
+# ──────────────────────────────────────────────────────────────────────────
+_ICEBERG_CONFIG_SQL = """
+UPDATE destinations
+SET connection_config = :cfg,
+    connector_version = COALESCE(connector_version, '1.0.0'),
+    status = COALESCE(status, 'active'),
+    updated_at = NOW()
+WHERE destination_name = 'Local Iceberg (MinIO + Nessie)'
+  AND sub_tenant_id IS NULL
+  AND (connection_config IS NULL OR connection_config = '{}'::jsonb);
+"""
+
+_ICEBERG_CONFIG_JSON = (
+    '{'
+    '"catalog_type": "rest",'
+    '"catalog_name": "fusion_cdc",'
+    '"namespace": "fusion",'
+    '"catalog_uri": "http://nessie:19120",'
+    '"nessie_ref": "main",'
+    '"warehouse": "s3://iceberg-warehouse/",'
+    '"s3_endpoint": "http://minio:9000",'
+    '"s3_access_key_id": "minioadmin",'
+    '"s3_secret_access_key": "minioadmin",'
+    '"s3_region": "us-east-1",'
+    '"s3_path_style": true,'
+    '"auth_mode": "static",'
+    '"format_version": 2,'
+    '"parquet_compression": "zstd",'
+    '"object_storage_enabled": true,'
+    '"partitioned_paths": true,'
+    '"cdc_apply_strategy": "upsert"'
+    '}'
+)
+
+
+def ensure_iceberg_destination_config(db: Session) -> None:
+    """Repair any seeded Iceberg destination row that has an empty config.
+
+    Called on every control-plane startup (see ``app.main.lifespan``) so that
+    clusters upgraded from v1.2.9 or earlier get the MinIO + Nessie config
+    back-filled without requiring a manual re-seed.
+    """
+    try:
+        result = db.execute(text(_ICEBERG_CONFIG_SQL), {"cfg": _ICEBERG_CONFIG_JSON})
+        db.commit()
+        if result.rowcount and result.rowcount > 0:
+            logger.info(
+                "Seed: repaired %d Iceberg destination row(s) with empty connection_config.",
+                result.rowcount,
+            )
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "Seed: could not repair Iceberg destination connection_config — %s",
+            exc,
+        )

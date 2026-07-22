@@ -327,19 +327,18 @@ BEGIN
     v_iceberg_dst_def_id,
     '1.0.0',
     '{
-      "catalog_type": "nessie",
+      "catalog_type": "rest",
       "catalog_name": "fusion_cdc",
       "namespace": "fusion",
-      "nessie_uri": "http://nessie:19120/api/v2",
+      "catalog_uri": "http://nessie:19120",
       "nessie_ref": "main",
-      "warehouse": "s3://iceberg-warehouse/fusion-cdc/",
+      "warehouse": "s3://iceberg-warehouse/",
       "s3_endpoint": "http://minio:9000",
+      "s3_access_key_id": "minioadmin",
+      "s3_secret_access_key": "minioadmin",
       "s3_region": "us-east-1",
       "s3_path_style": true,
-      "auth_mode": "access_key",
-      "aws_access_key_id": "minio",
-      "aws_secret_access_key": "minio123",
-      "aws_region": "us-east-1",
+      "auth_mode": "static",
       "format_version": 2,
       "parquet_compression": "zstd",
       "object_storage_enabled": true,
@@ -351,6 +350,36 @@ BEGIN
   WHERE NOT EXISTS (
     SELECT 1 FROM destinations WHERE destination_name = 'Local Iceberg (MinIO + Nessie)' AND sub_tenant_id IS NULL
   );
+
+  -- Force-update connection_config for any pre-existing Iceberg destination
+  -- row that was seeded with an empty config in prior releases.
+  UPDATE destinations
+  SET connection_config = '{
+      "catalog_type": "rest",
+      "catalog_name": "fusion_cdc",
+      "namespace": "fusion",
+      "catalog_uri": "http://nessie:19120",
+      "nessie_ref": "main",
+      "warehouse": "s3://iceberg-warehouse/",
+      "s3_endpoint": "http://minio:9000",
+      "s3_access_key_id": "minioadmin",
+      "s3_secret_access_key": "minioadmin",
+      "s3_region": "us-east-1",
+      "s3_path_style": true,
+      "auth_mode": "static",
+      "format_version": 2,
+      "parquet_compression": "zstd",
+      "object_storage_enabled": true,
+      "partitioned_paths": true,
+      "cdc_apply_strategy": "upsert"
+    }'::jsonb,
+    connector_definition_id = v_iceberg_dst_def_id,
+    connector_version = '1.0.0',
+    status = 'active',
+    updated_at = NOW()
+  WHERE destination_name = 'Local Iceberg (MinIO + Nessie)'
+    AND sub_tenant_id IS NULL
+    AND (connection_config IS NULL OR connection_config = '{}'::jsonb);
 
   -- ──────────────────────────────────────────────────────────────────────────
   -- 6. Sample connection — pg-source → pg-dest, REALTIME CDC

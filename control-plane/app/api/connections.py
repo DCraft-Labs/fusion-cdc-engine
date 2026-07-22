@@ -249,9 +249,39 @@ def _trigger_dag_or_worker(connection: Connection, db: Session) -> None:
             log.warning("Could not notify worker via HTTP (connection=%s): %s", connection_id, exc)
 
 
-def _check_worker_reachable() -> bool:
-    """Quick connectivity check to the CDC worker HTTP endpoint."""
+def _check_worker_reachable(db: Optional[Session] = None) -> bool:
+    """Determine whether at least one CDC worker is alive.
+
+    The CDC workers run in separate pods and their HTTP /health endpoint is
+    not exposed via a Service — the control plane cannot reach them via
+    ``localhost:8081`` in a Kubernetes deployment.  The authoritative liveness
+    signal is the ``worker_heartbeats`` table, which workers upsert every
+    ``HEARTBEAT_INTERVAL`` seconds (default 30s).
+
+    This function returns True if any worker has heartbeated within the last
+    90 seconds.  If a ``db`` session is not supplied, the HTTP probe is used
+    as a best-effort fallback (useful in unit tests / standalone scripts).
+    """
     import os
+    from datetime import datetime, timedelta
+
+    if db is not None:
+        try:
+            from app.models.monitoring import WorkerHeartbeat
+            cutoff = datetime.utcnow() - timedelta(seconds=90)
+            recent = (
+                db.query(WorkerHeartbeat)
+                .filter(WorkerHeartbeat.last_heartbeat_at >= cutoff)
+                .filter(WorkerHeartbeat.status.in_(["running", "idle", "healthy"]))
+                .first()
+            )
+            if recent is not None:
+                return True
+        except Exception:
+            pass
+
+    # Fallback: HTTP probe (works when control-plane and worker share a pod
+    # or when CDC_WORKER_URL is explicitly set to the worker Service).
     import httpx
     from app.config import settings
     worker_url = os.environ.get("CDC_WORKER_URL", os.environ.get("WORKER_CONTROL_URL", "http://localhost:8081"))
@@ -338,25 +368,31 @@ async def create_connection(
     Requires: connections:create permission
     """
     # Validate source exists and is accessible
-    source = db.query(Source).filter(
+    # Superusers bypass the tenant filter so they can wire up sources/destinations
+    # created under any tenant (the seeded admin has sub_tenant_id=NULL).
+    source_conditions = [
         Source.source_id == connection_data.source_id,
-        Source.sub_tenant_id == current_user.sub_tenant_id,
         Source.is_deleted == False,
-    ).first()
-    
+    ]
+    if not getattr(current_user, "is_superuser", False):
+        source_conditions.append(Source.sub_tenant_id == current_user.sub_tenant_id)
+    source = db.query(Source).filter(*source_conditions).first()
+
     if not source:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Source {connection_data.source_id} not found",
         )
-    
+
     # Validate destination exists and is accessible
-    destination = db.query(Destination).filter(
+    dest_conditions = [
         Destination.destination_id == connection_data.destination_id,
-        Destination.sub_tenant_id == current_user.sub_tenant_id,
         Destination.is_deleted == False,
-    ).first()
-    
+    ]
+    if not getattr(current_user, "is_superuser", False):
+        dest_conditions.append(Destination.sub_tenant_id == current_user.sub_tenant_id)
+    destination = db.query(Destination).filter(*dest_conditions).first()
+
     if not destination:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1035,7 +1071,7 @@ async def trigger_manual_sync(
     # A CDC "trigger" is fire-and-confirm — the run completes once the worker
     # acknowledges the source is being streamed.  The actual streaming lives in
     # the worker process indefinitely; the run record is just an audit entry.
-    worker_reachable = _check_worker_reachable()
+    worker_reachable = _check_worker_reachable(db)
     if sync_type not in ("BATCH", "SCHEDULED"):
         if not worker_reachable:
             run.status = "failed"

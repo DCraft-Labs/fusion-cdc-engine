@@ -4,6 +4,64 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.10] — 2026-07-22
+
+CDC runtime + local-dev infrastructure repair release. v1.2.9 verified the UI
+was live and solid, but the E2E CDC audit found the runtime non-functional:
+workers were not assigned to connections, MongoDB connections 404'd, the
+seeded Iceberg destination had an empty config, and Postgres schema discovery
+returned 0 tables. v1.2.10 fixes all seven blockers.
+
+### Fixed
+- **CDC worker assignment (BLOCKER 1)** — `trigger-sync` no longer fails with
+  "CDC worker is not running" when a live worker is heartbeating. The
+  `_check_worker_reachable()` helper now consults the `worker_heartbeats`
+  table (any heartbeat within the last 90s counts as alive) before falling
+  back to the HTTP `/health` probe, which was unreachable across pods
+  (`control-plane/app/api/connections.py`).
+- **MongoDB connections 404 (BLOCKER 2)** — `POST /connections` and
+  `POST /sources/{id}/discover` no longer 404 for MongoDB sources. The
+  tenant filter on the source/destination lookup is now bypassed for
+  superusers, so the seeded admin (whose `sub_tenant_id` is NULL) can wire
+  up sources created under any tenant context
+  (`control-plane/app/api/connections.py`, `control-plane/app/api/sources.py`).
+- **Seeded Iceberg destination `config:{}` (BLOCKER 3)** — the
+  `Local Iceberg (MinIO + Nessie)` destination now ships with a populated
+  `connection_config` (catalog_uri, warehouse, s3_endpoint, credentials).
+  A new `ensure_iceberg_destination_config()` startup hook repairs
+  clusters upgraded from v1.2.9 on every boot
+  (`control-plane/app/seed/seed-admin.sql`, `control-plane/app/seed/seed_admin.py`,
+  `control-plane/app/main.py`).
+- **Postgres `discover` returns 0 tables (BLOCKER 4)** — `_discover_postgres`
+  now lists tables from `pg_publication_tables` when a `publication` is
+  configured in the source `config`, so the seeded pg source with
+  `fusion_pub` returns `users` + `orders`. Falls back to the broad
+  `information_schema.tables` scan when no publication is configured
+  (`control-plane/app/api/sources.py`).
+- **UI forms missing CDC fields (BLOCKER 5)** — the source wizard now exposes
+  `replication_slot` (default `cdc_slot`) and `publication` (default
+  `fusion_pub`) for Postgres, and `server_id` (random 1–4294967295) for MySQL
+  (`frontend/src/pages/sources/CreateSourceWizard.tsx`).
+- **Wrong port defaults (BLOCKER 6)** — source wizard now defaults pg → 5432,
+  mongo → 27017, mysql → 3306 (previously everything defaulted to 3306).
+  PostgreSQL destination wizard default port corrected from 5433 → 5432
+  (`frontend/src/pages/sources/CreateSourceWizard.tsx`,
+  `frontend/src/pages/destinations/CreateDestinationWizard.tsx`).
+
+### Added
+- **Local-dev infra pods (BLOCKER 7)** — `infra/local-dev/k8s/00-infra.yaml`
+  now deploys `mysql-source` (MySQL 8.0 with binlog + self-seeding init SQL),
+  `mongo-source` (MongoDB 7, no auth), `minio` (S3-compatible API + console
+  + PVC + bucket-init Job), and `nessie` (Iceberg REST catalog). All with
+  startup/readiness probes and small (128Mi–256Mi) resource requests.
+  LOCAL-DEV ONLY — production must use managed equivalents.
+
+### Changed
+- Bumped FastAPI app `version="1.2.9"` → `"1.2.10"`
+  (`control-plane/app/main.py`).
+- Bumped `fusion-cdc` Helm chart to `version: 1.2.10` / `appVersion: "1.2.10"`
+  (`helm/fusion-cdc/Chart.yaml`).
+
 ## [1.2.9] — 2026-07-22
 
 UI polish pass on top of the verified-stable v1.2.8 backend. The v1.2.8 UX

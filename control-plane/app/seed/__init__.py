@@ -10,6 +10,6 @@ re-seeds itself whenever it starts and finds an empty DB.
 See CHANGELOG v1.2.2 and `app/seed/seed_admin.py`.
 """
 
-from app.seed.seed_admin import run_seed, SEED_SQL
+from app.seed.seed_admin import run_seed, SEED_SQL, ensure_iceberg_destination_config
 
-__all__ = ["run_seed", "SEED_SQL"]
+__all__ = ["run_seed", "SEED_SQL", "ensure_iceberg_destination_config"]

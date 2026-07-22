@@ -295,10 +295,13 @@ async def lifespan(app: FastAPI):
     # Run before the background tasks so the UI has connectors on first boot.
     try:
         from app.database import SessionLocal
-        from app.seed import run_seed
+        from app.seed import run_seed, ensure_iceberg_destination_config
         _seed_db = SessionLocal()
         try:
             run_seed(_seed_db)
+            # v1.2.10: always repair the seeded Iceberg destination config so
+            # clusters upgraded from v1.2.9 get MinIO + Nessie values back-filled.
+            ensure_iceberg_destination_config(_seed_db)
         finally:
             _seed_db.close()
     except Exception as exc:
@@ -346,7 +349,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Fusion CDC Engine - Control Plane",
     description="Multi-tenant Change Data Capture Platform API",
-    version="1.2.9",
+    version="1.2.10",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json",

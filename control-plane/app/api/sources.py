@@ -73,15 +73,21 @@ def _decrypt_password(encrypted: str) -> str:
 
 
 def _get_source_by_id(db: Session, source_id: UUID, user: User) -> Source:
-    """Get source by ID with tenant filtering"""
-    stmt = select(Source).where(
-        and_(
-            Source.source_id == source_id,
-            Source.sub_tenant_id == user.sub_tenant_id,
-            Source.is_deleted == False
-        )
-    ).options(joinedload(Source.connector_definition))
-    
+    """Get source by ID with tenant filtering.
+
+    Superusers (``is_superuser=True``) bypass the tenant filter so they can
+    access sources created under any tenant — this is essential for the
+    seeded admin user (whose ``sub_tenant_id`` is NULL) to discover and wire
+    up sources that may have been created with a non-NULL tenant context.
+    """
+    conditions = [
+        Source.source_id == source_id,
+        Source.is_deleted == False,
+    ]
+    if not getattr(user, "is_superuser", False):
+        conditions.append(Source.sub_tenant_id == user.sub_tenant_id)
+    stmt = select(Source).where(and_(*conditions)).options(joinedload(Source.connector_definition))
+
     source = db.execute(stmt).scalar_one_or_none()
     if not source:
         raise HTTPException(
@@ -173,7 +179,7 @@ def _discover_database_schemas(
         if ct in ("mysql", "mysql-binlog"):
             return _discover_mysql(host, port or 3306, database_name, username, password, ssh_config)
         elif ct in ("postgresql", "postgres", "postgres-wal"):
-            return _discover_postgres(host, port or 5432, database_name, username, password, ssh_config)
+            return _discover_postgres(host, port or 5432, database_name, username, password, ssh_config, extra_config)
         elif ct in ("mongodb", "mongo"):
             return _discover_mongodb(host, port or 27017, database_name, username, password, ssh_config, extra_config)
     except Exception as exc:
@@ -247,11 +253,22 @@ def _discover_mysql(host: str, port: int, database_name: str, username: str, pas
     ]}
 
 
-def _discover_postgres(host: str, port: int, database_name: str, username: str, password: str, ssh_config: dict = None) -> dict:
-    """Query information_schema for PostgreSQL schema structure."""
+def _discover_postgres(host: str, port: int, database_name: str, username: str, password: str, ssh_config: dict = None, extra_config: dict = None) -> dict:
+    """Query information_schema for PostgreSQL schema structure.
+
+    v1.2.10: if a ``publication`` is configured in ``extra_config`` (the
+    seeded pg source uses ``fusion_pub``), prefer listing tables from
+    ``pg_publication_tables`` so the discovery surface matches what the
+    CDC worker will actually stream.  We still fall back to the broad
+    ``information_schema.tables`` scan when no publication is configured
+    or the publication lookup returns nothing.
+    """
     from app.utils.db_tester import _ssh_tunnel
     import psycopg2
     import psycopg2.extras
+
+    extra_config = extra_config or {}
+    publication = (extra_config.get("publication") or extra_config.get("publication_name") or "").strip()
 
     with _ssh_tunnel(ssh_config or {}, host, port) as (bind_host, bind_port):
         conn = psycopg2.connect(
@@ -261,20 +278,47 @@ def _discover_postgres(host: str, port: int, database_name: str, username: str, 
         schemas: dict = {}
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # Tables
-                cur.execute(
-                    "SELECT table_schema, table_name, table_type "
-                    "FROM information_schema.tables "
-                    "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
-                    "ORDER BY table_schema, table_name"
-                )
-                for row in cur.fetchall():
-                    s, t = row["table_schema"], row["table_name"]
-                    schemas.setdefault(s, {})[t] = {
-                        "schema_name": s, "table_name": t,
-                        "table_type": row["table_type"],
-                        "row_count": 0, "columns": [], "primary_keys": [],
-                    }
+                # Tables — prefer publication membership when configured.
+                listed_tables = False
+                if publication:
+                    try:
+                        cur.execute(
+                            "SELECT schemaname, tablename "
+                            "FROM pg_publication_tables "
+                            "WHERE pubname = %s "
+                            "ORDER BY schemaname, tablename",
+                            (publication,),
+                        )
+                        pub_rows = cur.fetchall()
+                        for row in pub_rows:
+                            s, t = row["schemaname"], row["tablename"]
+                            schemas.setdefault(s, {})[t] = {
+                                "schema_name": s, "table_name": t,
+                                "table_type": "BASE TABLE",
+                                "row_count": 0, "columns": [], "primary_keys": [],
+                            }
+                        listed_tables = bool(pub_rows)
+                    except Exception as pub_exc:
+                        log.warning(
+                            "pg_publication_tables lookup failed for pub=%s — falling back to information_schema: %s",
+                            publication, pub_exc,
+                        )
+
+                if not listed_tables:
+                    # Fallback: list all user tables.
+                    cur.execute(
+                        "SELECT table_schema, table_name, table_type "
+                        "FROM information_schema.tables "
+                        "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
+                        "ORDER BY table_schema, table_name"
+                    )
+                    for row in cur.fetchall():
+                        s, t = row["table_schema"], row["table_name"]
+                        schemas.setdefault(s, {})[t] = {
+                            "schema_name": s, "table_name": t,
+                            "table_type": row["table_type"],
+                            "row_count": 0, "columns": [], "primary_keys": [],
+                        }
 
                 # Collect PK info
                 cur.execute(
