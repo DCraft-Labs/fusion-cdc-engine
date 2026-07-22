@@ -1868,17 +1868,37 @@ def main() -> None:
             pk_map[st["table_name"]] = list(pk_raw)
 
         if not conn_cfg["initial_load_completed"]:
-            pending_run = _get_pending_run(meta, cid)
-            run_id = str(pending_run["run_id"]) if pending_run else None
-            log.info("▶ Initial load required for '%s'", name)
-            try:
-                # Pass dest schema as fallback so initial load never defaults to 'public'
-                n = _do_initial_load(conn_cfg, dest_conns[cid], meta, dest_schemas[cid])
-                _complete_run(meta, cid, run_id, records=n)
-                log.info("✅ Initial load DONE for '%s': %d rows loaded", name, n)
-            except Exception as exc:
-                log.error("Initial load FAILED for '%s': %s", name, exc, exc_info=True)
-                _complete_run(meta, cid, run_id, records=0, error=str(exc))
+            # v1.2.16: when the destination's snapshot_mode is "transform_worker",
+            # the transform-worker owns the snapshot (tasks enqueued by the
+            # control-plane _enqueue_initial_load_tasks producer). Skip the
+            # inline path here to avoid a double load; cdc_consumer.py just
+            # waits for initial_load_completed to flip via the run-complete
+            # callback. Default mode is "inline" — cdc_consumer.py owns it.
+            dest_cfg = conn_cfg.get("dest_config") or {}
+            if isinstance(dest_cfg, str):
+                try:
+                    dest_cfg = json.loads(dest_cfg)
+                except Exception:
+                    dest_cfg = {}
+            snapshot_mode = str(dest_cfg.get("snapshot_mode") or "inline").lower()
+            if snapshot_mode == "transform_worker":
+                log.info(
+                    "▶ Initial load for '%s' delegated to transform-worker "
+                    "(snapshot_mode=transform_worker) — skipping inline path",
+                    name,
+                )
+            else:
+                pending_run = _get_pending_run(meta, cid)
+                run_id = str(pending_run["run_id"]) if pending_run else None
+                log.info("▶ Initial load required for '%s'", name)
+                try:
+                    # Pass dest schema as fallback so initial load never defaults to 'public'
+                    n = _do_initial_load(conn_cfg, dest_conns[cid], meta, dest_schemas[cid])
+                    _complete_run(meta, cid, run_id, records=n)
+                    log.info("✅ Initial load DONE for '%s': %d rows loaded", name, n)
+                except Exception as exc:
+                    log.error("Initial load FAILED for '%s': %s", name, exc, exc_info=True)
+                    _complete_run(meta, cid, run_id, records=0, error=str(exc))
         else:
             log.info("'%s': initial load already complete, starting CDC stream", name)
 
@@ -1963,13 +1983,29 @@ def main() -> None:
                         pk_map[st["table_name"]] = list(pk_raw)
 
                     if not conn_cfg["initial_load_completed"]:
-                        log.info("[poller] ▶ Starting initial load for '%s'", name)
-                        try:
-                            n = _do_initial_load(conn_cfg, dest_conns[cid], fresh_meta, dest_schemas[cid])
-                            _complete_run(fresh_meta, cid, None, records=n)
-                            log.info("[poller] ✅ Initial load DONE for '%s': %d rows", name, n)
-                        except Exception as exc:
-                            log.error("[poller] Initial load FAILED for '%s': %s", name, exc, exc_info=True)
+                        # v1.2.16: respect snapshot_mode=transform_worker in the
+                        # poller path too — skip inline load when the transform-worker
+                        # owns the snapshot.
+                        dest_cfg = conn_cfg.get("dest_config") or {}
+                        if isinstance(dest_cfg, str):
+                            try:
+                                dest_cfg = json.loads(dest_cfg)
+                            except Exception:
+                                dest_cfg = {}
+                        if str(dest_cfg.get("snapshot_mode") or "inline").lower() == "transform_worker":
+                            log.info(
+                                "[poller] ▶ Initial load for '%s' delegated to transform-worker "
+                                "(snapshot_mode=transform_worker) — skipping inline path",
+                                name,
+                            )
+                        else:
+                            log.info("[poller] ▶ Starting initial load for '%s'", name)
+                            try:
+                                n = _do_initial_load(conn_cfg, dest_conns[cid], fresh_meta, dest_schemas[cid])
+                                _complete_run(fresh_meta, cid, None, records=n)
+                                log.info("[poller] ✅ Initial load DONE for '%s': %d rows", name, n)
+                            except Exception as exc:
+                                log.error("[poller] Initial load FAILED for '%s': %s", name, exc, exc_info=True)
                     else:
                         log.info("[poller] '%s': initial load already done, added to CDC routing", name)
                 fresh_meta.close()

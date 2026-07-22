@@ -4,6 +4,55 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.16] — 2026-07-23
+
+Closes the three remaining gaps from v1.2.14. The transform-worker
+`InitialLoadTask` was correct but idle (no producer enqueued `initial_load`
+tasks), users could not create MySQL/MongoDB destinations (no connector
+definitions), and the task still called two non-existent control-plane
+endpoints (`/internal/data-proxy/fetch` and `/internal/load-checkpoints`).
+
+### Added
+- **Initial-load producer (Gap 1).** New
+  `control-plane/app/api/connections.py:_enqueue_initial_load_tasks` builds
+  one `initial_load` task per enabled stream and LPUSHes it to
+  `fusion:transforms:high` when the destination's `connection_config` sets
+  `snapshot_mode: transform_worker`. Default mode is `inline` — the existing
+  `cdc_consumer.py` snapshot path remains canonical and untouched. The
+  producer is dispatched from `_trigger_dag_or_worker` (so both `activate` and
+  `trigger-sync` pick it up) and is a no-op when mode is `inline`.
+  `cdc-workers/cdc_consumer.py` now respects `snapshot_mode=transform_worker`
+  in both the startup and poller paths, skipping the inline load to avoid a
+  double snapshot.
+- **MySQL & MongoDB destination connector definitions (Gap 2).** Added
+  `MySQL Destination` (connector_type=`mysql`, category=`destination`,
+  default port 3306, ssl_mode) and `MongoDB Destination` (connector_type=
+  `mongodb`, category=`destination`, default port 27017, auth_source,
+  replica_set) to `control-plane/app/seed/seed-admin.sql`. Mirrors the
+  PostgreSQL Destination structure. Idempotent via `ON CONFLICT (connector_name)
+  DO UPDATE`. Users can now create MySQL/MongoDB destinations (the v1.2.14
+  DSN builders `_mysql_dsn_from_dest` / `_mongo_dsn_from_dest` now have
+  matching connector defs).
+- **`POST /internal/load-checkpoints` endpoint (Gap 3).** New control-plane
+  endpoint in `control-plane/app/api/internal.py:upsert_load_checkpoint`
+  upserts into `initial_load_checkpoints` keyed by (connection_id, stream_id).
+  Replaces the non-existent endpoint the worker 404'd on.
+
+### Fixed
+- **`InitialLoadTask._fetch_rows` (Gap 3).** Rewrote
+  `transform-worker/loader.py:InitialLoadTask._fetch_rows` to connect to the
+  source DB directly using the `source` block in the task payload (psycopg2
+  for Postgres, pymysql for MySQL, pymongo for MongoDB) instead of proxying
+  through the non-existent `/internal/data-proxy/fetch` endpoint. Added
+  `pymysql==1.1.1` and `pymongo==4.7.3` to `transform-worker/requirements.txt`.
+- **`InitialLoadTask._mark_chunk_done` (Gap 3).** Now passes `stream_id` +
+  `source_table` so the new `/internal/load-checkpoints` endpoint can upsert
+  by (connection_id, stream_id). Failures are logged but never raise.
+
+### Changed
+- Bumped `control-plane/app/main.py` FastAPI `version` to `1.2.16`.
+- Bumped `helm/fusion-cdc/Chart.yaml` to `version: 1.2.16` / `appVersion: "1.2.16"`.
+
 ## [1.2.15] — 2026-07-23
 
 Fixes the Iceberg write path so the validate-write endpoint AND the real

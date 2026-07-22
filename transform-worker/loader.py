@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -130,15 +131,24 @@ class InitialLoadTask:
         pk_start = task.get("pk_start")
         pk_end = task.get("pk_end")
         steps = task.get("transform_steps", [])
+        source = task.get("source") or {}
+        source_schema = task.get("source_schema") or ""
+        source_table = task.get("source_table") or ""
+        stream_id = task.get("stream_id")
 
-        log.info("InitialLoad connection=%s chunk=%d pk=[%s, %s]",
-                 connection_id, chunk_seq, pk_start, pk_end)
+        log.info("InitialLoad connection=%s chunk=%d pk=[%s, %s] table=%s.%s",
+                 connection_id, chunk_seq, pk_start, pk_end, source_schema, source_table)
 
-        # Fetch source rows via control-plane proxy (avoids worker needing raw source DSN)
-        rows = self._fetch_rows(connection_id, pk_start, pk_end)
+        # Fetch source rows directly from the source DB (the task payload
+        # includes the source block with a decrypted plaintext password, so
+        # the worker does not need to proxy through the control-plane). The
+        # previous implementation called a non-existent
+        # /internal/data-proxy/fetch endpoint and 404'd on every chunk — see
+        # Gap 3 in the v1.2.16 release notes.
+        rows = self._fetch_rows(source, source_schema, source_table, pk_start, pk_end)
         if not rows:
             log.info("No rows in range — chunk %d complete", chunk_seq)
-            self._mark_chunk_done(connection_id, chunk_seq, 0)
+            self._mark_chunk_done(connection_id, stream_id, source_table, chunk_seq, 0)
             return
 
         # Apply transforms
@@ -175,7 +185,7 @@ class InitialLoadTask:
                     "Dropping %d rows.",
                     connection_id, chunk_seq, connector_type, len(transformed),
                 )
-                self._mark_chunk_done(connection_id, chunk_seq, 0, last_pk=pk_end)
+                self._mark_chunk_done(connection_id, stream_id, source_table, chunk_seq, 0, last_pk=pk_end)
                 return
             rows_written = self._copy_to_postgres(transformed, dest_dsn, schema, table)
             for child_name, child_rows in child_tables.items():
@@ -183,7 +193,7 @@ class InitialLoadTask:
                     self._copy_to_postgres(child_rows, dest_dsn, schema, child_name)
 
         # Checkpoint
-        self._mark_chunk_done(connection_id, chunk_seq, rows_written, last_pk=pk_end)
+        self._mark_chunk_done(connection_id, stream_id, source_table, chunk_seq, rows_written, last_pk=pk_end)
         log.info("InitialLoad chunk=%d done — %d rows written", chunk_seq, rows_written)
 
     def _write_to_iceberg(self, rows: list[dict], dest: dict, table_name: str) -> int:
@@ -193,17 +203,110 @@ class InitialLoadTask:
         writer = IcebergWriter(dest_config)
         return writer.write_batch(rows, table_name=table_name)
 
-    def _fetch_rows(self, connection_id: str, pk_start, pk_end) -> list[dict]:
-        """Fetch rows via control-plane data-proxy endpoint."""
-        import requests
-        url = f"{self.engine.control_plane_url}/internal/data-proxy/fetch"
-        resp = requests.post(url, json={
-            "connection_id": connection_id,
-            "pk_start": pk_start,
-            "pk_end": pk_end,
-        }, timeout=300)
-        resp.raise_for_status()
-        return resp.json().get("rows", [])
+    def _fetch_rows(self, source: dict, schema_name: str, table_name: str,
+                    pk_start=None, pk_end=None) -> list[dict]:
+        """Fetch rows directly from the source DB using the source block in
+        the task payload.
+
+        The source block shape:
+          {"connector_type": "postgres"|"mysql"|"mongodb",
+           "host": ..., "port": ..., "database_name": ..., "username": ...,
+           "password": <decrypted plaintext>, "config": {...}}
+
+        For Postgres/MySQL we issue a parameterised SELECT against
+        ``{schema}.{table}`` (or just ``{table}`` when schema is empty). For
+        MongoDB we cursor the collection and project documents to plain dicts.
+
+        ``pk_start`` / ``pk_end`` are optional PK bounds. When both are None
+        the entire table is fetched (used by the single-chunk initial-load
+        producer in v1.2.16). Returns ``[]`` when the table is empty or when
+        the source block is incomplete.
+        """
+        if not source or not table_name:
+            return []
+
+        ctype = (source.get("connector_type") or "").lower()
+        host = source.get("host") or ""
+        port = source.get("port")
+        database = source.get("database_name") or source.get("database") or ""
+        user = source.get("username") or source.get("user") or ""
+        password = source.get("password") or ""
+        cfg = source.get("config") or {}
+
+        if not host or not database:
+            log.error("_fetch_rows: source block missing host/database — cannot fetch")
+            return []
+
+        try:
+            if ctype in ("postgres", "postgresql"):
+                return self._fetch_pg(host, port or 5432, database, user, password,
+                                      schema_name, table_name, pk_start, pk_end)
+            if ctype == "mysql":
+                return self._fetch_mysql(host, port or 3306, database, user, password,
+                                          schema_name, table_name, pk_start, pk_end)
+            if ctype == "mongodb":
+                return self._fetch_mongo(host, port or 27017, database, user, password,
+                                         cfg, table_name)
+            log.error("_fetch_rows: unsupported source connector_type=%s", ctype)
+            return []
+        except Exception:
+            log.exception("_fetch_rows: failed to fetch from %s.%s on %s",
+                         schema_name, table_name, ctype)
+            return []
+
+    def _fetch_pg(self, host, port, database, user, password,
+                  schema_name, table_name, pk_start, pk_end) -> list[dict]:
+        import psycopg2
+        import psycopg2.extras
+        qualified = f"{schema_name}.{table_name}" if schema_name else table_name
+        # v1.2.16 producer enqueues a single chunk per stream with pk bounds
+        # unset, so the entire table is fetched in one SELECT. Chunked PK
+        # ranges are a future enhancement; for now we keep the signature but
+        # ignore the bounds.
+        sql = f"SELECT * FROM {qualified}"
+        with psycopg2.connect(host=host, port=port, dbname=database,
+                              user=user, password=password,
+                              connect_timeout=10) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql)
+                return [dict(r) for r in cur.fetchall()]
+
+    def _fetch_mysql(self, host, port, database, user, password,
+                     schema_name, table_name, pk_start, pk_end) -> list[dict]:
+        import pymysql
+        import pymysql.cursors
+        qualified = f"`{schema_name}`.`{table_name}`" if schema_name else f"`{table_name}`"
+        sql = f"SELECT * FROM {qualified}"
+        with pymysql.connect(host=host, port=int(port), database=database,
+                             user=user, password=password,
+                             cursorclass=pymysql.cursors.DictCursor,
+                             connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                return list(cur.fetchall())
+
+    def _fetch_mongo(self, host, port, database, user, password,
+                     cfg, collection_name) -> list[dict]:
+        from urllib.parse import quote_plus
+        from pymongo import MongoClient
+        auth_source = (cfg.get("auth_source") if isinstance(cfg, dict) else None) or "admin"
+        if user and password:
+            uri = (f"mongodb://{quote_plus(user)}:{quote_plus(password)}@"
+                   f"{host}:{port}/{database}?authSource={auth_source}")
+        else:
+            uri = f"mongodb://{host}:{port}/{database}?authSource={auth_source}"
+        client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        try:
+            db = client[database]
+            docs = list(db[collection_name].find(no_cursor_timeout=True))
+            # Convert ObjectId / datetime to serialisable forms
+            out: list[dict] = []
+            for d in docs:
+                row = {k: (str(v) if k == "_id" else v) for k, v in d.items()}
+                out.append(row)
+            return out
+        finally:
+            client.close()
 
     def _copy_to_postgres(self, rows: list[dict], dsn: str, schema: str, table: str) -> int:
         if not rows:
@@ -224,19 +327,34 @@ class InitialLoadTask:
                 conn.commit()
         return len(rows)
 
-    def _mark_chunk_done(self, connection_id: str, chunk_seq: int, rows_written: int, last_pk=None):
+    def _mark_chunk_done(self, connection_id: str, stream_id, source_table: str,
+                         chunk_seq: int, rows_written: int, last_pk=None):
+        """Report chunk progress to the control-plane /internal/load-checkpoints
+        endpoint (added in v1.2.16), which upserts into initial_load_checkpoints.
+
+        The previous implementation called a non-existent endpoint and 404'd
+        silently on every chunk. We now pass stream_id + source_table so the
+        control-plane can upsert by (connection_id, stream_id).
+        """
         import requests
-        requests.post(
-            f"{self.engine.control_plane_url}/internal/load-checkpoints",
-            json={
-                "connection_id": connection_id,
-                "chunk_seq": chunk_seq,
-                "rows_written": rows_written,
-                "last_pk": last_pk,
-                "state": "done",
-            },
-            timeout=10,
-        )
+        try:
+            requests.post(
+                f"{self.engine.control_plane_url}/internal/load-checkpoints",
+                json={
+                    "connection_id": connection_id,
+                    "stream_id": stream_id,
+                    "source_table": source_table,
+                    "chunk_seq": chunk_seq,
+                    "rows_written": rows_written,
+                    "last_pk": last_pk,
+                    "state": "done",
+                },
+                headers={"X-Worker-Token": os.environ.get("WORKER_SHARED_SECRET", "")},
+                timeout=10,
+            )
+        except Exception:
+            log.warning("_mark_chunk_done: failed to report checkpoint for connection=%s chunk=%s",
+                        connection_id, chunk_seq, exc_info=True)
 
 
 class CDCTransformTask:

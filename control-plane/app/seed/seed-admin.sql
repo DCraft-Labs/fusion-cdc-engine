@@ -26,6 +26,8 @@ DECLARE
   v_mysql_src_def_id  uuid;
   v_mongo_src_def_id  uuid;
   v_pg_dst_def_id     uuid;  -- assigned from v_pg_src_def_id (same connector)
+  v_mysql_dst_def_id  uuid;
+  v_mongo_dst_def_id  uuid;
   v_iceberg_dst_def_id uuid;
   v_s3_dst_def_id     uuid;
   v_source_id         uuid;
@@ -161,6 +163,56 @@ BEGIN
     connector_type = EXCLUDED.connector_type,
     category = EXCLUDED.category
   RETURNING connector_id INTO v_mongo_src_def_id;
+
+  -- MySQL DESTINATION connector (separate entry so UI can show it in destination list).
+  -- The v1.2.14 DSN builder _mysql_dsn_from_dest is ready, but without this
+  -- connector definition users could not create MySQL destinations. Added
+  -- in v1.2.16 (Gap 2). Mirrors the PostgreSQL Destination structure.
+  INSERT INTO connector_definitions (
+    connector_name, connector_type, category, latest_version,
+    default_config, required_fields, optional_fields, default_resource_limits,
+    supports_cdc, supports_full_refresh, supports_incremental,
+    documentation_url, is_active
+  )
+  VALUES (
+    'MySQL Destination', 'mysql', 'destination', '1.0.0',
+    '{"port": 3306, "ssl_mode": "preferred"}'::jsonb,
+    '["host","port","database_name","username","password"]'::jsonb,
+    '["ssl_mode","ssl_enabled","schema_name"]'::jsonb,
+    '{"cpu": "500m", "memory": "512Mi"}'::jsonb,
+    false, true, true,
+    'https://docs.dcraftfusion.io/connectors/mysql-destination',
+    true
+  )
+  ON CONFLICT (connector_name) DO UPDATE SET
+    connector_type = EXCLUDED.connector_type,
+    category = EXCLUDED.category
+  RETURNING connector_id INTO v_mysql_dst_def_id;
+
+  -- MongoDB DESTINATION connector (separate entry so UI can show it in destination list).
+  -- The v1.2.14 DSN builder _mongo_dsn_from_dest is ready, but without this
+  -- connector definition users could not create MongoDB destinations. Added
+  -- in v1.2.16 (Gap 2). Mirrors the PostgreSQL Destination structure.
+  INSERT INTO connector_definitions (
+    connector_name, connector_type, category, latest_version,
+    default_config, required_fields, optional_fields, default_resource_limits,
+    supports_cdc, supports_full_refresh, supports_incremental,
+    documentation_url, is_active
+  )
+  VALUES (
+    'MongoDB Destination', 'mongodb', 'destination', '1.0.0',
+    '{"port": 27017, "auth_source": "admin", "replica_set": ""}'::jsonb,
+    '["host","port","database_name"]'::jsonb,
+    '["username","password","auth_source","replica_set","ssl_enabled"]'::jsonb,
+    '{"cpu": "500m", "memory": "512Mi"}'::jsonb,
+    false, true, true,
+    'https://docs.dcraftfusion.io/connectors/mongodb-destination',
+    true
+  )
+  ON CONFLICT (connector_name) DO UPDATE SET
+    connector_type = EXCLUDED.connector_type,
+    category = EXCLUDED.category
+  RETURNING connector_id INTO v_mongo_dst_def_id;
 
   -- Apache Iceberg destination connector (DuckDB/PyIceberg lake path)
   INSERT INTO connector_definitions (
@@ -419,7 +471,7 @@ BEGIN
 
   RAISE NOTICE '=== Seed complete ===';
   RAISE NOTICE 'Admin login  : admin / Admin@123';
-  RAISE NOTICE 'Connector defs: PostgreSQL SOURCE, MySQL SOURCE, MongoDB SOURCE, PostgreSQL DESTINATION, Apache Iceberg DESTINATION, Amazon S3 DESTINATION';
+  RAISE NOTICE 'Connector defs: PostgreSQL SOURCE, MySQL SOURCE, MongoDB SOURCE, PostgreSQL DESTINATION, MySQL DESTINATION, MongoDB DESTINATION, Apache Iceberg DESTINATION, Amazon S3 DESTINATION';
   RAISE NOTICE 'Source       : Local PostgreSQL Source  (pg-source:5432/source_db)';
   RAISE NOTICE 'Destinations : Local PostgreSQL Destination (postgres-dest:5432/fusion_dw)';
   RAISE NOTICE '             : Local Iceberg (MinIO + Nessie) — s3://iceberg-warehouse/fusion-cdc/';

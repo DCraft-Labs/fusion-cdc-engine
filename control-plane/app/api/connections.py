@@ -248,6 +248,19 @@ def _trigger_dag_or_worker(connection: Connection, db: Session) -> None:
         except Exception as exc:
             log.warning("Could not notify worker via HTTP (connection=%s): %s", connection_id, exc)
 
+    # v1.2.16: when the destination's snapshot_mode is "transform_worker",
+    # enqueue initial_load tasks to fusion:transforms:high so the
+    # transform-worker performs the snapshot instead of cdc_consumer.py.
+    # No-op when mode is "inline" (the default — cdc_consumer.py owns the
+    # snapshot). See Gap 1 in the v1.2.16 release notes.
+    try:
+        _enqueue_initial_load_tasks(connection, db)
+    except Exception as exc:
+        log.warning(
+            "initial_load producer dispatch failed for connection=%s: %s",
+            connection_id, exc, exc_info=True,
+        )
+
 
 def _check_worker_reachable(db: Optional[Session] = None) -> bool:
     """Determine whether at least one CDC worker is alive.
@@ -350,6 +363,179 @@ def _stop_worker_streaming(connection: Connection) -> None:
         log.info("Published stop-streaming command to Redis for connection=%s", connection_id)
     except Exception as exc:
         log.warning("Could not publish stop-streaming to Redis (connection=%s): %s", connection_id, exc)
+
+
+# ===========================
+# Initial-load producer (transform-worker snapshot path)
+# ===========================
+
+def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
+    """Enqueue ``initial_load`` tasks to ``fusion:transforms:high`` when the
+    connection's destination is configured with ``snapshot_mode=transform_worker``.
+
+    The default snapshot mode is ``inline`` — the cdc_consumer.py process
+    performs the full-table snapshot directly (see ``cdc_consumer._do_initial_load``).
+    Setting ``snapshot_mode`` to ``transform_worker`` in the destination's
+    ``connection_config`` JSONB opts a connection into the transform-worker
+    snapshot path: this producer builds one ``initial_load`` task per enabled
+    stream and LPUSHes it to the high-priority Redis list consumed by
+    ``transform-worker/worker.py`` (``InitialLoadTask``).
+
+    The task payload includes:
+      - ``source`` block (host/port/database/username + decrypted password) so
+        the worker can fetch rows directly from the source DB (no data-proxy
+        round-trip — see Gap 3 in the v1.2.16 release notes).
+      - ``destination`` block (connector_type + connection_config with the
+        decrypted plaintext password) so the worker can derive the dest DSN
+        via ``_dest_dsn_from_dest`` (mirrors the CDC transform path).
+      - ``transform_steps`` from the stream's ``transform_overrides.transforms``.
+      - ``source_schema`` / ``source_table`` / ``dest_schema`` / ``dest_table``.
+
+    Returns the number of tasks LPUSHed (0 when mode is inline or on error).
+    Never raises — the inline path remains the canonical fallback.
+    """
+    import os
+    import json as _json
+    import logging as _logging
+
+    from app.config import settings
+    from app.models.connection import Stream
+    from app.models.source_destination import Source, Destination
+    from app.api.sources import _decrypt_password
+
+    log = _logging.getLogger(__name__)
+    try:
+        dest = (
+            db.query(Destination)
+            .filter(Destination.destination_id == connection.destination_id)
+            .first()
+        )
+        if not dest:
+            return 0
+        dest_config_raw = dest.connection_config or {}
+        if isinstance(dest_config_raw, str):
+            try:
+                dest_config_raw = _json.loads(dest_config_raw)
+            except Exception:
+                dest_config_raw = {}
+        snapshot_mode = str(dest_config_raw.get("snapshot_mode") or "inline").lower()
+        if snapshot_mode != "transform_worker":
+            return 0  # inline mode: cdc_consumer.py handles the snapshot
+
+        source = (
+            db.query(Source)
+            .filter(Source.source_id == connection.source_id)
+            .first()
+        )
+        if not source:
+            log.warning(
+                "initial_load producer: source %s not found for connection %s",
+                connection.source_id, connection.connection_id,
+            )
+            return 0
+
+        # Build destination block with decrypted plaintext password.
+        dest_config = dict(dest_config_raw)
+        enc = dest_config.get("password_encrypted")
+        if enc and not dest_config.get("password"):
+            try:
+                dest_config["password"] = _decrypt_password(enc)
+            except Exception:
+                pass
+        dest_connector_type = "postgres"
+        if dest.connector_definition:
+            dest_connector_type = dest.connector_definition.connector_type
+        dest_block = {
+            "connector_type": dest_connector_type,
+            "connection_config": dest_config,
+        }
+
+        # Build source block with decrypted plaintext password.
+        src_pw = ""
+        if source.password_encrypted:
+            try:
+                src_pw = _decrypt_password(source.password_encrypted)
+            except Exception:
+                pass
+        src_connector_type = "postgres"
+        if source.connector_definition:
+            src_connector_type = source.connector_definition.connector_type
+        source_block = {
+            "connector_type": src_connector_type,
+            "host": source.host,
+            "port": source.port,
+            "database_name": source.database_name,
+            "username": source.username,
+            "password": src_pw,
+            "config": source.config or {},
+            "ssh_config": source.ssh_config or {},
+        }
+
+        streams = (
+            db.query(Stream)
+            .filter(
+                Stream.connection_id == connection.connection_id,
+                Stream.is_enabled == True,  # noqa: E712
+            )
+            .all()
+        )
+        if not streams:
+            log.warning(
+                "initial_load producer: no enabled streams for connection %s",
+                connection.connection_id,
+            )
+            return 0
+
+        import redis as _redis
+        redis_url = os.environ.get(
+            "REDIS_URL", getattr(settings, "REDIS_URL", "redis://localhost:6379"),
+        )
+        r = _redis.from_url(redis_url)
+        high_queue = os.environ.get("HIGH_PRIORITY_QUEUE", "fusion:transforms:high")
+
+        pushed = 0
+        for stream in streams:
+            to = stream.transform_overrides or {}
+            steps = to.get("transforms", []) if isinstance(to, dict) else []
+            pk = stream.primary_keys
+            if isinstance(pk, list):
+                pk_str = ",".join(str(k) for k in pk) if pk else "id"
+            elif isinstance(pk, dict):
+                pk_str = ",".join(str(k) for k in pk.keys()) if pk else "id"
+            else:
+                pk_str = str(pk) if pk else "id"
+            task = {
+                "type": "initial_load",
+                "task_id": f"il-{connection.connection_id}-{stream.stream_id}",
+                "connection_id": str(connection.connection_id),
+                "stream_id": str(stream.stream_id),
+                "chunk_seq": 0,
+                "pk_start": None,
+                "pk_end": None,
+                "transform_steps": steps,
+                "destination": dest_block,
+                "source": source_block,
+                "source_schema": stream.source_schema_name or "",
+                "source_table": stream.source_table_name,
+                "dest_schema": stream.destination_schema_name or "dw",
+                "dest_table": stream.destination_table_name or stream.source_table_name,
+                "primary_key": pk_str,
+            }
+            r.lpush(high_queue, _json.dumps(task))
+            pushed += 1
+
+        log.info(
+            "initial_load producer: enqueued %d task(s) for connection=%s "
+            "(snapshot_mode=transform_worker, queue=%s)",
+            pushed, connection.connection_id, high_queue,
+        )
+        return pushed
+    except Exception as exc:
+        log.warning(
+            "initial_load producer: failed to enqueue tasks for connection=%s: %s",
+            connection.connection_id, exc, exc_info=True,
+        )
+        return 0
 
 
 # ===========================

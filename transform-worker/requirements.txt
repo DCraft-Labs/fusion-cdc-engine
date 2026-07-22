@@ -1,6 +1,11 @@
 duckdb==0.10.3
 redis==5.0.4
 psycopg2-binary==2.9.9
+# Source DB drivers for InitialLoadTask._fetch_rows (direct source fetch,
+# added in v1.2.16 — replaces the non-existent /internal/data-proxy/fetch
+# proxy). pymysql for MySQL sources, pymongo for MongoDB sources.
+pymysql==1.1.1
+pymongo==4.7.3
 pyarrow==16.0.0
 polars==0.20.23
 pyiceberg[glue,s3]==0.7.1

@@ -879,3 +879,98 @@ def get_transform_route(
             transform_steps=steps,
         ))
     return routes
+
+
+# ---------------------------------------------------------------------------
+# Initial-load checkpoint upsert — called by the transform-worker after each
+# InitialLoadTask chunk completes (loader.py InitialLoadTask._mark_chunk_done).
+# The previous worker implementation called a non-existent /internal/load-checkpoints
+# endpoint and 404'd silently; this minimal implementation upserts into the
+# initial_load_checkpoints table keyed by (connection_id, stream_id).
+# See Gap 3 in the v1.2.16 release notes.
+# ---------------------------------------------------------------------------
+
+class LoadCheckpointRequest(PydanticModel):
+    connection_id: str
+    stream_id: Optional[str] = None
+    source_table: Optional[str] = None
+    chunk_seq: int = 0
+    rows_written: int = 0
+    last_pk: Optional[Any] = None
+    state: str = "done"   # "done" | "running" | "failed"
+
+
+class LoadCheckpointResponse(PydanticModel):
+    ok: bool
+    upserted: int
+
+
+@router.post(
+    "/load-checkpoints",
+    response_model=LoadCheckpointResponse,
+    summary="Transform-worker reports initial-load chunk progress",
+)
+def upsert_load_checkpoint(
+    payload: LoadCheckpointRequest,
+    db: Session = Depends(get_db),
+    _token: str = Depends(_verify_worker_token),
+) -> LoadCheckpointResponse:
+    """Upsert a row into ``initial_load_checkpoints`` for the given
+    (connection_id, stream_id) pair.
+
+    If a row already exists for the stream it is updated (rows_written is
+    incremented, status is set to the reported state); otherwise a new row is
+    inserted. This lets the transform-worker's InitialLoadTask report chunk
+    progress without needing a separate data-proxy round-trip.
+    """
+    from datetime import datetime, timezone
+    from uuid import UUID
+    from app.models.monitoring import InitialLoadCheckpoint
+
+    try:
+        conn_uuid = UUID(payload.connection_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="connection_id must be a valid UUID")
+
+    stream_uuid = None
+    if payload.stream_id:
+        try:
+            stream_uuid = UUID(payload.stream_id)
+        except (ValueError, TypeError):
+            stream_uuid = None
+
+    table = (payload.source_table or "").strip() or "unknown"
+
+    existing = None
+    if stream_uuid is not None:
+        existing = (
+            db.query(InitialLoadCheckpoint)
+            .filter(
+                InitialLoadCheckpoint.connection_id == conn_uuid,
+                InitialLoadCheckpoint.stream_id == stream_uuid,
+            )
+            .first()
+        )
+
+    status = "completed" if payload.state == "done" else payload.state
+    now = datetime.now(timezone.utc)
+
+    if existing is not None:
+        existing.rows_written = (existing.rows_written or 0) + payload.rows_written
+        existing.status = status
+        if status == "completed":
+            existing.completed_at = now
+        db.commit()
+        return LoadCheckpointResponse(ok=True, upserted=1)
+
+    db.add(InitialLoadCheckpoint(
+        connection_id=conn_uuid,
+        stream_id=stream_uuid or UUID("00000000-0000-0000-0000-000000000000"),
+        source_table=table,
+        rows_written=payload.rows_written,
+        status=status,
+        started_at=now,
+        completed_at=now if status == "completed" else None,
+    ))
+    db.commit()
+    return LoadCheckpointResponse(ok=True, upserted=1)
