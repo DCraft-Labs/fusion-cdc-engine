@@ -258,7 +258,9 @@ class PermissionResponse(PermissionBase):
 
 class CurrentUserResponse(UserWithRoles):
     """Current authenticated user response"""
-    pass
+    # Computed single-role string for frontends that expect a `role` field
+    # (e.g. the CDC frontend SettingsPage). Derived from is_superuser + roles[0].
+    role: Optional[str] = Field(default=None, description="Computed role: superadmin | roles[0] | viewer")
 
 
 # ============================================================================

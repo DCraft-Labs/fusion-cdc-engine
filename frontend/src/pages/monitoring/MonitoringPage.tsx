@@ -109,7 +109,7 @@ export function MonitoringPage() {
           <Button size="sm" variant="outline" onClick={() => { refetchHealth(); refetchWorkers(); refetchPods(); }}>
             <RefreshCw className="h-4 w-4 mr-1" />Refresh
           </Button>
-          <a href="http://localhost:30800/graphql?request=query%7B__typename%7D" target="_blank" rel="noreferrer">
+          <a href="/api/v1/graphql?request=query%7B__typename%7D" target="_blank" rel="noreferrer">
             <Button size="sm" variant="outline">
               <ExternalLink className="h-4 w-4 mr-1" />GraphQL Explorer
             </Button>

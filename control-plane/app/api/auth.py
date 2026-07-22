@@ -486,6 +486,10 @@ async def get_current_user_info(
             detail="User not found",
         )
     
+    # Compute a single-role string for frontends that expect `role`.
+    # superadmin wins; otherwise the first assigned role; fallback "viewer".
+    computed_role = "superadmin" if user.is_superuser else (current_user.roles[0] if current_user.roles else "viewer")
+
     # Build response
     user_response = CurrentUserResponse(
         user_id=user.user_id,
@@ -503,6 +507,7 @@ async def get_current_user_info(
         updated_at=user.updated_at,
         roles=current_user.roles,
         permissions=current_user.permissions,
+        role=computed_role,
     )
     
     return user_response

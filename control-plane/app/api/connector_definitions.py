@@ -81,13 +81,47 @@ async def list_connector_definitions(
     # Apply pagination
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)
     stmt = stmt.order_by(ConnectorDefinition.connector_name)
-    
+
     # Execute query
     result = db.execute(stmt)
     connectors = result.scalars().all()
-    
+
+    # Compute usage_count (sources + destinations) per connector in one query
+    # so the UI "Used by: N" badge is correct without N follow-up calls.
+    connector_ids = [c.connector_id for c in connectors]
+    usage_by_connector: dict = {}
+    if connector_ids:
+        source_counts = db.execute(
+            select(Source.connector_definition_id, func.count(Source.source_id))
+            .where(
+                Source.connector_definition_id.in_(connector_ids),
+                Source.is_deleted == False,
+            )
+            .group_by(Source.connector_definition_id)
+        ).all()
+        dest_counts = db.execute(
+            select(Destination.connector_definition_id, func.count(Destination.destination_id))
+            .where(
+                Destination.connector_definition_id.in_(connector_ids),
+                Destination.is_deleted == False,
+            )
+            .group_by(Destination.connector_definition_id)
+        ).all()
+        for cid, cnt in source_counts:
+            usage_by_connector[cid] = usage_by_connector.get(cid, 0) + cnt
+        for cid, cnt in dest_counts:
+            usage_by_connector[cid] = usage_by_connector.get(cid, 0) + cnt
+
+    # Build response dicts with usage_count attached (the ORM model doesn't
+    # carry the field, so we construct the response explicitly).
+    response_connectors = []
+    for c in connectors:
+        data = ConnectorDefinitionResponse.model_validate(c).model_dump()
+        data["usage_count"] = usage_by_connector.get(c.connector_id, 0)
+        response_connectors.append(ConnectorDefinitionResponse(**data))
+
     return ConnectorDefinitionListResponse(
-        connectors=connectors,
+        connectors=response_connectors,
         total=total,
         page=page,
         page_size=page_size,

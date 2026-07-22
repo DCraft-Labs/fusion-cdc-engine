@@ -4,6 +4,67 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.9] — 2026-07-22
+
+UI polish pass on top of the verified-stable v1.2.8 backend. The v1.2.8 UX
+audit found that superadmin users only saw 2 of 9 settings cards (BLOCKER
+— the frontend read `user.role` but `/auth/me` returned `roles[]` +
+`is_superuser` with no `role` field), the connectors page showed
+"Used by: 0" for every connector, and a localhost GraphQL link broke when
+accessed from a remote browser. This release fixes all three plus the
+emilkowalski button `:active` scale and keyboard-accessible dropdowns.
+
+### Fixed
+- **Superadmin role mapping (BLOCKER)**
+  (`control-plane/app/api/auth.py:489-510`, `control-plane/app/schemas/auth.py:259-264`):
+  `/auth/me` now returns a computed `role: string` field
+  (`"superadmin" if is_superuser else (roles[0] if roles else "viewer")`)
+  so the frontend `SettingsPage` role gate renders all 9 cards for
+  superadmins. The `CurrentUserResponse` schema gained an optional `role`
+  field. Frontend `auth-store.ts` `login()` now fetches `/auth/me` after
+  storing the token (the previous code set `user: data.user` which was
+  always `undefined` since `TokenResponse` has no `user` field), and
+  `MainLayout` calls `loadUser()` on mount when authenticated but `user`
+  is null (handles page refresh).
+- **Connectors "Used by" count**
+  (`control-plane/app/api/connector_definitions.py:82-119`,
+  `control-plane/app/schemas/connector.py:60-71`): the
+  `/connector-definitions` list endpoint now computes `usage_count`
+  (sources + destinations, excluding soft-deleted) per connector in two
+  grouped queries and attaches it to each `ConnectorDefinitionResponse`.
+  The frontend already read `conn.usage_count ?? 0` — it was always 0
+  because the field was absent.
+- **localhost GraphQL link**
+  (`frontend/src/pages/graphql/GraphQLPage.tsx:9`,
+  `frontend/src/pages/monitoring/MonitoringPage.tsx:112`): replaced
+  `http://localhost:30800/graphql` with the relative `/api/v1/graphql`
+  so the "Open GraphiQL UI" link works behind the nginx proxy from any
+  browser, not just localhost.
+
+### Changed
+- **Button `:active` scale** (`frontend/src/components/ui/button.tsx:6`):
+  added `active:scale-[0.97]` to the `buttonVariants` base class. The
+  CDC button already used `transition-colors` (not `transition-all`), so
+  no transition-property change needed.
+- **Keyboard-accessible dropdowns**
+  (`frontend/src/components/ui/select.tsx`): the Radix Select wrapper
+  already forwards props to the primitives (keyboard works by default),
+  but the trigger only had `focus:` (mouse) ring styles and items only
+  had `focus:bg-accent`. Added `focus-visible:ring-2` to the trigger and
+  `data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground`
+  to `SelectItem` so keyboard-navigated items are visually distinct.
+- Bumped FastAPI app `version="1.2.8"` → `"1.2.9"`
+  (`control-plane/app/main.py:349`).
+- Bumped `fusion-cdc` Helm chart to `version: 1.2.9` / `appVersion: "1.2.9"`
+  (`helm/fusion-cdc/Chart.yaml`).
+
+### Notes
+- No database migrations in this release.
+- Coordinated with the public `dcraft-fusion` v1.2.9 release which
+  re-tags all images to `1.2.9` and ships the Fusion-side UI polish
+  (workspace nav active state, Audit Center timestamps, Recent Runs
+  semantic colors, button active scale).
+
 ## [1.2.8] — 2026-07-22
 
 Follow-up to v1.2.7. The v1.2.7 live stability audit found that

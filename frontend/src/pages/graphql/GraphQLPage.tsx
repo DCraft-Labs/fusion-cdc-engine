@@ -6,7 +6,10 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ExternalLink, Play, Code2 } from "lucide-react";
 
-const GRAPHQL_URL = "http://localhost:30800/graphql";
+// Relative URL so the link works behind any proxy / remote browser.
+// The nginx frontend proxies /api/ → control-plane, and Strawberry GraphQL
+// serves the GraphiQL UI on GET to /api/v1/graphql.
+const GRAPHQL_URL = "/api/v1/graphql";
 
 const EXAMPLE_QUERIES = [
   {

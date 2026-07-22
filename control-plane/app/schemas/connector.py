@@ -64,7 +64,11 @@ class ConnectorDefinitionResponse(ConnectorDefinitionBase):
     created_at: datetime
     updated_at: datetime
     created_by: Optional[UUID]
-    
+    # Number of sources + destinations using this connector definition.
+    # Computed by the list endpoint so the UI can show "Used by: N" without
+    # a follow-up /stats call per connector.
+    usage_count: int = Field(default=0)
+
     class Config:
         from_attributes = True
 

@@ -33,7 +33,16 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       const { data } = await api.post("/auth/login", { username: email, password });
       localStorage.setItem("auth_token", data.access_token);
-      set({ token: data.access_token, isAuthenticated: true, user: data.user });
+      set({ token: data.access_token, isAuthenticated: true });
+      // Fetch full user profile (with computed `role`) so role-gated UI
+      // (e.g. SettingsPage cards) renders correctly immediately after login.
+      try {
+        const { data: me } = await api.get("/auth/me");
+        set({ user: me });
+      } catch {
+        // token is valid but /auth/me failed; leave user null — ProtectedRoute
+        // still allows navigation; SettingsPage will fall back to "viewer".
+      }
     } finally {
       set({ isLoading: false });
     }
