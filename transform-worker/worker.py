@@ -37,6 +37,16 @@ NORMAL_QUEUE = os.environ.get("NORMAL_PRIORITY_QUEUE", "fusion:transforms:normal
 # Surfaced in /api/v1/monitoring/health and requeueable via
 # POST /api/v1/tasks/dead-letter/{task_id}/requeue.
 DEAD_LETTER_QUEUE = os.environ.get("DEAD_LETTER_QUEUE", "fusion:transforms:dead-letter")
+# v1.2.30 Defect D fix: per-worker in-flight list. Each task is atomically
+# moved (BLMOVE / BRPOPLPUSH) from the main queue to this list on dequeue,
+# and only removed (LREM) on ack (success or dead-letter). This prevents two
+# pods from dequeuing the same task_id concurrently — the old BRPOP path left
+# the task in the main queue during retry/backoff, so a sibling pod could
+# grab the re-enqueued copy while the original pod was still sleeping, causing
+# "snapshot id changed" Iceberg conflicts on the same partition.
+IN_FLIGHT_QUEUE = os.environ.get(
+    "IN_FLIGHT_QUEUE", f"fusion:transforms:in-flight:{os.environ.get('WORKER_ID', 'transform-worker-0')}"
+)
 WORKER_ID = os.environ.get("WORKER_ID", "transform-worker-0")
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://fusion-control-plane-svc.fusion.svc.cluster.local:8000")
 ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"]
@@ -113,6 +123,60 @@ def _dead_letter(r: redis.Redis, task: dict, raw_task: str, reason: str) -> None
               reason, DEAD_LETTER_QUEUE, MAX_TASK_RETRIES)
 
 
+def _atomic_dequeue(r: redis.Redis, timeout: int = 5):
+    """v1.2.30 Defect D fix: atomically move one task from the main queue to
+    this worker's in-flight list, so two pods can never dequeue the same
+    task_id concurrently. Tries HIGH first (short 1s block), then NORMAL
+    (remaining timeout). Returns ``(queue_name, raw_task)`` or ``None`` when
+    no task arrives within ``timeout`` seconds.
+
+    Uses BLMOVE (Redis 6.2+) with a BRPOPLPUSH fallback for older Redis. Both
+    pop from the RIGHT of the source and push to the LEFT of the in-flight
+    list, matching the legacy BRPOP semantics (oldest LPUSHed task first).
+    """
+    # Try the high-priority queue first (1s block so a pending high task is
+    # picked up immediately, but we don't block the whole timeout on it).
+    try:
+        raw = r.blmove(HIGH_QUEUE, IN_FLIGHT_QUEUE, "RIGHT", "LEFT", timeout=1)
+    except redis.ResponseError:
+        # Older Redis (<6.2) has no BLMOVE — fall back to BRPOPLPUSH.
+        raw = r.brpoplpush(HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1)
+    if raw is not None:
+        return HIGH_QUEUE, raw
+    # Then the normal-priority queue for the remainder of the window.
+    try:
+        raw = r.blmove(NORMAL_QUEUE, IN_FLIGHT_QUEUE, "RIGHT", "LEFT", timeout=max(1, timeout - 1))
+    except redis.ResponseError:
+        raw = r.brpoplpush(NORMAL_QUEUE, IN_FLIGHT_QUEUE, timeout=max(1, timeout - 1))
+    if raw is not None:
+        return NORMAL_QUEUE, raw
+    return None
+
+
+def _ack(r: redis.Redis, raw_task: str) -> None:
+    """v1.2.30 Defect D fix: remove ``raw_task`` from this worker's in-flight
+    list on successful completion (ack). LREM removes the first ``count``
+    occurrences; we pass count=1 so only this worker's copy is removed."""
+    r.lrem(IN_FLIGHT_QUEUE, 1, raw_task)
+
+
+def _requeue_after_backoff(r: redis.Redis, raw_task: str, updated_task: dict) -> None:
+    """v1.2.30 Defect D fix: after the backoff sleep, atomically move the
+    task from this worker's in-flight list back to the high-priority queue
+    with the updated payload (incremented retry_count). During the backoff
+    the task stays ONLY in the in-flight list — no sibling pod can dequeue
+    it, so the same partition is never processed by two pods at once."""
+    r.lrem(IN_FLIGHT_QUEUE, 1, raw_task)
+    r.lpush(HIGH_QUEUE, json.dumps(updated_task))
+
+
+def _dead_letter_from_inflight(r: redis.Redis, raw_task: str, task: dict, reason: str) -> None:
+    """v1.2.30 Defect D fix: remove the task from the in-flight list and move
+    it to the dead-letter list (retry budget exhausted)."""
+    r.lrem(IN_FLIGHT_QUEUE, 1, raw_task)
+    _dead_letter(r, task, raw_task, reason)
+
+
 def main():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -136,13 +200,17 @@ def main():
              WORKER_ID, HIGH_QUEUE, NORMAL_QUEUE, MAX_TASK_RETRIES, DEAD_LETTER_QUEUE)
 
     while not _shutdown:
-        # BRPOP with priority: high queue first, timeout 5s
-        result = r.brpop([HIGH_QUEUE, NORMAL_QUEUE], timeout=5)
-        if result is None:
+        # v1.2.30 Defect D fix: atomic dequeue (BLMOVE) from the main queue to
+        # this worker's in-flight list. The task is removed from the main
+        # queue atomically — two pods can never dequeue the same task_id
+        # concurrently. It is removed from the in-flight list on ack (success
+        # or dead-letter) or moved back to the main queue after backoff.
+        dequeued = _atomic_dequeue(r, timeout=5)
+        if dequeued is None:
             # No tasks — KEDA will scale us down soon
             continue
 
-        queue_name, raw_task = result
+        queue_name, raw_task = dequeued
         try:
             task = json.loads(raw_task)
             task_type = task.get("type", "cdc_transform")
@@ -158,25 +226,32 @@ def main():
             else:
                 log.warning("Unknown task type: %s — skipping", task_type)
 
+            # v1.2.30 Defect D fix: ack — remove the task from this worker's
+            # in-flight list on successful completion.
+            _ack(r, raw_task)
+
         except Exception as exc:
             retry_count = int(task.get("_retry_count", 0)) if isinstance(task, dict) else 0
             retry_count += 1
             if retry_count > MAX_TASK_RETRIES:
                 # v1.2.25 Task 6: circuit-breaker — move to dead-letter.
-                _dead_letter(r, task, raw_task, reason=str(exc)[:500])
+                # v1.2.30 Defect D fix: remove from in-flight first.
+                _dead_letter_from_inflight(r, raw_task, task, reason=str(exc)[:500])
                 continue
             # Exponential backoff: 1, 2, 4, 8, 16, 32, 60 (cap).
             delay = _backoff_seconds(retry_count - 1)
-            log.warning("Task id=%s failed (attempt %d/%d): %s — re-queuing with %ds backoff",
+            log.warning("Task id=%s failed (attempt %d/%d): %s — sleeping %ds then re-queuing with backoff",
                         task.get("task_id"), retry_count, MAX_TASK_RETRIES,
                         str(exc)[:200], delay)
             task["_retry_count"] = retry_count
             task["_last_error"] = str(exc)[:500]
             task["_last_failed_at"] = time.time()
-            # Re-queue to high priority so it's retried (with the mutated
-            # retry count baked into the payload).
-            r.lpush(HIGH_QUEUE, json.dumps(task))
+            # v1.2.30 Defect D fix: the task STAYS in the in-flight list
+            # during the backoff sleep (no sibling pod can dequeue it), then
+            # is atomically moved back to the high-priority queue with the
+            # updated retry_count.
             _interruptible_sleep(delay)
+            _requeue_after_backoff(r, raw_task, task)
 
     log.info("Transform worker %s exiting cleanly", WORKER_ID)
 

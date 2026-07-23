@@ -647,6 +647,13 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
         chunk_size = _connection_chunk_size(connection)
         src_connector_type = (source.connector_definition.connector_type
                               if source.connector_definition else "postgres")
+        # v1.2.30 Defect C fix: import the estimate-aware partitioner so each
+        # task payload carries a density-based ``rows_estimated`` (computed
+        # from the instant information_schema/pg_class count + MIN/MAX). The
+        # worker stamps this on the FIRST checkpoint for the partition and
+        # never overwrites it with rows_written, so progress_pct reflects
+        # real progress instead of always reading 100%.
+        from app.services.partitioning import partition_with_estimates
         for stream in streams:
             to = stream.transform_overrides or {}
             steps = to.get("transforms", []) if isinstance(to, dict) else []
@@ -662,23 +669,25 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
             pk_col = str(pk_str).split(",")[0].strip() or "id"
             if src_connector_type == "mongodb":
                 pk_col = "_id"
-            # v1.2.26 Task 1a: partition the table's [min(pk), max(pk)] range
-            # into K disjoint sub-ranges. Falls back to [(None, None)] (a
-            # single unbounded range) on error or when K<=1 — preserving the
-            # legacy v1.2.25 single-task-per-stream behaviour.
+            # v1.2.26 Task 1a / v1.2.30 Defect C: partition the table's
+            # [min(pk), max(pk)] range into K disjoint sub-ranges WITH a
+            # density-based per-partition row estimate. Falls back to
+            # [{pk_start:None, pk_end:None, rows_estimated:None}] (a single
+            # unbounded range with no estimate) on error or when K<=1 —
+            # preserving the legacy v1.2.25 single-task-per-stream behaviour.
             # v1.2.27 P0 fix: offload the DB-touching partition call to a
             # worker thread so the uvicorn event loop is NOT blocked while
             # MIN/MAX/information_schema queries run against the source DB.
-            # Other requests (health, login, etc.) are served concurrently.
-            # The partitioning step itself has a 30s server-side timeout +
-            # KILL fallback (see app.services.partitioning).
             import asyncio as _asyncio
-            ranges = await _asyncio.to_thread(
-                partition_pk_ranges,
+            parts = await _asyncio.to_thread(
+                partition_with_estimates,
                 source_block, stream.source_schema_name or "",
                 stream.source_table_name, pk_col, src_connector_type, k,
             )
-            for seq, (pk_start, pk_end) in enumerate(ranges):
+            for seq, part in enumerate(parts):
+                pk_start = part.get("pk_start")
+                pk_end = part.get("pk_end")
+                rows_estimated = part.get("rows_estimated")
                 task = {
                     "type": "initial_load",
                     "task_id": f"il-{connection.connection_id}-{stream.stream_id}-{seq}",
@@ -694,7 +703,13 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
                     # v1.2.26: total number of ranges for this stream — the
                     # control-plane uses this to decide when ALL ranges are
                     # completed and the connection's initial load is done.
-                    "total_chunks": len(ranges),
+                    "total_chunks": len(parts),
+                    # v1.2.30 Defect C fix: density-based per-partition row
+                    # estimate (table_rows * span / total_span), stamped at
+                    # ENQUEUE time so the worker can stamp it on the first
+                    # checkpoint and compute a real progress_pct. None when
+                    # the partitioner fell back to K=1 (unknown estimate).
+                    "rows_estimated": rows_estimated,
                     # v1.2.17: PK-bounded chunk size (rows per chunk). The
                     # worker loops internally within [pk_start, pk_end] and
                     # resumes from last_pk on restart.

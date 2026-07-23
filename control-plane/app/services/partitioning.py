@@ -138,34 +138,91 @@ def partition_pk_ranges(source: dict, schema_name: str, table_name: str,
         ``estimatedDocumentCount()`` is used for the count log line (instant,
         metadata-based) — never ``count_documents({})``. Inter-table
         parallelism still applies.
+
+    v1.2.30 Defect C fix: delegates to ``partition_with_estimates`` (which
+    also computes a density-based per-partition ``rows_estimated``) and
+    strips the estimate, preserving the legacy ``list[tuple]`` return type
+    so existing callers/tests are unaffected. The producer
+    (``_enqueue_initial_load_tasks``) now calls ``partition_with_estimates``
+    directly so it can stamp ``rows_estimated`` into each task payload.
+    """
+    parts = partition_with_estimates(source, schema_name, table_name, pk_col, ctype, k)
+    return [(p["pk_start"], p["pk_end"]) for p in parts]
+
+
+def _density_estimate(table_rows: int, mn, mx, pk_start, pk_end) -> int:
+    """v1.2.30 Defect C fix: density-based per-partition row estimate.
+
+    ``rows_estimated = table_rows * (pk_end - pk_start) / (mx - mn)`` —
+    assumes roughly uniform PK density across the key range, which is the
+    best estimate available without a per-range COUNT (a per-range COUNT
+    would re-introduce the blocking scan that v1.2.27 P0 fix removed).
+    Open bounds (pk_start=None / pk_end=None) are resolved to mn / mx.
+    Degenerate ranges (mx == mn, or non-numeric PKs that fell back to K=1)
+    get the full ``table_rows`` so progress_pct is meaningful.
+    """
+    try:
+        total_span = (mx - mn) if (mn is not None and mx is not None) else 0
+        if total_span <= 0:
+            return int(table_rows or 0)
+        eff_start = mn if pk_start is None else pk_start
+        eff_end = mx if pk_end is None else pk_end
+        span = (eff_end - eff_start) if (eff_end is not None and eff_start is not None) else 0
+        if span <= 0:
+            return 0
+        est = int((table_rows or 0) * span / total_span)
+        return max(0, est)
+    except Exception:
+        return int(table_rows or 0)
+
+
+def partition_with_estimates(source: dict, schema_name: str, table_name: str,
+                             pk_col: str, ctype: str, k: int) -> list[dict]:
+    """v1.2.30 Defect C fix: like ``partition_pk_ranges`` but returns a list
+    of dicts ``[{"pk_start":..., "pk_end":..., "rows_estimated":...}, ...]``
+    so the producer can stamp a real per-partition row estimate into each
+    ``initial_load`` task payload. The worker stamps this on the FIRST
+    checkpoint for the partition and never overwrites it with rows_written,
+    so ``progress_pct = rows_written / rows_estimated * 100`` reflects real
+    progress instead of always reading 100%.
+
+    The estimate is density-based (``table_rows * span / total_span``) using
+    the instant ``information_schema.tables.table_rows`` /
+    ``pg_class.reltuples`` count — no blocking per-range scan. For the single
+    unbounded fallback (K<=1 / MongoDB / no PK index / error), the estimate
+    is the full ``table_rows`` (or None when unavailable).
     """
     if k <= 1:
-        return [(None, None)]
+        return [{"pk_start": None, "pk_end": None, "rows_estimated": None}]
     if not source or not table_name:
-        return [(None, None)]
+        return [{"pk_start": None, "pk_end": None, "rows_estimated": None}]
     host = source.get("host") or ""
     database = source.get("database_name") or source.get("database") or ""
     user = source.get("username") or source.get("user") or ""
     password = source.get("password") or ""
     port = source.get("port")
     if not host or not database:
-        return [(None, None)]
+        return [{"pk_start": None, "pk_end": None, "rows_estimated": None}]
 
     try:
         if ctype in ("postgres", "postgresql"):
-            return _partition_pg(host, port or 5432, database, user, password,
-                                  schema_name, table_name, pk_col, k)
+            return _partition_pg_with_estimates(
+                host, port or 5432, database, user, password,
+                schema_name, table_name, pk_col, k,
+            )
         if ctype == "mysql":
-            return _partition_mysql(host, port or 3306, database, user, password,
-                                      schema_name, table_name, pk_col, k)
+            return _partition_mysql_with_estimates(
+                host, port or 3306, database, user, password,
+                schema_name, table_name, pk_col, k,
+            )
         if ctype == "mongodb":
             log.info("partition: mongodb _id is non-numeric — using K=1 for %s.%s",
                      schema_name, table_name)
-            return [(None, None)]
+            return [{"pk_start": None, "pk_end": None, "rows_estimated": None}]
     except Exception as exc:
         log.warning("partition: failed to partition %s.%s (k=%d): %s — falling back to single range",
                      schema_name, table_name, k, exc, exc_info=True)
-    return [(None, None)]
+    return [{"pk_start": None, "pk_end": None, "rows_estimated": None}]
 
 
 # ===========================
@@ -257,7 +314,12 @@ def _mysql_approx_count(host, port, database, user, password,
 
 
 def _partition_mysql(host, port, database, user, password,
-                     schema_name, table_name, pk_col, k) -> list[tuple]:
+                     schema_name, table_name, pk_col, k) -> tuple:
+    """v1.2.30: returns ``(ranges, mn, mx, table_rows)`` so the
+    ``_with_estimates`` wrapper can compute density-based per-partition
+    row estimates without re-running MIN/MAX. ``ranges`` is the list of
+    ``(pk_start, pk_end)`` tuples; ``mn``/``mx``/``table_rows`` are None/0
+    on the K=1 fallback paths."""
     import pymysql
     qualified = (f"`{schema_name}`.`{table_name}`"
                  if schema_name else f"`{table_name}`")
@@ -279,7 +341,7 @@ def _partition_mysql(host, port, database, user, password,
                     "adding an index on the PK for parallel loads.",
                     schema_name, table_name, pk_col,
                 )
-                return [(None, None)]
+                return [(None, None)], None, None, 0
             conn_id = _mysql_conn_id(cur)
             # Step 2: MIN/MAX with server-side timeout. Instant on indexed PKs.
             try:
@@ -300,21 +362,41 @@ def _partition_mysql(host, port, database, user, password,
                                      schema_name, table_name, pk_col, k,
                                      qualified, pk_q, timeout_hint)
             if mn is None or mx is None:
-                return [(None, None)]
+                return [(None, None)], None, None, 0
             cnt = _mysql_approx_count(host, port, database, user, password,
                                        schema_name, table_name) or 0
             log.info("partition: mysql %s.%s min=%s max=%s approx_rows=%s k=%d",
                      schema_name, table_name, mn, mx, cnt, k)
-            return naive_numeric_ranges(mn, mx, k)
-    return [(None, None)]
+            return naive_numeric_ranges(mn, mx, k), mn, mx, cnt
+    return [(None, None)], None, None, 0
+
+
+def _partition_mysql_with_estimates(host, port, database, user, password,
+                                    schema_name, table_name, pk_col, k) -> list[dict]:
+    """v1.2.30 Defect C fix: MySQL partitioning with per-partition
+    ``rows_estimated`` (density-based). Delegates the range math to
+    ``_partition_mysql`` and stamps each partition's estimate via
+    ``_density_estimate``."""
+    ranges, mn, mx, cnt = _partition_mysql(
+        host, port, database, user, password,
+        schema_name, table_name, pk_col, k,
+    )
+    out = []
+    for (pk_start, pk_end) in ranges:
+        if pk_start is None and pk_end is None and (mn is None or mx is None):
+            est = None
+        else:
+            est = _density_estimate(cnt, mn, mx, pk_start, pk_end)
+        out.append({"pk_start": pk_start, "pk_end": pk_end, "rows_estimated": est})
+    return out
 
 
 def _mysql_plan_b(host, port, database, user, password,
                   schema_name, table_name, pk_col, k,
-                  qualified, pk_q, timeout_hint) -> list[tuple]:
+                  qualified, pk_q, timeout_hint) -> tuple:
     """Plan B: first/last PK via ``ORDER BY pk LIMIT 1`` (uses the PK index,
     instant) + information_schema count. If even this times out, fall back to
-    K=1."""
+    K=1. v1.2.30: returns ``(ranges, mn, mx, cnt)``."""
     import pymysql
     try:
         with pymysql.connect(host=host, port=int(port), database=database,
@@ -342,22 +424,22 @@ def _mysql_plan_b(host, port, database, user, password,
                     if conn_id is not None:
                         _mysql_kill(host, port, database, user, password,
                                     conn_id)
-                    return [(None, None)]
+                    return [(None, None)], None, None, 0
                 if not first_row or not last_row:
-                    return [(None, None)]
+                    return [(None, None)], None, None, 0
                 mn, mx = first_row[0], last_row[0]
                 if mn is None or mx is None:
-                    return [(None, None)]
+                    return [(None, None)], None, None, 0
                 cnt = _mysql_approx_count(host, port, database, user, password,
                                            schema_name, table_name) or 0
                 log.info("partition: plan B mysql %s.%s first=%s last=%s "
                          "approx_rows=%s k=%d", schema_name, table_name,
                          mn, mx, cnt, k)
-                return naive_numeric_ranges(mn, mx, k)
+                return naive_numeric_ranges(mn, mx, k), mn, mx, cnt
     except Exception as exc:
         log.warning("partition: plan B connection failed for %s.%s: %s — "
                     "K=1", schema_name, table_name, exc)
-    return [(None, None)]
+    return [(None, None)], None, None, 0
 
 
 # ===========================
@@ -457,7 +539,10 @@ def _pg_approx_count(cur, schema_name: str, table_name: str) -> Optional[int]:
 
 
 def _partition_pg(host, port, database, user, password,
-                  schema_name, table_name, pk_col, k) -> list[tuple]:
+                  schema_name, table_name, pk_col, k) -> tuple:
+    """v1.2.30: returns ``(ranges, mn, mx, table_rows)`` so the
+    ``_with_estimates`` wrapper can compute density-based per-partition
+    row estimates without re-running MIN/MAX."""
     import psycopg2
     import psycopg2.extras
     qualified = (f'"{schema_name}"."{table_name}"'
@@ -477,7 +562,7 @@ def _partition_pg(host, port, database, user, password,
                     "adding an index on the PK for parallel loads.",
                     schema_name, table_name, pk_col,
                 )
-                return [(None, None)]
+                return [(None, None)], None, None, 0
             pid = _pg_backend_pid(cur)
             # Set a 30s statement timeout for this transaction (READ ONLY).
             cur.execute("BEGIN READ ONLY")
@@ -501,24 +586,45 @@ def _partition_pg(host, port, database, user, password,
                                       schema_name, table_name, pk_col, k,
                                       qualified, pk_q)
                 if mn is None or mx is None:
-                    return [(None, None)]
+                    return [(None, None)], None, None, 0
                 cnt = _pg_approx_count(cur, schema_name, table_name) or 0
                 log.info("partition: pg %s.%s min=%s max=%s approx_rows=%s k=%d",
                          schema_name, table_name, mn, mx, cnt, k)
-                return naive_numeric_ranges(mn, mx, k)
+                return naive_numeric_ranges(mn, mx, k), mn, mx, cnt
             finally:
                 try:
                     cur.execute("COMMIT")
                 except Exception:
                     pass
-    return [(None, None)]
+    return [(None, None)], None, None, 0
+
+
+def _partition_pg_with_estimates(host, port, database, user, password,
+                                 schema_name, table_name, pk_col, k) -> list[dict]:
+    """v1.2.30 Defect C fix: Postgres partitioning with per-partition
+    ``rows_estimated`` (density-based). Delegates the range math to
+    ``_partition_pg`` and stamps each partition's estimate via
+    ``_density_estimate``."""
+    ranges, mn, mx, cnt = _partition_pg(
+        host, port, database, user, password,
+        schema_name, table_name, pk_col, k,
+    )
+    out = []
+    for (pk_start, pk_end) in ranges:
+        if pk_start is None and pk_end is None and (mn is None or mx is None):
+            est = None
+        else:
+            est = _density_estimate(cnt, mn, mx, pk_start, pk_end)
+        out.append({"pk_start": pk_start, "pk_end": pk_end, "rows_estimated": est})
+    return out
 
 
 def _pg_plan_b(host, port, database, user, password,
                schema_name, table_name, pk_col, k,
-               qualified, pk_q) -> list[tuple]:
+               qualified, pk_q) -> tuple:
     """Plan B: first/last PK via ``ORDER BY pk LIMIT 1`` + pg_class.reltuples.
-    If even this times out, fall back to K=1."""
+    If even this times out, fall back to K=1. v1.2.30: returns
+    ``(ranges, mn, mx, cnt)``."""
     import psycopg2
     import psycopg2.extras
     try:
@@ -550,17 +656,17 @@ def _pg_plan_b(host, port, database, user, password,
                                     schema_name, table_name, exc)
                         if pid is not None:
                             _pg_kill(host, port, database, user, password, pid)
-                        return [(None, None)]
+                        return [(None, None)], None, None, 0
                     if not first_row or not last_row:
-                        return [(None, None)]
+                        return [(None, None)], None, None, 0
                     mn, mx = first_row["pk"], last_row["pk"]
                     if mn is None or mx is None:
-                        return [(None, None)]
+                        return [(None, None)], None, None, 0
                     cnt = _pg_approx_count(cur, schema_name, table_name) or 0
                     log.info("partition: plan B pg %s.%s first=%s last=%s "
                              "approx_rows=%s k=%d", schema_name, table_name,
                              mn, mx, cnt, k)
-                    return naive_numeric_ranges(mn, mx, k)
+                    return naive_numeric_ranges(mn, mx, k), mn, mx, cnt
                 finally:
                     try:
                         cur.execute("COMMIT")
@@ -569,6 +675,6 @@ def _pg_plan_b(host, port, database, user, password,
     except Exception as exc:
         log.warning("partition: plan B connection failed for %s.%s: %s — K=1",
                     schema_name, table_name, exc)
-    return [(None, None)]
+    return [(None, None)], None, None, 0
 
 

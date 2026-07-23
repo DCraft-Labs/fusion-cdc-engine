@@ -289,6 +289,13 @@ class InitialLoadTask:
         pk_start = task.get("pk_start")
         pk_end = task.get("pk_end")
         total_chunks = int(task.get("total_chunks") or 1)
+        # v1.2.30 Defect C fix: the per-partition row estimate is now stamped
+        # at ENQUEUE time by the control-plane (density-based: table_rows *
+        # (pk_end - pk_start) / (max_pk - min_pk)). The worker stamps it on
+        # the FIRST checkpoint for this partition and never overwrites it with
+        # rows_written, so progress_pct = rows_written / rows_estimated * 100
+        # reflects real progress instead of always reading 100%.
+        rows_estimated = task.get("rows_estimated")
         # Primary key column used for PK-bounded chunking. The producer sends
         # ``primary_key`` as a comma-joined string for composite PKs; we chunk
         # on the first PK column (correct for identity-style composite PKs).
@@ -468,6 +475,14 @@ class InitialLoadTask:
         first_fetch.start()
 
         # ── PK-bounded chunk loop (within this partition's [pk_start, pk_end]) ──
+        # v1.2.30 Defect B fix: the loop body is wrapped in try/except below
+        # so ANY exception (e.g. Iceberg "snapshot id changed" conflict from a
+        # duplicate-dequeue sibling pod, or a transient write error) still
+        # persists a "failed" checkpoint row for this chunk_seq before
+        # re-raising to the worker's retry/dead-letter path. Without this, a
+        # partition that crashed mid-load left NO checkpoint row, so the
+        # control-plane could never report its real status and resume-on-
+        # restart had nothing to resume from.
         while not STOP_EVENT.is_set():
             # v1.2.29 Task 6: surface queue depth + backpressure warning.
             INITIAL_LOAD_QUEUE_DEPTH.labels(_m_conn, _m_stream, _m_part).set(prefetch_q.qsize())
@@ -512,77 +527,58 @@ class InitialLoadTask:
                 row_count = len(rows)
                 next_pk = self._extract_pk(rows[-1], pk_col, ctype)
 
-            # v1.2.26 Task 5: start the next fetch NOW (before the write) so
-            # the source-DB read of chunk N+1 overlaps with the convert+write
-            # of chunk N. Only prefetch when this chunk was full (a short
-            # chunk means end-of-range).
-            if row_count >= cur_chunk_size:
+            # v1.2.30 Defect A fix: start the next fetch NOW (before the write)
+            # so the source-DB read of chunk N+1 overlaps with the convert+write
+            # of chunk N. v1.2.30 replaces the old "only prefetch when the chunk
+            # was full" heuristic — for a BOUNDED partition (pk_end is not None)
+            # a short chunk near the boundary is expected (the remaining PK range
+            # is smaller than chunk_size) and does NOT mean the partition is
+            # done. We now prefetch the next chunk unless we have positively
+            # reached the end of this partition:
+            #   (a) crossed the upper bound (next_pk >= pk_end), or
+            #   (b) unbounded last partition (pk_end is None) AND short chunk
+            #       (legacy end-of-table heuristic), or
+            #   (c) the fetch returned 0 rows (handled above, but guarded here).
+            # Without this, a bounded partition that returns a short chunk near
+            # the boundary would deadlock on the next prefetch_q.get() because
+            # no producer thread was started.
+            reached_end = False
+            if row_count == 0:
+                reached_end = True
+            elif pk_end is not None and next_pk is not None and next_pk >= pk_end:
+                reached_end = True
+            elif pk_end is None and row_count < cur_chunk_size:
+                reached_end = True
+            if not reached_end:
                 threading.Thread(
                     target=_fetch_and_put, args=(next_pk, cur_chunk_size), daemon=True,
                 ).start()
 
-            t0 = time.monotonic()
-
-            # v1.2.29 Task 1: DuckDB bulk path — scanner already produced a
-            # typed Arrow table; skip Python convert and write Arrow directly
-            # to Iceberg (the fast path). Transform steps are NOT applied in
-            # bulk mode (bulk = raw 1:1 snapshot for speed).
-            if kind == "arrow" and connector_type == "iceberg":
-                INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(0.0)
-                t_w0 = time.monotonic()
-                rows_written = self._write_arrow_to_iceberg(arrow_tbl, dest, dest_table)
-                INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
-                child_tables = {}
-            elif kind == "arrow":
-                t_c0 = time.monotonic()
-                transformed = arrow_tbl.to_pylist()
-                INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
-                child_tables = {}
-                transformed_schema = cached_source_schema
-                dest_dsn = _dest_dsn_from_dest(dest)
-                if not dest_dsn:
-                    log.error("InitialLoad connection=%s cannot derive dest_dsn for connector_type=%s — destination block missing/incomplete. Stopping load after %d rows.",
-                              connection_id, connector_type, total_rows)
-                    self._report_checkpoint(connection_id, stream_id, source_table,
-                                            chunk_seq, 0, last_pk, state="failed",
-                                            total_chunks=total_chunks)
-                    return
-                t_w0 = time.monotonic()
-                rows_written = self._copy_to_postgres(transformed, dest_dsn, dest_schema, dest_table)
-                INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
-            else:
-                # Apply transforms
-                if steps:
+            # v1.2.30 Defect B fix: wrap convert+write in try/except so an
+            # exception (e.g. Iceberg "snapshot id changed" conflict from a
+            # duplicate-dequeue sibling pod, or a transient write error)
+            # persists a "failed" checkpoint for this chunk_seq before
+            # re-raising to the worker retry/dead-letter path. Without this
+            # a partition that crashed mid-load left NO checkpoint row.
+            try:
+                t0 = time.monotonic()
+    
+                # v1.2.29 Task 1: DuckDB bulk path — scanner already produced a
+                # typed Arrow table; skip Python convert and write Arrow directly
+                # to Iceberg (the fast path). Transform steps are NOT applied in
+                # bulk mode (bulk = raw 1:1 snapshot for speed).
+                if kind == "arrow" and connector_type == "iceberg":
+                    INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(0.0)
+                    t_w0 = time.monotonic()
+                    rows_written = self._write_arrow_to_iceberg(arrow_tbl, dest, dest_table)
+                    INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+                    child_tables = {}
+                elif kind == "arrow":
                     t_c0 = time.monotonic()
-                    transformed, child_tables, transformed_schema = self.engine.execute_pipeline(
-                        rows, steps, schema=cached_source_schema,
-                    )
+                    transformed = arrow_tbl.to_pylist()
                     INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
-                    if cached_transformed_schema is None and transformed_schema is not None:
-                        cached_transformed_schema = transformed_schema
-                else:
-                    transformed, child_tables = rows, {}
+                    child_tables = {}
                     transformed_schema = cached_source_schema
-
-                # Write to destination
-                if connector_type == "iceberg":
-                    pending_rows.extend(transformed)
-                    for child_name, child_rows in child_tables.items():
-                        if child_rows:
-                            pending_child.setdefault(child_name, []).extend(child_rows)
-                    chunks_since_commit += 1
-                    rows_written = len(transformed)
-                    if chunks_since_commit >= commit_batch:
-                        t_w0 = time.monotonic()
-                        self._flush_iceberg_batch(
-                            pending_rows, pending_child, dest, dest_table,
-                            schema=cached_transformed_schema or cached_source_schema,
-                        )
-                        INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
-                        pending_rows = []
-                        pending_child = {}
-                        chunks_since_commit = 0
-                else:
                     dest_dsn = _dest_dsn_from_dest(dest)
                     if not dest_dsn:
                         log.error("InitialLoad connection=%s cannot derive dest_dsn for connector_type=%s — destination block missing/incomplete. Stopping load after %d rows.",
@@ -593,11 +589,66 @@ class InitialLoadTask:
                         return
                     t_w0 = time.monotonic()
                     rows_written = self._copy_to_postgres(transformed, dest_dsn, dest_schema, dest_table)
-                    for child_name, child_rows in child_tables.items():
-                        if child_rows:
-                            self._copy_to_postgres(child_rows, dest_dsn, dest_schema, child_name)
                     INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
-
+                else:
+                    # Apply transforms
+                    if steps:
+                        t_c0 = time.monotonic()
+                        transformed, child_tables, transformed_schema = self.engine.execute_pipeline(
+                            rows, steps, schema=cached_source_schema,
+                        )
+                        INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
+                        if cached_transformed_schema is None and transformed_schema is not None:
+                            cached_transformed_schema = transformed_schema
+                    else:
+                        transformed, child_tables = rows, {}
+                        transformed_schema = cached_source_schema
+    
+                    # Write to destination
+                    if connector_type == "iceberg":
+                        pending_rows.extend(transformed)
+                        for child_name, child_rows in child_tables.items():
+                            if child_rows:
+                                pending_child.setdefault(child_name, []).extend(child_rows)
+                        chunks_since_commit += 1
+                        rows_written = len(transformed)
+                        if chunks_since_commit >= commit_batch:
+                            t_w0 = time.monotonic()
+                            self._flush_iceberg_batch(
+                                pending_rows, pending_child, dest, dest_table,
+                                schema=cached_transformed_schema or cached_source_schema,
+                            )
+                            INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+                            pending_rows = []
+                            pending_child = {}
+                            chunks_since_commit = 0
+                    else:
+                        dest_dsn = _dest_dsn_from_dest(dest)
+                        if not dest_dsn:
+                            log.error("InitialLoad connection=%s cannot derive dest_dsn for connector_type=%s — destination block missing/incomplete. Stopping load after %d rows.",
+                                      connection_id, connector_type, total_rows)
+                            self._report_checkpoint(connection_id, stream_id, source_table,
+                                                    chunk_seq, 0, last_pk, state="failed",
+                                                    total_chunks=total_chunks)
+                            return
+                        t_w0 = time.monotonic()
+                        rows_written = self._copy_to_postgres(transformed, dest_dsn, dest_schema, dest_table)
+                        for child_name, child_rows in child_tables.items():
+                            if child_rows:
+                                self._copy_to_postgres(child_rows, dest_dsn, dest_schema, child_name)
+                        INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+    
+            except Exception:
+                log.exception("InitialLoad connection=%s chunk_seq=%d convert/write failed - reporting failed checkpoint and re-raising",
+                            connection_id, chunk_seq)
+                try:
+                    self._report_checkpoint(connection_id, stream_id, source_table,
+                                            chunk_seq, 0, last_pk, state="failed",
+                                            total_chunks=total_chunks)
+                except Exception:
+                    log.error("InitialLoad: failed-checkpoint report also failed for connection=%s chunk_seq=%s",
+                              connection_id, chunk_seq, exc_info=True)
+                raise
             # v1.2.29 Task 2: fetch-phase duration (loop-gap approximation).
             INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "fetch").observe(max(0.0, t0 - t_fetch_end))
 
@@ -620,7 +671,7 @@ class InitialLoadTask:
                                         chunk_seq, rows_written, last_pk, state="running",
                                         total_chunks=total_chunks,
                                         pk_start=pk_start, pk_end=pk_end,
-                                        rows_estimated=total_chunks * cur_chunk_size)
+                                        rows_estimated=rows_estimated)
             else:
                 self._report_checkpoint(connection_id, stream_id, source_table,
                                         chunk_seq, rows_written, last_pk, state="running",
@@ -677,16 +728,33 @@ class InitialLoadTask:
                     log.exception("InitialLoad connection=%s compaction failed for table=%s chunk=%d — continuing (non-fatal)",
                                   connection_id, dest_table, chunk_counter)
 
-            # v1.2.26 Task 1c: stop when we've crossed this partition's upper
-            # bound (closed upper bound — _fetch_chunk already clamps the
-            # fetch to ``pk <= pk_end`` so the last chunk ends exactly at the
-            # boundary; this guard is a belt-and-suspenders stop).
-            if pk_end is not None and last_pk is not None and last_pk >= pk_end:
-                break
-
-            # A short chunk means we've reached the end of the table / range.
-            if row_count < cur_chunk_size:
-                break
+            # v1.2.30 Defect A fix: replaced the single-partition-era
+            # ``if row_count < cur_chunk_size: break`` heuristic with an
+            # explicit end-of-partition check. For a BOUNDED partition
+            # (pk_end is not None) the loop continues fetching while
+            # ``last_pk < pk_end`` — a short chunk near the boundary is
+            # expected (the remaining PK range is smaller than chunk_size)
+            # and is NOT end-of-partition. The loop only stops when:
+            #   (a) ``last_pk >= pk_end`` (crossed the upper bound — the
+            #       fetch already clamps to ``pk <= pk_end`` so the last
+            #       chunk ends exactly at the boundary), or
+            #   (b) pk_end is None (unbounded last partition) AND a short
+            #       chunk (legacy end-of-table heuristic).
+            # The empty-payload case (row_count == 0) is handled above by
+            # breaking out of the loop before reaching here. The prefetch
+            # thread is primed above only when ``not reached_end``, so a
+            # short chunk in a bounded partition still has a next fetch in
+            # flight and the loop continues.
+            if pk_end is not None:
+                if last_pk is not None and last_pk >= pk_end:
+                    break
+                # Bounded partition, short chunk, last_pk < pk_end → continue
+                # fetching (the next chunk starts from last_pk and is clamped
+                # to pk <= pk_end). Do NOT break on ``row_count < cur_chunk_size``.
+            else:
+                # Unbounded last partition: short chunk means end of table.
+                if row_count < cur_chunk_size:
+                    break
 
             # Fix C4: release the chunk's memory before fetching the next.
             if kind == "arrow":
@@ -893,12 +961,32 @@ class InitialLoadTask:
 
     def _open_source_connection(self, source: dict, ctype: str):
         """v1.2.29 Task 5: open ONE source DB connection per partition and
-        reuse it across all chunks. Returns a connection object or None."""
+        reuse it across all chunks. Returns a connection object or None.
+
+        v1.2.30 Defect E fix: the pooled connection now uses the EXACT same
+        param extraction as the per-chunk ``_fetch_chunk`` path
+        (``database_name``/``database`` and ``username``/``user``), the same
+        ``connect_timeout=10``, and (for MySQL) the same ``autocommit=True``
+        + ``DictCursor``. The previous implementation read ``source["database"]``
+        and ``source["user"]`` which are NOT the keys the producer stamps
+        (it stamps ``database_name`` and ``username``), so the pooled
+        connection opened with ``database=None`` / ``user=None`` and
+        ProxySQL rejected it with "Access denied" — the worker then fell
+        back to per-chunk connects (non-fatal but defeated the pooling win).
+        """
         try:
-            host = source.get("host"); port = source.get("port")
-            database = source.get("database"); user = source.get("user")
-            password = source.get("password")
-            if ctype == "postgres":
+            host = source.get("host") or ""
+            port = source.get("port")
+            # Match _fetch_chunk's extraction (database_name first, then database).
+            database = (source.get("database_name") or source.get("database") or "")
+            # Match _fetch_chunk's extraction (username first, then user).
+            user = source.get("username") or source.get("user") or ""
+            password = source.get("password") or ""
+            if not host or not database or not user:
+                log.warning("InitialLoad: pooled source connection skipped — incomplete source block (host=%s database=%s user=%s)",
+                            host, database, user)
+                return None
+            if ctype in ("postgres", "postgresql"):
                 import psycopg2
                 conn = psycopg2.connect(host=host, port=port, dbname=database,
                                          user=user, password=password,
@@ -909,7 +997,7 @@ class InitialLoadTask:
             if ctype == "mysql":
                 import pymysql
                 import pymysql.cursors
-                return pymysql.connect(host=host, port=int(port), database=database,
+                return pymysql.connect(host=host, port=int(port or 3306), database=database,
                                         user=user, password=password,
                                         cursorclass=pymysql.cursors.DictCursor,
                                         connect_timeout=10, autocommit=True)

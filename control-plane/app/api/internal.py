@@ -1035,12 +1035,22 @@ def upsert_load_checkpoint(
             existing.current_chunk = payload.current_chunk
         if payload.total_chunks is not None:
             existing.total_chunks = payload.total_chunks
-        # v1.2.29 Task 3: persist range bounds + estimated rows.
+        # v1.2.29 Task 3 / v1.2.30 Defect C fix: persist range bounds + the
+        # density-based estimated rows. The estimate is stamped by the worker
+        # on the FIRST checkpoint for the partition (from the task payload,
+        # which the producer fills at enqueue time). Never overwrite a non-null
+        # rows_estimated with a later value — the old code overwrote it on every
+        # report, so if a later report carried rows_written in the estimate
+        # slot the progress_pct collapsed to 100% prematurely. Now we only
+        # set it when the existing value is NULL/0 (first write for this
+        # partition) so the original density-based estimate is preserved.
         if payload.pk_start is not None:
             existing.pk_start = str(payload.pk_start)
         if payload.pk_end is not None:
             existing.pk_end = str(payload.pk_end)
-        if payload.rows_estimated is not None:
+        if payload.rows_estimated is not None and (
+            existing.rows_estimated is None or existing.rows_estimated == 0
+        ):
             existing.rows_estimated = payload.rows_estimated
         if status == "completed":
             existing.completed_at = now

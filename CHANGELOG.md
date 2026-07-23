@@ -4,6 +4,72 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.30] — 2026-07-23
+
+### P0 correctness fix — multi-pod parallel initial load (bug #18)
+Confirmed live against a 118M-row MySQL table: 6 pods, 6 disjoint PK ranges
+enqueued correctly, but only 380k rows (0.32%) plateaued with all pods idle,
+queues empty, no errors. Only 1 of 6 partitions got a checkpoint row
+(`chunk_seq=3`, `status:'completed'` at 60k rows for a ~19.7M-row partition).
+`progress_pct` showed `100.0` because `rows_estimated` was stamped equal to
+`rows_written`. Two copies of the same partition circulated (one task fought
+over by 2 pods) causing Iceberg "snapshot id changed" conflicts. ProxySQL
+"Access denied" for v1.2.29 connection-pooling (fell back to per-chunk).
+
+Five defects fixed:
+
+- **Defect A — premature DONE on a short chunk** (`transform-worker/loader.py:InitialLoadTask.run`):
+  the single-partition-era `if row_count < chunk_size: break` heuristic was
+  replaced with an explicit `last_pk >= pk_end` upper-bound check. A short
+  chunk near a bounded partition's boundary is expected and does NOT end
+  the partition; the loop continues until the boundary is reached (or the
+  range is genuinely exhausted, for the unbounded last partition).
+- **Defect B — missing checkpoints** (`transform-worker/loader.py`):
+  convert+write is wrapped in try/except so an exception persists a
+  `state="failed"` checkpoint for the `chunk_seq` before re-raising to the
+  worker retry/dead-letter path. Every exit path (normal, premature-DONE
+  fix, error, exception, fetch-thread failure) now reports a checkpoint
+  under the composite key `(connection_id, stream_id, chunk_seq)`.
+- **Defect C — fake `rows_estimated`** (`control-plane/app/services/partitioning.py`,
+  `control-plane/app/api/connections.py:_enqueue_initial_load_tasks`,
+  `control-plane/app/api/internal.py:upsert_load_checkpoint`): the
+  per-partition row estimate is now density-based
+  (`table_rows * span / total_span`, from the instant
+  `information_schema.tables.table_rows` / `pg_class.reltuples` count +
+  MIN/MAX) and stamped at ENQUEUE time in the task payload. The worker
+  stamps it on the FIRST checkpoint for the partition and the control-plane
+  never overwrites a non-null `rows_estimated`, so
+  `progress_pct = rows_written / rows_estimated * 100` reflects real
+  progress instead of always reading 100%.
+- **Defect D — duplicate dequeue** (`transform-worker/worker.py`): replaced
+  the non-atomic `LRANGE` + `LREM` dequeue with `BLMOVE` (atomic) from the
+  main queue to a per-worker in-flight list (`fusion:transforms:in-flight:<worker_id>`).
+  Two pods can never dequeue the same `task_id` concurrently. The task is
+  removed from in-flight only on ack (success or dead-letter); during
+  retry/backoff it stays in in-flight (no sibling pod can grab it), then is
+  atomically moved back to the main queue with the updated retry count.
+- **Defect E — ProxySQL pooling auth** (`transform-worker/loader.py:_open_source_connection`):
+  the pooled source connection now uses the EXACT same param extraction as
+  the per-chunk path (`database_name`/`database`, `username`/`user`,
+  `connect_timeout=10`, MySQL `autocommit=True` + `DictCursor`), so ProxySQL
+  no longer rejects the pooled connection with "Access denied" and the
+  worker keeps the pooling win.
+
+### Tests
+Five regression tests added in
+`transform-worker/tests/test_parallel_load_correctness.py` (re-exported
+from `test_v130_correctness.py`):
+1. `test_partition_loop_continues_past_short_chunk` — Defect A.
+2. `test_all_partitions_get_checkpoint` — Defect B (K=4).
+3. `test_rows_estimated_from_partitioning` — Defect C.
+4. `test_no_duplicate_dequeue` — Defect D (two workers, atomic BLMOVE).
+5. `test_premature_done_fix_regression` — Defect A regression (25M-key
+   range, chunk_size 10k, must NOT mark DONE at 50k rows).
+
+### Version
+- `control-plane/app/main.py`: `version="1.2.30"`.
+- `helm/fusion-cdc/Chart.yaml`: `version` + `appVersion` → `1.2.30`.
+
 ## [1.2.29] — 2026-07-23
 
 ### Performance — bulk initial load (Task 1, biggest win)
