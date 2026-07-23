@@ -62,7 +62,12 @@ def test_get_source_schema_called_once_per_initial_load():
         return []
     task._fetch_chunk = MagicMock(side_effect=fake_fetch)
     task._extract_pk = lambda row, pk, ctype: row.get(pk)
-    task._write_to_iceberg = MagicMock(return_value=2)
+    # v1.2.38 Finding B: the transformed+iceberg path now calls
+    # _write_arrow_to_iceberg (Arrow-native), not _write_to_iceberg.
+    task._write_arrow_to_iceberg = MagicMock(return_value=2)
+    # Child-table path still uses _write_to_iceberg (dict path) — keep it
+    # mocked so any json_flatten_child output doesn't try a real catalog.
+    task._write_to_iceberg = MagicMock(return_value=0)
 
     # v1.2.37: INITIAL_LOAD_COMMIT_BATCH default was raised 1→5. This test
     # asserts per-chunk writer calls, which only happens at commit_batch=1.
@@ -93,12 +98,19 @@ def test_get_source_schema_called_once_per_initial_load():
         f"Fix C1 regression: _get_source_schema called {inner_spy.call_count} "
         f"times (expected 1) for {call_count['n']} chunks"
     )
-    # And the writer must have been called for every chunk with a schema.
-    assert task._write_to_iceberg.call_count == 3
-    for call_args in task._write_to_iceberg.call_args_list:
-        # The 3rd positional arg is the schema (kw or positional)
-        schema_arg = call_args.kwargs.get("schema")
-        assert schema_arg is not None, "IcebergWriter.write_batch must receive the cached schema"
+    # v1.2.38: the Arrow write path is called once per chunk (commit_batch=1).
+    assert task._write_arrow_to_iceberg.call_count == 3, (
+        f"expected 3 _write_arrow_to_iceberg calls (one per chunk), "
+        f"got {task._write_arrow_to_iceberg.call_count}"
+    )
+    # Each call's first positional arg is the Arrow table; it must carry the
+    # cached transformed schema (id:int64, name:string) so the writer never
+    # re-infers types.
+    for call_args in task._write_arrow_to_iceberg.call_args_list:
+        arrow_tbl = call_args.args[0] if call_args.args else call_args.kwargs.get("arrow_tbl")
+        assert arrow_tbl is not None, "write_arrow must receive a pa.Table"
+        assert arrow_tbl.schema.field("id").type == pa.int64()
+        assert arrow_tbl.schema.field("name").type == pa.string()
 
 
 def test_pg_chunk_fetch_uses_read_only_transaction():

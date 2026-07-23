@@ -64,6 +64,38 @@ class DuckDBTransformEngine:
         self.scratch_dir = os.getenv("DUCKDB_SCRATCH_DIR", "/tmp/duckdb")
         self.threads = int(os.getenv("DUCKDB_THREADS", "2"))
         self.memory_limit = os.getenv("DUCKDB_MEMORY_LIMIT", "3GB")
+        # v1.2.38 Finding A: pool ONE in-memory DuckDB connection per
+        # DuckDBTransformEngine (i.e. per worker process) and reuse it
+        # across every execute_pipeline call, instead of opening + closing
+        # a fresh :memory: connection on every chunk. Measured directly
+        # (master report §6f Finding A): ~7.6ms per fresh open+close, ~1s
+        # of pure connection-setup overhead across a 1.29M-row table at
+        # 10k-row chunks. The pooled connection is created lazily on first
+        # use and reused for the lifetime of the worker process; DuckDB's
+        # :memory: state is fully isolated per-connection so this is safe.
+        # ``CREATE OR REPLACE TABLE staging`` (below) keeps each chunk's
+        # staging schema fresh even though the connection persists.
+        self._pooled_conn: "duckdb.DuckDBPyConnection | None" = None
+
+    def _get_conn(self):
+        """Return the pooled in-memory DuckDB connection, creating it on
+        first use. Reused across all execute_pipeline / execute_pipeline_arrow
+        calls for this engine instance."""
+        if self._pooled_conn is None:
+            self._pooled_conn = duckdb.connect(database=":memory:", config={
+                "threads": self.threads,
+                "memory_limit": self.memory_limit,
+            })
+        return self._pooled_conn
+
+    def close(self):
+        """Close the pooled DuckDB connection. Called on worker shutdown."""
+        if self._pooled_conn is not None:
+            try:
+                self._pooled_conn.close()
+            except Exception:
+                pass
+            self._pooled_conn = None
 
     def execute_pipeline(self, rows: list[dict], steps: list[dict],
                          schema: pa.Schema | None = None
@@ -85,47 +117,100 @@ class DuckDBTransformEngine:
         so even all-NULL columns keep their declared type — callers pass
         this schema to ``IcebergWriter.write_batch`` so PyIceberg never
         sees a ``pa.null()`` column.
+
+        v1.2.38 Finding A: the connection is now pooled on the engine
+        instance (``_get_conn``) instead of opened+closed per call. This
+        preserves the exact same staging-table semantics via
+        ``CREATE OR REPLACE TABLE staging``.
         """
         if not rows:
             return [], {}, schema
 
-        with duckdb.connect(database=":memory:", config={
-            "threads": self.threads,
-            "memory_limit": self.memory_limit,
-        }) as conn:
-            # Convert rows → Arrow table with explicit schema (Fix A),
-            # register as a view, then materialise into staging. This
-            # replaces the broken $1 binding (Fix B).
-            arrow_tbl = pa.Table.from_pylist(rows, schema=schema) if schema is not None \
-                else pa.Table.from_pylist(rows)
-            conn.register("rows_view", arrow_tbl)
-            conn.execute("CREATE TABLE staging AS SELECT * FROM rows_view")
+        conn = self._get_conn()
+        # Convert rows → Arrow table with explicit schema (Fix A), register
+        # as a view, then materialise into staging. CREATE OR REPLACE keeps
+        # the staging table fresh across pooled-conn reuses.
+        arrow_tbl = pa.Table.from_pylist(rows, schema=schema) if schema is not None \
+            else pa.Table.from_pylist(rows)
+        conn.register("rows_view", arrow_tbl)
+        conn.execute("CREATE OR REPLACE TABLE staging AS SELECT * FROM rows_view")
 
-            child_tables: dict[str, list[dict]] = {}
+        child_tables: dict[str, list[dict]] = {}
 
-            for step in steps:
-                step_type = step.get("type")
-                handler = self.STEP_HANDLERS.get(step_type)
-                if handler is None:
-                    log.warning("Unknown transform step type: %s — skipping", step_type)
-                    continue
-                try:
-                    result = handler(conn, step, udf_registry_url=self.control_plane_url)
-                    if isinstance(result, dict) and "child_table" in result:
-                        # json_flatten_child produces a named child table
-                        child_tables[result["child_table_name"]] = result["child_table"]
-                except Exception:
-                    log.exception("Transform step failed: %s", step)
-                    raise
+        for step in steps:
+            step_type = step.get("type")
+            handler = self.STEP_HANDLERS.get(step_type)
+            if handler is None:
+                log.warning("Unknown transform step type: %s — skipping", step_type)
+                continue
+            try:
+                result = handler(conn, step, udf_registry_url=self.control_plane_url)
+                if isinstance(result, dict) and "child_table" in result:
+                    # json_flatten_child produces a named child table
+                    child_tables[result["child_table_name"]] = result["child_table"]
+            except Exception:
+                log.exception("Transform step failed: %s", step)
+                raise
 
-            # Capture the transformed schema from DuckDB's staging table so
-            # all-NULL columns retain their declared type (Fix A). Use
-            # fetch_arrow_table() to avoid pandas round-tripping the types.
-            arrow_out = conn.execute("SELECT * FROM staging").fetch_arrow_table()
-            transformed_schema = arrow_out.schema
-            transformed = arrow_out.to_pylist()
+        # Capture the transformed schema from DuckDB's staging table so
+        # all-NULL columns retain their declared type (Fix A). Use
+        # fetch_arrow_table() to avoid pandas round-tripping the types.
+        arrow_out = conn.execute("SELECT * FROM staging").fetch_arrow_table()
+        transformed_schema = arrow_out.schema
+        transformed = arrow_out.to_pylist()
 
         return transformed, child_tables, transformed_schema
+
+    def execute_pipeline_arrow(self, rows: list[dict], steps: list[dict],
+                               schema: pa.Schema | None = None
+                               ) -> tuple[pa.Table, dict, pa.Schema | None]:
+        """v1.2.38 Finding B: same as ``execute_pipeline`` but returns the
+        transformed ``pa.Table`` directly instead of calling ``.to_pylist()``
+        and forcing the caller to re-convert to Arrow via ``_rows_to_arrow``.
+
+        Measured directly (master report §6f Finding B): a transformed 10k-row
+        chunk pays ~42.2ms for ``.to_pylist()`` and ~4.7ms for the redundant
+        second ``pa.Table.from_pylist()`` in ``_rows_to_arrow`` — ~47ms of
+        pure wasted conversion per 10k-row chunk, ~6s across a 1.29M-row
+        table. Returning the Arrow table straight through lets transformed
+        streams stay in Arrow format from DuckDB staging all the way to the
+        Iceberg commit, eliminating both wasted conversions. Composes
+        cleanly with the bulk-mode fix (v1.2.37 Bug #25/#26) and the
+        single-committer redesign (v1.2.39).
+
+        Returns ``(arrow_table, child_tables, transformed_schema)``. The
+        ``child_tables`` value is still ``dict[str, list[dict]]`` (only
+        ``json_flatten_child`` produces child tables, and that path is
+        small/rare — kept as list[dict] for now).
+        """
+        if not rows:
+            empty = pa.table({}) if schema is None else pa.table([], schema=schema)
+            return empty, {}, schema
+
+        conn = self._get_conn()
+        arrow_tbl = pa.Table.from_pylist(rows, schema=schema) if schema is not None \
+            else pa.Table.from_pylist(rows)
+        conn.register("rows_view", arrow_tbl)
+        conn.execute("CREATE OR REPLACE TABLE staging AS SELECT * FROM rows_view")
+
+        child_tables: dict[str, list[dict]] = {}
+
+        for step in steps:
+            step_type = step.get("type")
+            handler = self.STEP_HANDLERS.get(step_type)
+            if handler is None:
+                log.warning("Unknown transform step type: %s — skipping", step_type)
+                continue
+            try:
+                result = handler(conn, step, udf_registry_url=self.control_plane_url)
+                if isinstance(result, dict) and "child_table" in result:
+                    child_tables[result["child_table_name"]] = result["child_table"]
+            except Exception:
+                log.exception("Transform step failed: %s", step)
+                raise
+
+        arrow_out = conn.execute("SELECT * FROM staging").fetch_arrow_table()
+        return arrow_out, child_tables, arrow_out.schema
 
 
 # ─── Transform step implementations ──────────────────────────────────────────

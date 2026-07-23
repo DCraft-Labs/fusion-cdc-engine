@@ -4,6 +4,57 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.38] — 2026-07-24
+
+### Engine perf — Findings A + B (master report §6f)
+
+Two isolated, low-risk perf wins from the full transform-engine trace in
+the master report §6f. Combined ~53ms/10k-row chunk (~7s across a 1.29M-row
+table) — real and free, stacks with the v1.2.37 bulk-mode fix and the
+v1.2.39 single-committer redesign.
+
+- **Finding A (§6f): pool one DuckDB connection per worker process.**
+  `DuckDBTransformEngine.execute_pipeline` previously opened a fresh
+  `:memory:` DuckDB connection on every chunk (~7.6ms/chunk of pure
+  connection-setup overhead, ~1s across a 1.29M-row table at 10k-row
+  chunks). The connection is now pooled on the engine instance
+  (`_get_conn` / `_pooled_conn`), created lazily on first use, and reused
+  across every `execute_pipeline` / `execute_pipeline_arrow` call for the
+  lifetime of the worker process. `CREATE OR REPLACE TABLE staging` keeps
+  each chunk's staging schema fresh even though the connection persists.
+  A `close()` method is provided for graceful shutdown.
+- **Finding B (§6f): eliminate the Arrow↔Python round-trip for transformed
+  chunks.** `execute_pipeline` did Arrow→DuckDB→Arrow→`.to_pylist()`→
+  `pending_rows.extend()`→`_rows_to_arrow()` again — ~47ms/10k-row chunk of
+  pure wasted conversion (~6s across a 1.29M-row table). New
+  `execute_pipeline_arrow` method returns the `pa.Table` directly, and the
+  transformed+iceberg write path in `loader.py` now buffers Arrow tables
+  (`pending_arrow`) and flushes via the new `_flush_iceberg_batch_arrow`
+  helper → `IcebergWriter.write_arrow` (no Python dict intermediate).
+  `pa.concat_tables(promote_options="default")` merges buffered chunks
+  for the batched commit; if concat fails on irreconcilable schema drift,
+  it falls back to flushing each table individually (durable in N commits
+  instead of 1). The postgres COPY path keeps `list[dict]` (COPY expects
+  Python rows); the CDC upsert path keeps `execute_pipeline` (list[dict]).
+
+### Tests
+- `transform-worker/tests/test_v138_engine_perf.py` (new): Finding A
+  (pooled conn reused across calls, `duckdb.connect` not called on second
+  call, `close()` resets, `CREATE OR REPLACE` keeps staging fresh per
+  chunk), Finding B (`execute_pipeline_arrow` returns `pa.Table` not
+  `list[dict]`, empty-rows returns empty table, transforms applied in
+  Arrow path, Arrow and dict paths produce same data, loader iceberg
+  path uses `_write_arrow_to_iceberg` not `_write_to_iceberg`).
+- `transform-worker/tests/test_compute_efficiency.py`: updated the
+  schema-fetched-once test to mock the new Arrow write path
+  (`_write_arrow_to_iceberg`) and assert the cached schema is carried by
+  the Arrow table itself (Finding B).
+
+### Follow-ups (not in this release)
+- Wire `engine.close()` into the worker process graceful-shutdown path
+  (currently the pooled conn is released on process exit, which is fine
+  for the worker's scale-to-zero lifecycle but not strictly clean).
+
 ## [1.2.37] — 2026-07-24
 
 ### Priority 0 — Nessie persistence + bulk-mode blockers + commit-batch tuning

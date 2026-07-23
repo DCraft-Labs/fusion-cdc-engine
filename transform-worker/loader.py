@@ -426,7 +426,13 @@ class InitialLoadTask:
         # transformed rows into a single Iceberg append. Only applies to
         # Iceberg destinations; Postgres COPY is already batched per chunk.
         commit_batch = max(1, INITIAL_LOAD_COMMIT_BATCH) if connector_type == "iceberg" else 1
-        pending_rows: list[dict] = []       # buffered transformed rows
+        # v1.2.38 Finding B: the transformed+iceberg path now buffers Arrow
+        # tables (not Python dicts) and flushes via ``write_arrow``. This
+        # eliminates the ~47ms/10k-row chunk wasted Arrow↔Python round-trip
+        # (master report §6f Finding B) and stacks with the v1.2.37 bulk-mode
+        # fix. ``pending_child`` stays list[dict] (only json_flatten_child
+        # produces child tables, a small/rare path).
+        pending_arrow: list["pa.Table"] = []   # buffered transformed Arrow tables
         pending_child: dict[str, list[dict]] = {}
         chunks_since_commit = 0
 
@@ -653,35 +659,46 @@ class InitialLoadTask:
                     # the checkpoint cursor only after it succeeds.
                     last_pk = next_pk
                 else:
-                    # Apply transforms
-                    if steps:
-                        t_c0 = time.monotonic()
-                        transformed, child_tables, transformed_schema = self.engine.execute_pipeline(
-                            rows, steps, schema=cached_source_schema,
-                        )
-                        INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
-                        if cached_transformed_schema is None and transformed_schema is not None:
-                            cached_transformed_schema = transformed_schema
-                    else:
-                        transformed, child_tables = rows, {}
-                        transformed_schema = cached_source_schema
-    
-                    # Write to destination
+                    # Apply transforms. v1.2.38 Finding B: branch on
+                    # connector_type so the iceberg write path stays in Arrow
+                    # (no .to_pylist() + _rows_to_arrow round-trip, ~47ms/10k
+                    # rows saved per master report §6f Finding B), while the
+                    # postgres COPY path keeps the list[dict] format it needs.
+                    # Finding A: the underlying DuckDB connection is pooled
+                    # on the engine instance either way.
                     if connector_type == "iceberg":
-                        pending_rows.extend(transformed)
+                        if steps:
+                            t_c0 = time.monotonic()
+                            arrow_out, child_tables, transformed_schema = self.engine.execute_pipeline_arrow(
+                                rows, steps, schema=cached_source_schema,
+                            )
+                            INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
+                            if cached_transformed_schema is None and transformed_schema is not None:
+                                cached_transformed_schema = transformed_schema
+                        else:
+                            # No transforms — wrap the Python rows in an Arrow
+                            # table so the write path is uniform. (Bulk-mode
+                            # already returns Arrow and never reaches here.)
+                            arrow_out = pa.Table.from_pylist(rows, schema=cached_source_schema) \
+                                if cached_source_schema is not None else pa.Table.from_pylist(rows)
+                            child_tables = {}
+                            transformed_schema = cached_source_schema
+
+                        if arrow_out is not None and arrow_out.num_rows > 0:
+                            pending_arrow.append(arrow_out)
                         for child_name, child_rows in child_tables.items():
                             if child_rows:
                                 pending_child.setdefault(child_name, []).extend(child_rows)
                         chunks_since_commit += 1
-                        rows_written = len(transformed)
+                        rows_written = arrow_out.num_rows if arrow_out is not None else 0
                         if chunks_since_commit >= commit_batch:
                             t_w0 = time.monotonic()
-                            self._flush_iceberg_batch(
-                                pending_rows, pending_child, dest, dest_table,
+                            self._flush_iceberg_batch_arrow(
+                                pending_arrow, pending_child, dest, dest_table,
                                 schema=cached_transformed_schema or cached_source_schema,
                             )
                             INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
-                            pending_rows = []
+                            pending_arrow = []
                             pending_child = {}
                             chunks_since_commit = 0
                             # v1.2.33 Bug #22 fix 1 (PRIMARY): the batched
@@ -692,6 +709,20 @@ class InitialLoadTask:
                             # already-durable rows on retry-after-conflict.
                             last_pk = next_pk
                     else:
+                        # Postgres COPY path: keep list[dict] (COPY expects
+                        # Python rows, not Arrow).
+                        if steps:
+                            t_c0 = time.monotonic()
+                            transformed, child_tables, transformed_schema = self.engine.execute_pipeline(
+                                rows, steps, schema=cached_source_schema,
+                            )
+                            INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
+                            if cached_transformed_schema is None and transformed_schema is not None:
+                                cached_transformed_schema = transformed_schema
+                        else:
+                            transformed, child_tables = rows, {}
+                            transformed_schema = cached_source_schema
+
                         dest_dsn = _dest_dsn_from_dest(dest)
                         if not dest_dsn:
                             log.error("InitialLoad connection=%s cannot derive dest_dsn for connector_type=%s — destination block missing/incomplete. Stopping load after %d rows.",
@@ -839,11 +870,23 @@ class InitialLoadTask:
                     break
 
             # Fix C4: release the chunk's memory before fetching the next.
+            # v1.2.38 Finding B: the transformed+iceberg path now produces
+            # ``arrow_out`` (pa.Table) instead of ``transformed`` (list[dict]);
+            # the postgres path still produces ``transformed``. del each
+            # path-specific binding if it was assigned this iteration.
             if kind == "arrow":
-                del arrow_tbl, transformed, child_tables
+                del arrow_tbl, child_tables
                 arrow_tbl = None
             else:
-                del rows, transformed, child_tables
+                del rows, child_tables
+            try:
+                del transformed
+            except NameError:
+                pass
+            try:
+                del arrow_out
+            except NameError:
+                pass
             # v1.2.29 Task 2: chunk done — back to idle.
             INITIAL_LOAD_CHUNKS_IN_FLIGHT.labels(_m_conn, _m_stream, _m_part).set(0)
 
@@ -861,12 +904,12 @@ class InitialLoadTask:
                 pass
 
         # v1.2.26 Task 7: flush any remaining buffered Iceberg batch.
-        if connector_type == "iceberg" and pending_rows:
-            self._flush_iceberg_batch(
-                pending_rows, pending_child, dest, dest_table,
+        if connector_type == "iceberg" and pending_arrow:
+            self._flush_iceberg_batch_arrow(
+                pending_arrow, pending_child, dest, dest_table,
                 schema=cached_transformed_schema or cached_source_schema,
             )
-            pending_rows = []
+            pending_arrow = []
             pending_child = {}
             chunks_since_commit = 0
             # v1.2.33 Bug #22 fix 1: the final buffered batch is now durable —
@@ -899,10 +942,56 @@ class InitialLoadTask:
         loser reloads metadata and retries (tenacity-backed in
         ``iceberg_writer.load_catalog``). So K pods appending to the same
         Iceberg table is a supported pattern; do NOT serialize this.
+
+        v1.2.38 Finding B: the transformed+iceberg path now uses
+        ``_flush_iceberg_batch_arrow`` (Arrow-native, no Python dict
+        intermediate). This dict-based helper is retained for the CDC
+        upsert path and any caller that already has list[dict] in hand.
         """
         if not rows:
             return 0
         written = self._write_to_iceberg(rows, dest, table_name, schema=schema)
+        for child_name, child_rows in child_tables.items():
+            if child_rows:
+                self._write_to_iceberg(child_rows, dest, child_name)
+        return written
+
+    def _flush_iceberg_batch_arrow(self, arrow_tables: list, child_tables: dict,
+                                   dest: dict, table_name: str,
+                                   schema: "pa.Schema | None" = None) -> int:
+        """v1.2.38 Finding B: flush a buffered batch of transformed Arrow
+        tables to Iceberg in ONE ``table.append`` (one commit) via
+        ``IcebergWriter.write_arrow`` — no Python dict intermediate.
+
+        Concatenates the buffered Arrow tables (``pa.concat_tables`` with
+        ``promote_options="default"`` so nullable new columns from schema
+        drift across chunks merge cleanly), then delegates to
+        ``_write_arrow_to_iceberg``. Child tables stay on the dict path
+        (only ``json_flatten_child`` produces them, a small/rare path).
+        Returns the row count written.
+        """
+        if not arrow_tables:
+            return 0
+        # Filter out empty tables (concat_tables errors on a list of all-empty
+        # tables with mismatched schemas; an empty table contributes 0 rows
+        # anyway).
+        non_empty = [t for t in arrow_tables if t is not None and t.num_rows > 0]
+        if not non_empty:
+            return 0
+        try:
+            combined = pa.concat_tables(non_empty, promote_options="default")
+        except Exception as e:
+            # If concat fails (e.g. irreconcilable schema drift across
+            # chunks), fall back to flushing each table individually so
+            # the batch is still durably committed — just in N commits
+            # instead of 1. Log and proceed.
+            log.warning("InitialLoad: pa.concat_tables failed (%s) — flushing %d Arrow tables individually.",
+                        e, len(non_empty))
+            written = 0
+            for t in non_empty:
+                written += self._write_arrow_to_iceberg(t, dest, table_name)
+        else:
+            written = self._write_arrow_to_iceberg(combined, dest, table_name)
         for child_name, child_rows in child_tables.items():
             if child_rows:
                 self._write_to_iceberg(child_rows, dest, child_name)
