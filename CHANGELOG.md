@@ -4,6 +4,86 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.27] — 2026-07-23
+
+### P0 Fix — Non-blocking partitioning (production MySQL was tied up by a stuck `COUNT(*)`)
+v1.2.26's `partition_pk_ranges()` ran `SELECT MIN(pk), MAX(pk), COUNT(*) FROM table`
+synchronously in the request handler, blocking the uvicorn event loop (with
+`--workers 1`, the entire API was blocked). For a 118M-row table, `COUNT(*)`
+takes 20+ minutes and ties up the production MySQL cluster. This release fixes
+the blocking, the slow query, and the pod-safety issues.
+
+- **Task 1 — Threadpool offload (`control-plane/app/api/connections.py`):**
+  `_enqueue_initial_load_tasks` is now `async` and the `partition_pk_ranges`
+  call is wrapped in `await asyncio.to_thread(...)` so the DB-touching
+  partitioning runs in a worker thread — the uvicorn event loop stays
+  responsive (health, login, and other requests are served concurrently while
+  partitioning runs). `_trigger_dag_or_worker` is also `async` and awaited from
+  its 4 callers (`create_connection`, `activate`, `resume`, `trigger_sync`).
+- **Task 2 — No `COUNT(*)` (`control-plane/app/services/partitioning.py`):**
+  - MySQL: `SELECT /*+ MAX_EXECUTION_TIME(30000) */ MIN(pk), MAX(pk) FROM table`
+    + `SELECT table_rows FROM information_schema.tables WHERE ...` (instant
+    metadata lookup).
+  - Postgres: `SELECT MIN(pk), MAX(pk) FROM table` (within a `BEGIN READ ONLY`
+    + `SET LOCAL statement_timeout = 30s`) + `SELECT reltuples::bigint FROM
+    pg_class ...`.
+  - MongoDB: `db.collection.estimatedDocumentCount()` (metadata-based) —
+    never `count_documents({})`. Mongo still uses K=1 (ObjectId is
+    non-numeric; inter-table parallelism still applies).
+  - The OFFSET-based PK sampling from v1.2.26 (`SELECT pk ... LIMIT 1 OFFSET
+    o` at K-1 offsets) is removed — `OFFSET 50M` scans 50M rows, itself slow.
+    Partitioning now uses a naive even split of `[min, max]` into K ranges
+    (fast, slightly less even, but the worker's keyset pagination handles
+    uneven ranges fine).
+- **Task 3 — Timeout + KILL + plan B (`partitioning.py`):**
+  - Server-side timeout: `MAX_EXECUTION_TIME(30000)` (MySQL), `SET LOCAL
+    statement_timeout = 30s` (Postgres), `maxTimeMS(30000)` (Mongo).
+  - Client-side: `connect_timeout=10`, `read_timeout=30` on all partitioning
+    connections.
+  - On timeout: **KILL the stuck query on the source** from a *fresh*
+    connection — `KILL QUERY <conn_id>` (MySQL, where `conn_id` comes from
+    `SELECT CONNECTION_ID()` on the stuck connection), `pg_cancel_backend(pid)`
+    + `pg_terminate_backend(pid)` (Postgres, `pid` from `pg_backend_pid()`),
+    `db.killOp(opid)` (Mongo). The KILL uses our own connection/pid id
+    (captured before the slow query), so it can never kill another client's
+    connection.
+  - Plan B fallback: `SELECT pk FROM table ORDER BY pk LIMIT 1` (first PK) +
+    `SELECT pk FROM table ORDER BY pk DESC LIMIT 1` (last PK) — both instant
+    on indexed PKs — + information_schema count. If even first/last PK times
+    out, fall back to K=1.
+  - The whole partitioning step completes in < 60s or falls back to plan B.
+- **Task 4 — Async endpoint (`connections.py`):**
+  `POST /connections/{id}/retry-initial-load` now returns `202 Accepted`
+  immediately with `{"status": "partitioning", "task_id": "..."}`. The
+  partitioning + enqueue runs in a background `asyncio.create_task`
+  (`_run_initial_load_background`) that opens its own DB session and updates
+  an in-process state dict. New `GET /connections/{id}/initial-load/status`
+  returns `{"phase": "partitioning"|"enqueued"|"running"|"completed"|"failed",
+  "partitions": K, "rows_estimated": N, "error": ...}` for the UI to poll.
+- **Task 5 — Pod protection:** the partitioning threadpool offload (Task 1)
+  keeps the event loop alive so liveness probes pass. `read_timeout=30` on
+  the DB connection prevents the thread from hanging forever. The
+  threadpool task is cancellable on pod shutdown. Resource limits: one extra
+  thread ≈ 50MB — document this in the chart's `controlPlane.resources`
+  comment.
+- **Task 6 — No PK index (`partitioning.py`):** `_mysql_has_pk_index` /
+  `_pg_has_pk_index` check `information_schema.statistics` /
+  `pg_indexes` before running MIN/MAX. If the PK has no index, fall back to
+  K=1 with a warning ("Table has no usable PK index, falling back to
+  single-partition load"). The chunked fetch (v1.2.17 keyset pagination)
+  still works, just no parallelism.
+- **Task 7 — Tests (`control-plane/tests/test_partitioning.py`):** 7 new
+  test classes covering: K disjoint ranges from mocked MIN/MAX/count; no
+  `COUNT(*)` ever executed (MySQL + Postgres); timeout → plan B fallback;
+  KILL called on timeout (with the correct conn_id); no PK index → K=1;
+  the route declares `202`; the background enqueue produces K tasks. Also
+  fixed a pre-existing `NameError` in `test_monotonic_bounds` (`sorted(b)`
+  → `sorted(bounds)`).
+
+### Version
+- Chart version + appVersion bumped to `1.2.27` (`helm/fusion-cdc/Chart.yaml`,
+  `control-plane/app/main.py`).
+
 ## [1.2.26] — 2026-07-23
 
 ### Initial Load — Multi-pod Parallelism (Task 1, the big one — Section 3.5)

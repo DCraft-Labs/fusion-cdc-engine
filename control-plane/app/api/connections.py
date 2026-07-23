@@ -61,6 +61,44 @@ PARTITION_SAMPLE_THRESHOLD = 1_000_000
 # Default chunk size (rows per chunk within a single partition's PK range).
 DEFAULT_CHUNK_SIZE = int(os.environ.get("INITIAL_LOAD_CHUNK_SIZE", "10000"))
 
+# v1.2.27: in-process initial-load partitioning state tracker. Used by the
+# async ``retry-initial-load`` endpoint (returns 202 immediately) and the
+# ``GET /connections/{id}/initial-load/status`` endpoint. With
+# ``--workers 1`` (the production control-plane config) there is a single
+# process so this dict is the authoritative state. With multiple workers,
+# state is per-worker — the status endpoint returns the calling worker's
+# view (acceptable for a P0; a future release can move this to a DB table).
+_initial_load_state: dict = {}
+
+
+def _get_initial_load_state(connection_id: str) -> dict:
+    """Return (or create) the partitioning state dict for a connection."""
+    s = _initial_load_state.get(connection_id)
+    if s is None:
+        s = {
+            "phase": "idle",        # idle|partitioning|enqueued|running|completed|failed
+            "task_id": None,
+            "partitions": 0,        # K (number of ranges)
+            "rows_estimated": None, # approximate row count from information_schema
+            "error": None,
+            "started_at": None,
+            "updated_at": None,
+        }
+        _initial_load_state[connection_id] = s
+    return s
+
+
+def _set_initial_load_phase(connection_id: str, phase: str, **fields) -> None:
+    """Update the partitioning state for a connection (timestamped)."""
+    from datetime import datetime as _dt
+    s = _get_initial_load_state(connection_id)
+    s["phase"] = phase
+    s["updated_at"] = _dt.utcnow().isoformat()
+    for key, val in fields.items():
+        s[key] = val
+    if phase == "partitioning" and s.get("started_at") is None:
+        s["started_at"] = s["updated_at"]
+
 
 # ===========================
 # Helper Functions
@@ -173,7 +211,7 @@ def _calculate_next_sync_time(cron_expression: str) -> Optional[datetime]:
         return now + timedelta(days=1)
 
 
-def _trigger_dag_or_worker(connection: Connection, db: Session) -> None:
+async def _trigger_dag_or_worker(connection: Connection, db: Session) -> None:
     """
     Spec §1 (P1-2/P1-3): Trigger an initial full load or manual sync.
 
@@ -186,7 +224,9 @@ def _trigger_dag_or_worker(connection: Connection, db: Session) -> None:
     For CDC/REALTIME connections, the worker is already streaming — trigger-sync
     re-fetches sources and starts any new ones.
 
-    Failures are logged but must not abort the activate/trigger-sync response.
+    v1.2.27: now async — ``_enqueue_initial_load_tasks`` is awaited (it
+    offloads partitioning to a threadpool). Failures are logged but must not
+    abort the activate/trigger-sync response.
     """
     import os
     import json as _json
@@ -280,7 +320,7 @@ def _trigger_dag_or_worker(connection: Connection, db: Session) -> None:
     # path deployed via kubernetes/base/cdc-consumer.yaml. The v1.2.18
     # deletion was a regression and has been reverted.
     try:
-        _enqueue_initial_load_tasks(connection, db)
+        await _enqueue_initial_load_tasks(connection, db)
     except Exception as exc:
         log.warning(
             "initial_load producer dispatch failed for connection=%s: %s",
@@ -460,7 +500,7 @@ def _connection_chunk_size(connection: Connection) -> int:
     return max(1, cs)
 
 
-def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
+async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
     """Enqueue ``initial_load`` tasks to ``fusion:transforms:high`` when the
     connection's destination is configured with ``snapshot_mode=transform_worker``.
 
@@ -626,7 +666,15 @@ def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
             # into K disjoint sub-ranges. Falls back to [(None, None)] (a
             # single unbounded range) on error or when K<=1 — preserving the
             # legacy v1.2.25 single-task-per-stream behaviour.
-            ranges = partition_pk_ranges(
+            # v1.2.27 P0 fix: offload the DB-touching partition call to a
+            # worker thread so the uvicorn event loop is NOT blocked while
+            # MIN/MAX/information_schema queries run against the source DB.
+            # Other requests (health, login, etc.) are served concurrently.
+            # The partitioning step itself has a 30s server-side timeout +
+            # KILL fallback (see app.services.partitioning).
+            import asyncio as _asyncio
+            ranges = await _asyncio.to_thread(
+                partition_pk_ranges,
                 source_block, stream.source_schema_name or "",
                 stream.source_table_name, pk_col, src_connector_type, k,
             )
@@ -817,7 +865,7 @@ async def create_connection(
     # Trigger initial sync automatically if connection is created as active
     if connection.status == "active":
         connection.initial_load_started_at = datetime.utcnow()
-        _trigger_dag_or_worker(connection, db)
+        await _trigger_dag_or_worker(connection, db)
         db.commit()
     
     # Load relationships
@@ -1222,7 +1270,7 @@ async def activate_connection(
         # Mark that initial load is in progress; the Airflow DAG / Spark consumer
         # will call /internal/connections/{id}/run-complete when done.
         connection.initial_load_started_at = datetime.utcnow()
-        _trigger_dag_or_worker(connection, db)
+        await _trigger_dag_or_worker(connection, db)
     
     db.commit()
     
@@ -1298,7 +1346,7 @@ async def resume_connection(
         connection.next_sync_at = _calculate_next_sync_time(connection.schedule_cron)
 
     # For CDC/REALTIME connections, notify the worker to resume streaming
-    _trigger_dag_or_worker(connection, db)
+    await _trigger_dag_or_worker(connection, db)
     
     db.commit()
     
@@ -1390,7 +1438,7 @@ async def trigger_manual_sync(
     if is_first_sync:
         connection.initial_load_started_at = datetime.utcnow()
 
-    _trigger_dag_or_worker(connection, db)
+    await _trigger_dag_or_worker(connection, db)
 
     record_audit(
         db,
@@ -1510,7 +1558,8 @@ async def trigger_manual_sync(
 # Retry Initial Load
 # ===========================
 
-@router.post("/{connection_id}/retry-initial-load", response_model=dict)
+@router.post("/{connection_id}/retry-initial-load", response_model=dict,
+             status_code=status.HTTP_202_ACCEPTED)
 async def retry_initial_load(
     connection_id: UUID,
     db: Session = Depends(get_db),
@@ -1524,12 +1573,18 @@ async def retry_initial_load(
     misconfigured), users had to delete + recreate the connection to retry.
     This endpoint lets them retry without that destructive workaround.
 
-    Resets ``initial_load_completed = false`` and
-    ``initial_load_started_at = now()``, then re-invokes
-    ``_enqueue_initial_load_tasks``. Only valid for CDC/REALTIME connections
-    (BATCH/SCHEDULED connections use Airflow, not the transform-worker
-    snapshot path).
+    v1.2.27 P0 fix: returns ``202 Accepted`` immediately and runs the
+    partitioning + enqueue in a background ``asyncio.create_task``. The
+    partitioning step (``MIN/MAX`` + ``information_schema`` count, with a 30s
+    timeout + KILL fallback) is offloaded to a threadpool so the uvicorn event
+    loop stays responsive. The UI polls
+    ``GET /connections/{id}/initial-load/status`` for progress. Only valid
+    for CDC/REALTIME connections (BATCH/SCHEDULED connections use Airflow,
+    not the transform-worker snapshot path).
     """
+    import asyncio
+    import uuid as _uuid
+
     connection = _get_connection_by_id(db, connection_id, current_user)
 
     sync_type = (getattr(connection, "sync_type", "") or "").upper()
@@ -1546,30 +1601,136 @@ async def retry_initial_load(
     connection.initial_load_completed = False
     connection.initial_load_completed_at = None
     connection.initial_load_started_at = datetime.utcnow()
+    db.commit()
 
-    # Re-enqueue one initial_load task per enabled stream.
-    tasks_enqueued = _enqueue_initial_load_tasks(connection, db)
+    # Mark phase=partitioning and spawn the background task. The background
+    # task opens its OWN DB session (the request session is closed once the
+    # response is returned) and updates the state dict as it progresses.
+    conn_id_str = str(connection_id)
+    task_id = f"il-{conn_id_str}-{_uuid.uuid4().hex[:8]}"
+    _set_initial_load_phase(
+        conn_id_str, "partitioning",
+        task_id=task_id, partitions=0, rows_estimated=None, error=None,
+    )
+
+    asyncio.create_task(_run_initial_load_background(
+        conn_id_str, connection.connection_id, current_user.user_id,
+    ))
 
     record_audit(
         db,
         "connection.retry_initial_load",
         user=current_user,
         resource_type="connection",
-        resource_id=str(connection_id),
-        details={"tasks_enqueued": tasks_enqueued},
+        resource_id=conn_id_str,
+        details={"task_id": task_id, "phase": "partitioning"},
     )
-
     db.commit()
 
     return {
         "ok": True,
-        "connection_id": str(connection_id),
-        "tasks_enqueued": tasks_enqueued,
+        "connection_id": conn_id_str,
+        "status": "partitioning",
+        "task_id": task_id,
         "message": (
-            f"Enqueued {tasks_enqueued} initial-load task(s) to fusion:transforms:high. "
-            "The transform-worker will pick them up when KEDA scales it up."
+            "Initial-load partitioning started in the background. Poll "
+            "GET /connections/{id}/initial-load/status for progress."
         ),
         "retried_at": datetime.utcnow().isoformat(),
+    }
+
+
+async def _run_initial_load_background(conn_id_str: str,
+                                       connection_id, user_id) -> None:
+    """Background task: partition + enqueue the initial load off the request
+    path. Opens its own DB session (the request session is closed by the time
+    this runs) and updates ``_initial_load_state`` as it progresses.
+
+    Failures are recorded in the state dict (phase=failed, error=...) so the
+    UI can surface them via the status endpoint — the task itself never
+    raises (it's a fire-and-forget ``asyncio.create_task``).
+    """
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    try:
+        from app.database import SessionLocal
+        from app.models.auth import User
+        from app.models.connection import Connection
+        from sqlalchemy.orm import joinedload
+        with SessionLocal() as bg_db:
+            connection = (
+                bg_db.query(Connection)
+                .options(joinedload(Connection.streams))
+                .filter(Connection.connection_id == connection_id)
+                .first()
+            )
+            if not connection:
+                _set_initial_load_phase(conn_id_str, "failed",
+                                        error="connection not found")
+                return
+            current_user = bg_db.query(User).filter(User.user_id == user_id).first()
+            # Phase=partitioning -> _enqueue_initial_load_tasks does the
+            # partitioning (offloaded to threadpool) and the enqueue.
+            tasks_enqueued = await _enqueue_initial_load_tasks(connection, bg_db)
+            _set_initial_load_phase(
+                conn_id_str, "enqueued",
+                partitions=tasks_enqueued,
+            )
+            # Record audit (best-effort).
+            try:
+                if current_user is not None:
+                    record_audit(
+                        bg_db,
+                        "connection.retry_initial_load.enqueued",
+                        user=current_user,
+                        resource_type="connection",
+                        resource_id=conn_id_str,
+                        details={"tasks_enqueued": tasks_enqueued},
+                    )
+                bg_db.commit()
+            except Exception as exc:
+                log.warning("initial_load background audit failed: %s", exc)
+                bg_db.rollback()
+    except Exception as exc:
+        log.warning("initial_load background task failed for %s: %s",
+                    conn_id_str, exc, exc_info=True)
+        _set_initial_load_phase(conn_id_str, "failed", error=str(exc))
+
+
+@router.get("/{connection_id}/initial-load/status", response_model=dict)
+async def get_initial_load_status(
+    connection_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """v1.2.27: return the current partitioning/enqueue state for a
+    connection's initial load. The UI polls this after
+    ``POST /connections/{id}/retry-initial-load`` (which returns 202
+    immediately) to show progress.
+
+    Returns ``{"phase": "idle"|"partitioning"|"enqueued"|"running"|"completed"|"failed",
+              "task_id": ..., "partitions": K, "rows_estimated": N, "error": ...}``.
+    """
+    # Verify the connection exists + tenant filter (raises 404 if not).
+    _get_connection_by_id(db, connection_id, current_user)
+    conn_id_str = str(connection_id)
+    state = _get_initial_load_state(conn_id_str)
+    # Reflect the connection's overall initial_load_completed flag too so
+    # the UI can show "completed" once the worker reports done.
+    conn = db.query(Connection).filter(
+        Connection.connection_id == connection_id,
+    ).first()
+    completed = bool(getattr(conn, "initial_load_completed", False)) if conn else False
+    return {
+        "connection_id": conn_id_str,
+        "phase": state.get("phase", "idle"),
+        "task_id": state.get("task_id"),
+        "partitions": state.get("partitions", 0),
+        "rows_estimated": state.get("rows_estimated"),
+        "error": state.get("error"),
+        "started_at": state.get("started_at"),
+        "updated_at": state.get("updated_at"),
+        "initial_load_completed": completed,
     }
 
 
