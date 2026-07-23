@@ -25,6 +25,16 @@ if _TW_DIR not in sys.path:
 import loader as loader_mod  # noqa: E402
 from loader import InitialLoadTask  # noqa: E402
 
+# v1.2.30: worker.py reads REDIS_URL / ENCRYPTION_KEY / DATABASE_URL at module
+# import time (``os.environ[...]`` / ``os.environ.get(...)``). The duplicate-
+# dequeue tests import ``worker`` inside the test body; without these env
+# vars set first, the import raises ``KeyError: 'REDIS_URL'`` / ``RuntimeError``.
+# Set harmless stubs so the import succeeds in CI (no real Redis/DB needed —
+# the tests use a FakeRedis and never touch the module-level clients).
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379")
+os.environ.setdefault("ENCRYPTION_KEY", "x" * 32)
+os.environ.setdefault("DATABASE_URL", "sqlite:///test.db")
+
 
 def _make_loader():
     engine = MagicMock()
@@ -555,11 +565,19 @@ class TestPrematureDoneFixRegression:
         # describes (adaptive chunk sizing grows the chunk size, so the cursor
         # advances faster than chunk_size=10k per call — the count is NOT
         # 1M/10k=100). The invariant is: it did NOT stop at ~5 chunks AND the
-        # last cursor reached the boundary.
+        # last cursor reached close to the boundary.
         assert len(fetch_calls) > 10, fetch_calls
         # The last fetch cursor must have reached close to pk_end (the boundary).
+        # Adaptive chunk sizing can grow chunk_size up to ADAPTIVE_MAX_CHUNK
+        # (100000), so the final cursor can be up to one max-size chunk away
+        # from the boundary — the loop still completed correctly (the fetch
+        # is bounded by ``pk <= pk_end`` so the last chunk ends exactly at the
+        # boundary). Use a generous slack of ADAPTIVE_MAX_CHUNK + chunk_size
+        # so the assertion holds regardless of how aggressively the adaptive
+        # sizer grew the chunk.
         last_cursor = fetch_calls[-1][0]
-        assert last_cursor is not None and last_cursor >= pk_end - 2 * chunk_size, (last_cursor, fetch_calls[-1])
+        slack = 100000 + 2 * chunk_size  # ADAPTIVE_MAX_CHUNK + margin
+        assert last_cursor is not None and last_cursor >= pk_end - slack, (last_cursor, fetch_calls[-1])
         # The final checkpoint report must be "done" (genuine completion).
         states = [c.kwargs.get("state") for c in mock_ckpt.call_args_list]
         assert "done" in states, states
