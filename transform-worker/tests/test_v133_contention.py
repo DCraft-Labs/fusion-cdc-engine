@@ -317,6 +317,34 @@ def test_checkpoint_advances_only_after_commit_success():
 
 
 # ─── Bug #22 fix 2: dedup-on-PK before append (idempotency) ──────────────────
+def _stub_pyiceberg_in():
+    """The CI unit-test job does NOT install pyiceberg (only pyarrow/duckdb/
+    requests/pymysql/psycopg2/redis). `_dedup_on_pk` does
+    `from pyiceberg.expressions import In` at call time, which would raise
+    ImportError and make the helper skip dedup (its non-fatal fallback). To
+    exercise the delete-then-append path in CI, we inject a tiny fake
+    `pyiceberg.expressions.In` into sys.modules so the import succeeds. The
+    fake `In` exposes the `.term` and `.rows` attributes that
+    `_FakeIcebergTable.delete` inspects."""
+    import sys
+    import types
+    if "pyiceberg" not in sys.modules:
+        pkg = types.ModuleType("pyiceberg")
+        pkg.__path__ = []  # mark as package
+        sys.modules["pyiceberg"] = pkg
+    if "pyiceberg.expressions" not in sys.modules:
+        mod = types.ModuleType("pyiceberg.expressions")
+
+        class In:
+            def __init__(self, term, rows):
+                self.term = term
+                self.rows = tuple(rows)
+
+        mod.In = In
+        sys.modules["pyiceberg.expressions"] = mod
+        setattr(sys.modules["pyiceberg"], "expressions", mod)
+
+
 class _FakeIcebergTable:
     """Minimal stand-in for a PyIceberg table: records delete() and append()
     calls so the test can assert delete-then-append ordering and that
@@ -343,6 +371,7 @@ class _FakeIcebergTable:
 def test_dedup_on_pk_before_append_removes_duplicates():
     """Pre-insert duplicate PKs, run _dedup_on_pk, then append — assert no
     duplicate PKs remain in the table."""
+    _stub_pyiceberg_in()
     from iceberg_writer import _dedup_on_pk
 
     # Table already has PKs [1, 2, 3] (e.g. from a prior partially-committed batch).
@@ -367,6 +396,7 @@ def test_dedup_on_pk_before_append_removes_duplicates():
 
 def test_dedup_on_pk_skips_when_no_pk_col():
     """When pk_col is falsy, _dedup_on_pk is a no-op."""
+    _stub_pyiceberg_in()
     from iceberg_writer import _dedup_on_pk
     table = _FakeIcebergTable(existing_pks=[1, 2])
     _dedup_on_pk(table, "", rows=[{"id": 1}])
