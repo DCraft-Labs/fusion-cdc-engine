@@ -4,6 +4,74 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.22] — 2026-07-23
+
+**Critical fix release.** Two confirmed blocking bugs in the transform-worker
+(Iceberg destination path) plus a compute-efficiency regression that blocked
+the source DB during the 118M-row MySQL → Iceberg load.
+
+### Fixed
+- **Bug A (all-NULL columns → `pa.null()` → PyIceberg rejects).**
+  `transform-worker/iceberg_writer.py` `_rows_to_arrow()` now accepts an
+  explicit `pa.Schema` and uses it for `pa.Table.from_pylist(rows, schema=...)`
+  so all-NULL columns keep their declared type (e.g. `pa.string()`) instead
+  of being inferred as `pa.null()` (which PyIceberg rejects with
+  `ValueError: Cannot write DataType null`). New `_get_source_schema()`
+  fetches the source table's column types ONCE from `information_schema`
+  (MySQL/Postgres) or by sampling one document (Mongo) and caches the result
+  for the entire stream — no per-chunk type inference.
+- **Bug B (DuckDB `$1` binding fails for `list[dict]`).**
+  `transform-worker/engine.py` `execute_pipeline()` no longer binds the
+  Python row list via `conn.execute("CREATE TABLE staging AS SELECT * FROM
+  $1", [rows])` (which raised `duckdb.InvalidInputException: Unsupported
+  parameter type for binding $1`). Rows are now converted to a PyArrow
+  Table with the explicit source schema, registered as a view, and
+  materialised into `staging` via `CREATE TABLE staging AS SELECT * FROM
+  rows_view`. The transformed schema is captured from DuckDB's staging
+  table via `fetch_arrow_table().schema` so all-NULL columns keep their
+  type through the round-trip.
+- **3 additional step-handler bugs found during testing (Fix B2):**
+  - `_apply_date_op`: `year(col)`/`month(col)`/etc. now cast the input to
+    `TIMESTAMP` first — DuckDB's date functions do not accept `VARCHAR`
+    (raised `Binder Error: No function matches 'year(VARCHAR)'`).
+  - `_apply_json_flatten_child`: replaced
+    `unnest(from_json(parent.col, '[]'))` (raised `Binder Error: Too many
+    values in array of JSON structure`) with
+    `unnest(CAST(json_extract(parent.col, '$') AS JSON[]))` and unquotes
+    string elements via `json_extract_string`.
+  - `_apply_mask` `hash` strategy: `sha256(col::BLOB)` → `sha256(col::VARCHAR)`
+    (DuckDB's `sha256` takes `VARCHAR`, not `BLOB`).
+  - `_apply_udf`: `duckdb.create_function(...)` → `conn.create_function(...)`
+    (the module-level helper returns a function object that is never
+    attached to the in-memory connection, so the subsequent `UPDATE` raised
+    `Table Function "fn_name" not found`).
+
+### Changed (compute efficiency — Fix C)
+- `transform-worker/loader.py` `InitialLoadTask.run` fetches the source
+  schema ONCE per stream (not per chunk) and passes it to
+  `engine.execute_pipeline` and `IcebergWriter.write_batch` on every chunk.
+  The transformed schema is captured from the first chunk and reused.
+- `_fetch_pg_chunk` now uses `BEGIN READ ONLY` + `COMMIT` with
+  `conn.autocommit = True` so the chunk SELECT does not hold a transaction
+  open across the destination write (Fix C3 — source DB no longer locked).
+- `_fetch_mysql_chunk` now connects with `autocommit=True` (Fix C3).
+- Each chunk's memory is released (`del rows, transformed, child_tables`)
+  before fetching the next (Fix C4 — stream, don't accumulate).
+
+### Added
+- `transform-worker/tests/test_iceberg_writer.py` — Bug A + type mapping +
+  schema drift (15 tests).
+- `transform-worker/tests/test_engine.py` — Bug B + all 10 step handlers
+  (13 tests).
+- `transform-worker/tests/test_compute_efficiency.py` — Fix C1/C3
+  (schema fetched once, READ ONLY transactions) (3 tests).
+- `.github/workflows/publish-images.yml` `test` job now installs
+  `pyarrow==16.0.0` + `duckdb==0.10.3` and runs the transform-worker suite.
+
+### Changed
+- `control-plane/app/main.py` FastAPI `version` → `1.2.22`.
+- `helm/fusion-cdc/Chart.yaml` `version` / `appVersion` → `1.2.22`.
+
 ## [1.2.21] — 2026-07-23
 
 **CI fix for v1.2.20.** The v1.2.20 `test` CI job failed because

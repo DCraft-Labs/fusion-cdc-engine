@@ -11,6 +11,7 @@ import tempfile
 from typing import Any
 
 import duckdb
+import pyarrow as pa
 import requests
 
 log = logging.getLogger(__name__)
@@ -64,21 +65,41 @@ class DuckDBTransformEngine:
         self.threads = int(os.getenv("DUCKDB_THREADS", "2"))
         self.memory_limit = os.getenv("DUCKDB_MEMORY_LIMIT", "3GB")
 
-    def execute_pipeline(self, rows: list[dict], steps: list[dict]) -> list[dict]:
+    def execute_pipeline(self, rows: list[dict], steps: list[dict],
+                         schema: pa.Schema | None = None
+                         ) -> tuple[list[dict], dict, pa.Schema | None]:
         """
         Apply a sequence of transform steps to a list of row dicts.
-        Returns transformed rows.
-        All steps run against a single DuckDB in-memory connection.
+        Returns ``(transformed_rows, child_tables, transformed_schema)``.
+
+        v1.2.22 Bug B fix: the previous code bound the Python list of dicts
+        via ``conn.execute("CREATE TABLE staging AS SELECT * FROM $1", [rows])``.
+        DuckDB's $1 / $2 parameter binding does NOT accept a Python
+        ``list[dict]`` — it raises ``duckdb.InvalidInputException: Unsupported
+        parameter type for binding $1``. We now convert ``rows`` to a
+        PyArrow Table with the explicit source schema (Fix A) and register
+        it as a view, then ``CREATE TABLE staging AS SELECT * FROM rows_view``.
+
+        v1.2.22 Bug A fix (continued): the transformed schema is captured
+        from DuckDB's ``staging`` table via ``fetch_arrow_table().schema``
+        so even all-NULL columns keep their declared type — callers pass
+        this schema to ``IcebergWriter.write_batch`` so PyIceberg never
+        sees a ``pa.null()`` column.
         """
         if not rows:
-            return []
+            return [], {}, schema
 
         with duckdb.connect(database=":memory:", config={
             "threads": self.threads,
             "memory_limit": self.memory_limit,
         }) as conn:
-            # Load rows into staging table
-            conn.execute("CREATE TABLE staging AS SELECT * FROM $1", [rows])
+            # Convert rows → Arrow table with explicit schema (Fix A),
+            # register as a view, then materialise into staging. This
+            # replaces the broken $1 binding (Fix B).
+            arrow_tbl = pa.Table.from_pylist(rows, schema=schema) if schema is not None \
+                else pa.Table.from_pylist(rows)
+            conn.register("rows_view", arrow_tbl)
+            conn.execute("CREATE TABLE staging AS SELECT * FROM rows_view")
 
             child_tables: dict[str, list[dict]] = {}
 
@@ -97,10 +118,14 @@ class DuckDBTransformEngine:
                     log.exception("Transform step failed: %s", step)
                     raise
 
-            # Return transformed rows
-            transformed = conn.execute("SELECT * FROM staging").df().to_dict(orient="records")
+            # Capture the transformed schema from DuckDB's staging table so
+            # all-NULL columns retain their declared type (Fix A). Use
+            # fetch_arrow_table() to avoid pandas round-tripping the types.
+            arrow_out = conn.execute("SELECT * FROM staging").fetch_arrow_table()
+            transformed_schema = arrow_out.schema
+            transformed = arrow_out.to_pylist()
 
-        return transformed, child_tables
+        return transformed, child_tables, transformed_schema
 
 
 # ─── Transform step implementations ──────────────────────────────────────────
@@ -160,23 +185,33 @@ def _apply_math_op(conn, step, **_):
 
 
 def _apply_date_op(conn, step, **_):
-    """Type 4: Date/time operations — extract parts, arithmetic, formatting."""
+    """Type 4: Date/time operations — extract parts, arithmetic, formatting.
+
+    v1.2.22 Fix B2: cast the input column to TIMESTAMP before applying date
+    functions — DuckDB's ``year()``/``month()``/etc. do not accept VARCHAR,
+    so a string column would raise ``Binder Error: No function matches the
+    given name and argument types 'year(VARCHAR)'``.
+    """
     col = step["column"]
     op = step.get("operation", "year")
     out = step.get("output_column", f"{col}_{op}")
     extra = step.get("extra", {})
 
+    # Cast the source column to TIMESTAMP so every date function works
+    # regardless of whether the source column is VARCHAR, DATE, or TIMESTAMP.
+    col_ts = f"CAST({col} AS TIMESTAMP)"
+
     op_expr = {
-        "year":        f"year({col})",
-        "month":       f"month({col})",
-        "day":         f"dayofmonth({col})",
-        "hour":        f"hour({col})",
-        "minute":      f"minute({col})",
-        "epoch":       f"epoch({col})",
-        "date_format": f"strftime('{extra.get('format', '%Y-%m-%d')}', {col})",
-        "date_add":    f"{col} + INTERVAL '{extra.get('value', 1)}' {extra.get('unit', 'DAY')}",
-        "date_diff":   f"datediff('{extra.get('unit', 'day')}', {extra.get('other', col)}, {col})",
-    }.get(op, f"year({col})")
+        "year":        f"year({col_ts})",
+        "month":       f"month({col_ts})",
+        "day":         f"dayofmonth({col_ts})",
+        "hour":        f"hour({col_ts})",
+        "minute":      f"minute({col_ts})",
+        "epoch":       f"epoch({col_ts})",
+        "date_format": f"strftime('{extra.get('format', '%Y-%m-%d')}', {col_ts})",
+        "date_add":    f"{col_ts} + INTERVAL '{extra.get('value', 1)}' {extra.get('unit', 'DAY')}",
+        "date_diff":   f"datediff('{extra.get('unit', 'day')}', CAST({extra.get('other', col)} AS TIMESTAMP), {col_ts})",
+    }.get(op, f"year({col_ts})")
 
     conn.execute(f"ALTER TABLE staging ADD COLUMN IF NOT EXISTS {out} VARCHAR")
     conn.execute(f"UPDATE staging SET {out} = CAST({op_expr} AS VARCHAR)")
@@ -218,19 +253,35 @@ def _apply_json_flatten_child(conn, step, **_):
     """
     Type 7: Explode JSON array into a separate child table.
     Returns child rows separately — caller writes them to a different destination table.
+
+    v1.2.22 Fix B2: the previous code used
+    ``unnest(from_json(parent.{col}, '[]'))`` which raised
+    ``Binder Error: Too many values in array of JSON structure`` because
+    the ``'[]'`` type hint tells DuckDB the JSON is an empty array, not a
+    list of values. We now parse the JSON as a JSON array and use
+    ``json_array_elements`` (or ``unnest`` on the parsed array) which
+    correctly explodes each element.
     """
     col = step["column"]
     child_table_name = step.get("child_table", f"{col}_items")
     pk_col = step.get("parent_pk", "id")
 
-    # Unnest JSON array; DuckDB UNNEST handles this natively
+    # Parse the JSON string as a JSON array, then cast to JSON[] and unnest.
+    # `json_extract(col, '$')` returns a JSON-typed value; casting it to
+    # `JSON[]` gives a list that `unnest()` can explode. Items come out as
+    # JSON-quoted strings (e.g. `'"a"'`) so we unquote string elements via
+    # `json_extract_string(item, '$')` when the item is a JSON string.
     child_rows = conn.execute(f"""
         SELECT
             parent.{pk_col} AS parent_{pk_col},
-            unnest(from_json(parent.{col}, '[]')) AS item
+            CASE
+                WHEN json_type(unnest(CAST(json_extract(parent.{col}, '$') AS JSON[]))) = 'VARCHAR'
+                THEN json_extract_string(unnest(CAST(json_extract(parent.{col}, '$') AS JSON[])), '$')
+                ELSE CAST(unnest(CAST(json_extract(parent.{col}, '$') AS JSON[])) AS VARCHAR)
+            END AS item
         FROM staging AS parent
         WHERE parent.{col} IS NOT NULL AND parent.{col} != 'null'
-    """).df().to_dict(orient="records")
+    """).fetch_arrow_table().to_pylist()
 
     return {"child_table": child_rows, "child_table_name": child_table_name}
 
@@ -250,7 +301,10 @@ def _apply_mask(conn, step, **_):
             END
         """
     elif strategy == "hash":
-        expr = f"sha256({col}::BLOB)::VARCHAR"
+        # v1.2.22 Fix B2: DuckDB's sha256() takes VARCHAR (not BLOB) and
+        # returns a hex VARCHAR. The old `sha256({col}::BLOB)::VARCHAR`
+        # raised ``Binder Error: No function matches 'sha256(BLOB)'``.
+        expr = f"sha256({col}::VARCHAR)::VARCHAR"
     elif strategy == "null":
         expr = "NULL"
     elif strategy == "first4":
@@ -314,7 +368,12 @@ def _apply_udf(conn, step, udf_registry_url: str = "", **_):
     fn = namespace[fn_name]
 
     py_type_map = {"string": str, "int": int, "long": int, "double": float, "boolean": bool}
-    duckdb.create_function(fn_name, fn, return_type=py_type_map.get(return_type, str))
+    # v1.2.22 Bug B2: DuckDB UDFs must be registered on the *connection*
+    # (`conn.create_function`), not on the `duckdb` module — the module-level
+    # helper returns a function object that is never attached to the in-memory
+    # connection, so the subsequent `UPDATE staging SET ... = fn_name(...)`
+    # raised `CatalogException: Table Function "fn_name" not found`.
+    conn.create_function(fn_name, fn, return_type=py_type_map.get(return_type, str))
 
     args_str = ", ".join(args) if args else ""
     conn.execute(f"ALTER TABLE staging ADD COLUMN IF NOT EXISTS {out} {duck_type}")

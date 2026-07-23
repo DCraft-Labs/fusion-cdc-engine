@@ -45,6 +45,12 @@ jobs:
           python -m pytest \
             tests/integration/test_connection_lifecycle.py \
             -q --noconftest -p no:cacheprovider
+      - name: Transform-worker unit tests (v1.2.22 Bug A + Bug B + Fix C)
+        run: |
+          python -m pip install --quiet pyarrow==16.0.0 duckdb==0.10.3
+          python -m pytest \
+            transform-worker/tests/ \
+            -q -p no:cacheprovider
 
   publish:
     name: publish-${{ matrix.name }}

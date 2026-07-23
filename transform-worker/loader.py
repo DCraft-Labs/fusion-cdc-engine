@@ -10,6 +10,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 import psycopg2
+import pyarrow as pa
 import redis
 
 if TYPE_CHECKING:
@@ -169,6 +170,23 @@ class InitialLoadTask:
         log.info("InitialLoad connection=%s table=%s.%s pk=%s chunk_size=%d dest=%s",
                  connection_id, source_schema, source_table, pk_col, chunk_size, connector_type)
 
+        # ── v1.2.22 Bug A fix / Fix C1: fetch the source schema ONCE per
+        # stream and reuse it for every chunk. This (a) gives all-NULL
+        # columns their declared type so PyIceberg never sees pa.null(),
+        # and (b) removes the per-chunk type-inference compute waste that
+        # was blocking the source DB during the 118M-row load.
+        cached_source_schema: "pa.Schema | None" = None
+        if connector_type == "iceberg":
+            try:
+                from iceberg_writer import _get_source_schema
+                cached_source_schema = _get_source_schema(source, source_schema, source_table)
+                log.info("InitialLoad connection=%s fetched source schema (%d cols) — will reuse for all chunks",
+                         connection_id, len(cached_source_schema))
+            except Exception:
+                log.exception("InitialLoad connection=%s _get_source_schema failed — falling back to per-chunk inference (Bug A may recur)",
+                              connection_id)
+                cached_source_schema = None
+
         # ── Resume: fetch the last checkpoint for this stream ──────────────
         last_pk = None
         chunk_seq = 0
@@ -186,6 +204,12 @@ class InitialLoadTask:
                      connection_id, stream_id, chunk_seq, last_pk, prior_rows)
 
         total_rows = prior_rows
+        # v1.2.22 Fix C4: stream, don't accumulate. Each chunk is converted to
+        # Arrow, written to the destination, checkpointed, then released.
+        # The transformed schema is captured from the first chunk (via
+        # DuckDB's staging table) and reused for every subsequent chunk so
+        # IcebergWriter never re-infers types.
+        cached_transformed_schema: "pa.Schema | None" = None
         # ── PK-bounded chunk loop ───────────────────────────────────────────
         while not STOP_EVENT.is_set():
             rows = self._fetch_chunk(source, source_schema, source_table,
@@ -197,13 +221,19 @@ class InitialLoadTask:
 
             # Apply transforms
             if steps:
-                transformed, child_tables = self.engine.execute_pipeline(rows, steps)
+                transformed, child_tables, transformed_schema = self.engine.execute_pipeline(
+                    rows, steps, schema=cached_source_schema,
+                )
+                if cached_transformed_schema is None and transformed_schema is not None:
+                    cached_transformed_schema = transformed_schema
             else:
                 transformed, child_tables = rows, {}
+                transformed_schema = cached_source_schema
 
             # Write to destination
             if connector_type == "iceberg":
-                rows_written = self._write_to_iceberg(transformed, dest, dest_table)
+                rows_written = self._write_to_iceberg(transformed, dest, dest_table,
+                                                       schema=cached_transformed_schema or cached_source_schema)
                 for child_name, child_rows in child_tables.items():
                     if child_rows:
                         self._write_to_iceberg(child_rows, dest, child_name)
@@ -239,6 +269,9 @@ class InitialLoadTask:
             if len(rows) < chunk_size:
                 break
 
+            # Fix C4: release the chunk's memory before fetching the next.
+            del rows, transformed, child_tables
+
         if STOP_EVENT.is_set():
             log.warning("InitialLoad connection=%s stopped mid-load after chunk %d — checkpoint saved, will resume on restart",
                         connection_id, chunk_seq)
@@ -251,12 +284,17 @@ class InitialLoadTask:
         log.info("InitialLoad connection=%s DONE — %d rows across %d chunks",
                  connection_id, total_rows, chunk_seq)
 
-    def _write_to_iceberg(self, rows: list[dict], dest: dict, table_name: str) -> int:
-        """Write rows to Iceberg via PyIceberg (DuckDB lake path)."""
+    def _write_to_iceberg(self, rows: list[dict], dest: dict, table_name: str,
+                          schema: "pa.Schema | None" = None) -> int:
+        """Write rows to Iceberg via PyIceberg (DuckDB lake path).
+
+        v1.2.22 Bug A fix: ``schema`` is the explicit source/transformed
+        schema so all-NULL columns keep their declared type.
+        """
         from iceberg_writer import IcebergWriter
         dest_config = dest.get("connection_config") or dest.get("config") or dest
         writer = IcebergWriter(dest_config)
-        return writer.write_batch(rows, table_name=table_name)
+        return writer.write_batch(rows, table_name=table_name, schema=schema)
 
     def _fetch_chunk(self, source: dict, schema_name: str, table_name: str,
                     pk_col: str, last_pk, chunk_size: int, ctype: str) -> list[dict]:
@@ -309,12 +347,21 @@ class InitialLoadTask:
             sql = (f"SELECT * FROM {qualified} WHERE {pk_q} > %s "
                    f"ORDER BY {pk_q} ASC LIMIT %s")
             params = (last_pk, chunk_size)
+        # v1.2.22 Fix C3: READ ONLY + autocommit so we never hold a long
+        # transaction open across the chunk write to the destination (which
+        # was blocking the source DB during the 118M-row load).
         with psycopg2.connect(host=host, port=port, dbname=database,
                               user=user, password=password,
-                              connect_timeout=10) as conn:
+                              connect_timeout=10,
+                              application_name="fusion-cdc-initial-load") as conn:
+            conn.autocommit = True
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, params)
-                return [dict(r) for r in cur.fetchall()]
+                cur.execute("BEGIN READ ONLY")
+                try:
+                    cur.execute(sql, params)
+                    return [dict(r) for r in cur.fetchall()]
+                finally:
+                    cur.execute("COMMIT")
 
     def _fetch_mysql_chunk(self, host, port, database, user, password,
                            schema_name, table_name, pk_col, last_pk, chunk_size) -> list[dict]:
@@ -330,10 +377,13 @@ class InitialLoadTask:
             sql = (f"SELECT * FROM {qualified} WHERE {pk_q} > %s "
                    f"ORDER BY {pk_q} ASC LIMIT %s")
             params = (last_pk, chunk_size)
+        # v1.2.22 Fix C3: autocommit=True so the chunk SELECT does not start
+        # a transaction that is held open across the destination write.
         with pymysql.connect(host=host, port=int(port), database=database,
                              user=user, password=password,
                              cursorclass=pymysql.cursors.DictCursor,
-                             connect_timeout=10) as conn:
+                             connect_timeout=10,
+                             autocommit=True) as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 return list(cur.fetchall())
@@ -480,6 +530,8 @@ class CDCTransformTask:
         schema = task.get("dest_schema", "dw")
         table = task.get("dest_table", "data")
         pk_col = task.get("primary_key", "id")
+        source = task.get("source") or {}
+        source_schema_name = task.get("source_schema") or ""
 
         # Derive the destination DSN. Prefer an explicit dest_dsn on the task
         # (legacy path); otherwise build it from the destination block's
@@ -501,15 +553,32 @@ class CDCTransformTask:
         if not events:
             return
 
+        # v1.2.22 Bug A fix / Fix C1: fetch the source schema ONCE per task
+        # (not per event) and reuse it for every batch. CDC tasks are short
+        # so this is a single round-trip to information_schema per task.
+        cached_source_schema: "pa.Schema | None" = None
+        if connector_type == "iceberg":
+            try:
+                from iceberg_writer import _get_source_schema
+                cached_source_schema = _get_source_schema(source, source_schema_name, table)
+            except Exception:
+                log.exception("CDCTransform connection=%s _get_source_schema failed — falling back to per-batch inference",
+                              connection_id)
+                cached_source_schema = None
+
         # Separate INSERT/UPDATE rows from DELETEs
         to_upsert = [e["after"] for e in events if e.get("op") in ("INSERT", "UPDATE") and e.get("after")]
         to_delete_pks = [e["before"][pk_col] for e in events if e.get("op") == "DELETE" and e.get("before")]
 
+        cached_transformed_schema: "pa.Schema | None" = None
         if to_upsert and steps:
-            to_upsert, _ = self.engine.execute_pipeline(to_upsert, steps)
+            to_upsert, _, cached_transformed_schema = self.engine.execute_pipeline(
+                to_upsert, steps, schema=cached_source_schema,
+            )
 
         if connector_type == "iceberg":
-            self._apply_to_iceberg(to_upsert, to_delete_pks, dest, table, pk_col)
+            self._apply_to_iceberg(to_upsert, to_delete_pks, dest, table, pk_col,
+                                   schema=cached_transformed_schema or cached_source_schema)
         elif dest_dsn:
             self._upsert(to_upsert, to_delete_pks, dest_dsn, schema, table, pk_col)
         else:
@@ -521,13 +590,15 @@ class CDCTransformTask:
             )
 
     def _apply_to_iceberg(self, rows: list[dict], delete_pks: list,
-                          dest: dict, table: str, pk_col: str):
+                          dest: dict, table: str, pk_col: str,
+                          schema: "pa.Schema | None" = None):
         from iceberg_writer import IcebergWriter
         dest_config = dest.get("connection_config") or dest.get("config") or dest
         identifier_fields = dest_config.get("identifier_fields") or [pk_col]
         writer = IcebergWriter(dest_config)
         if rows:
-            writer.upsert(rows, table_name=table, identifier_fields=identifier_fields)
+            writer.upsert(rows, table_name=table, identifier_fields=identifier_fields,
+                          schema=schema)
         if delete_pks:
             writer.delete(table_name=table,
                           identifier_fields=identifier_fields,
