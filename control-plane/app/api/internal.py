@@ -966,16 +966,25 @@ def upsert_load_checkpoint(
     _token: str = Depends(_verify_worker_token),
 ) -> LoadCheckpointResponse:
     """Upsert a row into ``initial_load_checkpoints`` for the given
-    (connection_id, stream_id) pair.
+    (connection_id, stream_id, chunk_seq) composite key.
 
-    If a row already exists for the stream it is updated (rows_written is
-    incremented, status is set to the reported state); otherwise a new row is
-    inserted. This lets the transform-worker's InitialLoadTask report chunk
-    progress without needing a separate data-proxy round-trip.
+    v1.2.26: the key is now composite — ``chunk_seq`` is the partition index
+    (0..K-1) of the multi-pod intra-table parallel load. Each of the K
+    concurrent pods reports under its own ``chunk_seq`` so they do not stomp
+    a single shared row. When a pod reports ``state="done"`` for its range,
+    the endpoint checks whether ALL K ranges for the stream are completed
+    and, if so, sets ``connection.initial_load_completed = True`` (the
+    connection's overall initial load is done only when every partition is
+    done).
+
+    If a row already exists for the (connection, stream, chunk_seq) triple
+    it is updated (rows_written is incremented, status is set to the
+    reported state); otherwise a new row is inserted.
     """
     from datetime import datetime, timezone
     from uuid import UUID
     from app.models.monitoring import InitialLoadCheckpoint
+    from app.models.connection import Connection as Conn
 
     try:
         conn_uuid = UUID(payload.connection_id)
@@ -998,6 +1007,7 @@ def upsert_load_checkpoint(
             .filter(
                 InitialLoadCheckpoint.connection_id == conn_uuid,
                 InitialLoadCheckpoint.stream_id == stream_uuid,
+                InitialLoadCheckpoint.chunk_seq == payload.chunk_seq,
             )
             .first()
         )
@@ -1023,6 +1033,7 @@ def upsert_load_checkpoint(
         if status == "completed":
             existing.completed_at = now
         db.commit()
+        _maybe_mark_initial_load_completed(db, conn_uuid, stream_uuid)
         return LoadCheckpointResponse(ok=True, upserted=1)
 
     db.add(InitialLoadCheckpoint(
@@ -1040,7 +1051,59 @@ def upsert_load_checkpoint(
         total_chunks=payload.total_chunks,
     ))
     db.commit()
+    _maybe_mark_initial_load_completed(db, conn_uuid, stream_uuid)
     return LoadCheckpointResponse(ok=True, upserted=1)
+
+
+def _maybe_mark_initial_load_completed(db: Session, conn_uuid, stream_uuid) -> None:
+    """v1.2.26: after a checkpoint upsert, check whether ALL K partitions
+    (chunk_seq 0..K-1) for this stream have reached ``status='completed'``.
+    If so, set ``connection.initial_load_completed = True`` (and
+    ``initial_load_completed_at``) so the UI / scheduler treats the
+    connection's initial load as finished.
+
+    ``K`` is read from ``max(total_chunks)`` across the stream's checkpoint
+    rows (the producer stamps every range with ``total_chunks = K``). The
+    check requires both (a) at least K rows exist (all K pods have reported
+    at least once) and (b) all K rows are ``completed`` — this avoids
+    prematurely firing when only some pods have started.
+    """
+    from datetime import datetime, timezone
+    from app.models.monitoring import InitialLoadCheckpoint
+    from app.models.connection import Connection as Conn
+
+    if stream_uuid is None:
+        return
+    try:
+        rows = (
+            db.query(InitialLoadCheckpoint)
+            .filter(
+                InitialLoadCheckpoint.connection_id == conn_uuid,
+                InitialLoadCheckpoint.stream_id == stream_uuid,
+            )
+            .all()
+        )
+        if not rows:
+            return
+        # K = max(total_chunks) across rows (default 1 when unset — legacy).
+        k_values = [int(r.total_chunks or 1) for r in rows]
+        k = max(k_values) if k_values else 1
+        if len(rows) < k:
+            return  # not all K pods have reported yet
+        completed = sum(1 for r in rows if (r.status or "") == "completed")
+        if completed >= k:
+            conn = db.query(Conn).filter(Conn.connection_id == conn_uuid).first()
+            if conn and not conn.initial_load_completed:
+                conn.initial_load_completed = True
+                conn.initial_load_completed_at = datetime.now(timezone.utc)
+                db.commit()
+                log.info(
+                    "initial_load_completed: connection=%s stream=%s — all %d partitions done",
+                    conn_uuid, stream_uuid, k,
+                )
+    except Exception:
+        log.warning("_maybe_mark_initial_load_completed: failed for connection=%s stream=%s",
+                    conn_uuid, stream_uuid, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,20 +1126,24 @@ class LoadCheckpointSnapshot(PydanticModel):
 
 
 @router.get(
-    "/load-checkpoints/last/{connection_id}/{stream_id}",
+    "/load-checkpoints/last/{connection_id}/{stream_id}/{chunk_seq}",
     response_model=LoadCheckpointSnapshot,
-    summary="Fetch last initial-load checkpoint for resume (v1.2.17)",
+    summary="Fetch last initial-load checkpoint for a partition (v1.2.26 composite key)",
 )
 def get_last_load_checkpoint(
     connection_id: str,
     stream_id: str,
+    chunk_seq: int,
     db: Session = Depends(get_db),
     _token: str = Depends(_verify_worker_token),
 ) -> LoadCheckpointSnapshot:
-    """Return the latest ``initial_load_checkpoints`` row for the given
-    (connection_id, stream_id) pair. The transform-worker calls this at
-    the start of an ``initial_load`` task to decide whether to resume from
-    ``last_pk`` or start from the beginning.
+    """Return the ``initial_load_checkpoints`` row for the given
+    (connection_id, stream_id, chunk_seq) composite key. The transform-worker
+    calls this at the start of an ``initial_load`` task to decide whether to
+    resume from ``last_pk`` or start from the partition's lower bound.
+
+    v1.2.26: ``chunk_seq`` is the partition index (0..K-1) of the multi-pod
+    intra-table parallel load. Each pod resumes its own range's checkpoint.
     """
     from uuid import UUID
     from app.models.monitoring import InitialLoadCheckpoint
@@ -1095,9 +1162,73 @@ def get_last_load_checkpoint(
         .filter(
             InitialLoadCheckpoint.connection_id == conn_uuid,
             InitialLoadCheckpoint.stream_id == stream_uuid,
+            InitialLoadCheckpoint.chunk_seq == chunk_seq,
         )
         .first()
     )
+    if row is None:
+        raise HTTPException(status_code=404, detail="no checkpoint for this stream/chunk_seq")
+    return LoadCheckpointSnapshot(
+        connection_id=str(row.connection_id),
+        stream_id=str(row.stream_id),
+        source_table=row.source_table,
+        status=row.status,
+        rows_written=row.rows_written or 0,
+        chunk_seq=row.chunk_seq or 0,
+        last_pk=row.last_pk,
+        current_chunk=row.current_chunk or 0,
+        total_chunks=row.total_chunks,
+    )
+
+
+@router.get(
+    "/load-checkpoints/last/{connection_id}/{stream_id}",
+    response_model=LoadCheckpointSnapshot,
+    summary="Fetch last initial-load checkpoint for resume (v1.2.17 legacy)",
+)
+def get_last_load_checkpoint_legacy(
+    connection_id: str,
+    stream_id: str,
+    db: Session = Depends(get_db),
+    _token: str = Depends(_verify_worker_token),
+) -> LoadCheckpointSnapshot:
+    """Legacy v1.2.17 endpoint — returns the chunk_seq=0 row for the given
+    (connection_id, stream_id) pair. Kept for backward compatibility with
+    older workers; the v1.2.26 worker uses the 3-segment composite-key
+    route above.
+    """
+    from uuid import UUID
+    from app.models.monitoring import InitialLoadCheckpoint
+
+    try:
+        conn_uuid = UUID(connection_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="connection_id must be a valid UUID")
+    try:
+        stream_uuid = UUID(stream_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="stream_id must be a valid UUID")
+
+    row = (
+        db.query(InitialLoadCheckpoint)
+        .filter(
+            InitialLoadCheckpoint.connection_id == conn_uuid,
+            InitialLoadCheckpoint.stream_id == stream_uuid,
+            InitialLoadCheckpoint.chunk_seq == 0,
+        )
+        .first()
+    )
+    if row is None:
+        # Fall back to the first row for the stream (pre-v1.2.26 single-row data).
+        row = (
+            db.query(InitialLoadCheckpoint)
+            .filter(
+                InitialLoadCheckpoint.connection_id == conn_uuid,
+                InitialLoadCheckpoint.stream_id == stream_uuid,
+            )
+            .order_by(InitialLoadCheckpoint.chunk_seq.asc())
+            .first()
+        )
     if row is None:
         raise HTTPException(status_code=404, detail="no checkpoint for this stream")
     return LoadCheckpointSnapshot(

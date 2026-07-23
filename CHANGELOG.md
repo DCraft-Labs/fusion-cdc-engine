@@ -4,6 +4,88 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.26] — 2026-07-23
+
+### Initial Load — Multi-pod Parallelism (Task 1, the big one — Section 3.5)
+- **Intra-table parallelism (Task 1a/1b):** the producer
+  (`connections._enqueue_initial_load_tasks`) now partitions each stream's
+  `[min(pk), max(pk)]` range into `K` disjoint sub-ranges (K =
+  `resource_limits.parallelism`, clamped to [1, 16], default 4) and enqueues
+  `K` independent `initial_load` tasks — one per range — each stamped with
+  `chunk_seq` (0..K-1), `pk_start`, `pk_end`, and `total_chunks=K`. KEDA
+  then scales the transform-worker to K concurrent pods, giving true
+  intra-table parallelism (a 118M-row table with K=16 loads in ~1/16 the
+  wall-clock time, bounded by the slowest partition).
+  - Partitioning strategy: `SELECT MIN(pk), MAX(pk), COUNT(*)` (one query);
+    for tables > 1M rows, approximate-percentile PK sampling
+    (`SELECT pk ... LIMIT 1 OFFSET o` at K-1 evenly-spaced offsets) builds
+    robust split points resilient to PK gaps from deletes; for smaller
+    tables, a naive even split of the numeric range. MongoDB uses K=1
+    (ObjectId is non-numeric; inter-table parallelism still applies).
+  - Pure helpers extracted to `control-plane/app/services/partitioning.py`
+    (single source of truth, unit-tested).
+- **Worker reads partition bounds (Task 1c):** `InitialLoadTask.run` reads
+  `pk_start`/`pk_end`/`chunk_seq`/`total_chunks` from the task payload,
+  resumes from `max(last_pk, pk_start)`, and the per-DB fetchers
+  (`_fetch_pg_chunk`, `_fetch_mysql_chunk`) now apply `AND pk <= pk_end` so
+  each pod's fetches stay within its disjoint range — this is the
+  correctness invariant (no row fetched by two pods, no row skipped).
+- **Composite checkpoint key (Task 1c):** checkpoint upsert/lookup now keys
+  on `(connection_id, stream_id, chunk_seq)` so K concurrent pods each
+  write their own checkpoint row (no stomping). New 3-segment route
+  `GET /internal/load-checkpoints/last/{connection_id}/{stream_id}/{chunk_seq}`;
+  the legacy 2-segment route is kept for backward compat (returns chunk_seq=0).
+- **Connection completion aggregation:** `upsert_load_checkpoint` now sets
+  `connection.initial_load_completed = True` only when ALL K partitions
+  report `state=done` (K read from `max(total_chunks)` across the stream's
+  checkpoint rows), so the connection's overall initial load is marked
+  complete only when every partition finishes.
+
+### Initial Load — Performance (Tasks 4, 5, 7)
+- **Adaptive chunk sizing (Task 4):** the worker auto-tunes the chunk size
+  at runtime from observed per-chunk latency — doubled after
+  `ADAPTIVE_FAST_STREAK` (5) consecutive chunks under
+  `ADAPTIVE_FAST_LATENCY_S` (2s), halved after `ADAPTIVE_SLOW_STREAK` (2)
+  consecutive chunks over `ADAPTIVE_SLOW_LATENCY_S` (30s), bounded by
+  `[ADAPTIVE_MIN_CHUNK=1000, ADAPTIVE_MAX_CHUNK=100000]`. The producer's
+  configured `chunk_size` is the starting point (capped at MAX, never
+  clamped UP to MIN) so an operator who sets a small chunk_size gets it.
+  All tunable via env vars.
+- **Fetch/write overlap (Task 5):** a background thread prefetches chunk N+1
+  from the source DB while the main thread converts + writes chunk N, hiding
+  read latency behind write latency. Bounded queue (`PIPELINE_QUEUE_SIZE=2`)
+  keeps memory bounded to ~2 chunks.
+- **Commit batching (Task 7):** for Iceberg destinations, `N` chunks
+  (`INITIAL_LOAD_COMMIT_BATCH`, default 1 = legacy) are buffered into a
+  single `table.append` (one commit), reducing the commit count and the
+  manifest-accumulation cost. The final partial batch is always flushed.
+  Concurrent Iceberg writes from sibling pods are safe (PyIceberg catalog
+  commit is an optimistic CAS with retry).
+
+### UI (Task 3)
+- **Max parallel workers field:** added a "Max parallel workers
+  (initial-load intra-table parallelism, 1-16)" input to the
+  CreateConnectionWizard and EditConnectionPage, mapped to
+  `resource_limits.parallelism`. Default 4.
+
+### Tests
+- `control-plane/tests/test_partitioning.py` — covers `naive_numeric_ranges`,
+  `ranges_from_splits` (disjoint-cover invariant), and `clamp_parallelism`.
+- `transform-worker/tests/test_initial_load_checkpoint.py` — covers the
+  composite-key wire format (`_report_checkpoint` sends `chunk_seq` +
+  `total_chunks`; `_get_last_checkpoint` hits the 3-segment URL).
+
+### Deferred (documented in REPORT_v126.md)
+- **Task 6 (native DuckDB bulk export):** researched; not implemented this
+  release (risk to correctness outweighs the win for the current scale).
+- **Task 7 items 3-4 (disable Iceberg snapshot-inheritance checks,
+  fast-append):** not exposed by PyIceberg 0.7.1; deferred to the PyIceberg
+  upgrade (tracked separately — do NOT upgrade in this release).
+
+### Version
+- `control-plane/app/main.py` API version + `helm/fusion-cdc/Chart.yaml`
+  bumped to `1.2.26`.
+
 ## [1.2.25] — 2026-07-23
 
 ### Reliability

@@ -54,7 +54,7 @@ def test_get_source_schema_called_once_per_initial_load():
     ]
     call_count = {"n": 0}
 
-    def fake_fetch(source, schema, table, pk, last_pk, size, ctype):
+    def fake_fetch(source, schema, table, pk, last_pk, size, ctype, pk_end=None):
         if call_count["n"] < len(chunks):
             r = chunks[call_count["n"]]
             call_count["n"] += 1

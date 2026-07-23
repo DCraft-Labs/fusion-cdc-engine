@@ -412,6 +412,11 @@ export function CreateConnectionWizard() {
     generate_dag: false,
     max_events_sec: "",
     max_memory_mb: "",
+    // v1.2.26 Task 3: per-connection intra-table parallelism (K). Controls
+    // how many disjoint PK-range partitions the producer enqueues for each
+    // stream's initial load — KEDA then scales up to K concurrent pods.
+    // Default 4, range 1-16 (clamped server-side).
+    parallelism: "4",
   });
 
   const { data: sources = [] } = useQuery({ queryKey: ["sources"], queryFn: () => fetchList("/sources", "sources") });
@@ -555,10 +560,13 @@ export function CreateConnectionWizard() {
           };
         }),
         resource_limits:
-          config.max_events_sec || config.max_memory_mb
+          config.max_events_sec || config.max_memory_mb || config.parallelism
             ? {
                 max_events_sec: config.max_events_sec ? Number(config.max_events_sec) : undefined,
                 max_memory_mb: config.max_memory_mb ? Number(config.max_memory_mb) : undefined,
+                // v1.2.26: K = intra-table parallelism (number of PK-range
+                // partitions enqueued per stream for the initial load).
+                parallelism: config.parallelism ? Number(config.parallelism) : undefined,
               }
             : {},
         status: activateImmediately ? "active" : "draft",
@@ -913,6 +921,7 @@ export function CreateConnectionWizard() {
               <div className="mt-3 grid grid-cols-2 gap-4">
                 <div className="space-y-1"><label className="text-xs text-muted-foreground">Max events/sec</label><Input type="number" value={config.max_events_sec} onChange={(e) => setConfig({ ...config, max_events_sec: e.target.value })} placeholder="10000" /></div>
                 <div className="space-y-1"><label className="text-xs text-muted-foreground">Max memory (MB)</label><Input type="number" value={config.max_memory_mb} onChange={(e) => setConfig({ ...config, max_memory_mb: e.target.value })} placeholder="2048" /></div>
+                <div className="space-y-1 col-span-2"><label className="text-xs text-muted-foreground">Max parallel workers (initial-load intra-table parallelism, 1-16)</label><Input type="number" min={1} max={16} value={config.parallelism} onChange={(e) => setConfig({ ...config, parallelism: e.target.value })} placeholder="4" /></div>
               </div>
             </details>
           </CardContent>

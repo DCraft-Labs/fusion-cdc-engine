@@ -274,6 +274,9 @@ export function EditConnectionPage() {
     max_events_per_sec: "",
     max_memory_mb: "",
     max_workers: "",
+    // v1.2.26 Task 3: intra-table parallelism (K) — number of PK-range
+    // partitions enqueued per stream for the initial load.
+    parallelism: "",
   });
 
   const [editStreams, setEditStreams] = useState<EditStreamState[]>([]);
@@ -339,6 +342,7 @@ export function EditConnectionPage() {
         max_events_per_sec: String(connection.resource_limits?.max_events_per_sec ?? ""),
         max_memory_mb: String(connection.resource_limits?.max_memory_mb ?? ""),
         max_workers: String(connection.resource_limits?.max_workers ?? ""),
+        parallelism: String(connection.resource_limits?.parallelism ?? ""),
       });
     }
   }, [connection]);
@@ -446,6 +450,7 @@ export function EditConnectionPage() {
           max_events_per_sec: form.max_events_per_sec ? parseInt(form.max_events_per_sec) : undefined,
           max_memory_mb: form.max_memory_mb ? parseInt(form.max_memory_mb) : undefined,
           max_workers: form.max_workers ? parseInt(form.max_workers) : undefined,
+          parallelism: form.parallelism ? parseInt(form.parallelism) : undefined,
         },
       }),
     onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["connections", id] }); navigate(`/connections/${id}`); },
@@ -985,6 +990,11 @@ export function EditConnectionPage() {
                     <label className="text-sm font-medium">Max Workers</label>
                     <Input value={form.max_workers} onChange={(e) => setForm({ ...form, max_workers: e.target.value })} type="number" placeholder="4" />
                     <p className="text-xs text-muted-foreground">Parallel write workers</p>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Max Parallel Workers (initial load)</label>
+                    <Input value={form.parallelism} onChange={(e) => setForm({ ...form, parallelism: e.target.value })} type="number" min={1} max={16} placeholder="4" />
+                    <p className="text-xs text-muted-foreground">Intra-table PK-range partitions (1-16); KEDA scales pods to match</p>
                   </div>
                 </div>
                 <div className="flex gap-2 pt-4">

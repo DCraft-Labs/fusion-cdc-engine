@@ -1,5 +1,6 @@
 """Connections API endpoints"""
 
+import os
 from datetime import datetime, timedelta
 from typing import Optional, List
 from uuid import UUID
@@ -16,6 +17,7 @@ from app.models.source_destination import Source, Destination
 from app.models.connector import ConnectorDefinition
 from app.models.monitoring import ConnectionRun, CheckpointState, InitialLoadCheckpoint
 from app.services.audit_log import record_audit
+from app.services.partitioning import partition_pk_ranges
 from app.schemas.connection import (
     ConnectionCreate,
     ConnectionUpdate,
@@ -37,6 +39,27 @@ from app.schemas.connection import (
 )
 
 router = APIRouter()
+
+
+# ===========================
+# v1.2.26: Multi-pod INTRA-table parallelism config
+# ===========================
+# K = number of disjoint PK-range partitions enqueued per stream for the
+# initial load. KEDA then scales the transform-worker to ``maxReplicaCount``
+# pods so the K ranges are consumed concurrently by different pods (true
+# intra-table parallelism — see Task 1 in REPORT_v126.md). Configurable per
+# connection via ``resource_limits.parallelism`` (1..MAX_PARALLELISM) and
+# globally via the ``INITIAL_LOAD_DEFAULT_PARALLELISM`` env var.
+MAX_PARALLELISM = 16
+DEFAULT_PARALLELISM = max(1, min(MAX_PARALLELISM, int(os.environ.get(
+    "INITIAL_LOAD_DEFAULT_PARALLELISM", "4"))))
+# Tables above this row count use approximate-percentile PK sampling for
+# even row distribution across the K partitions; smaller tables use a naive
+# even split of the numeric [min,max] PK range (cheaper, fine when PKs are
+# dense).
+PARTITION_SAMPLE_THRESHOLD = 1_000_000
+# Default chunk size (rows per chunk within a single partition's PK range).
+DEFAULT_CHUNK_SIZE = int(os.environ.get("INITIAL_LOAD_CHUNK_SIZE", "10000"))
 
 
 # ===========================
@@ -393,6 +416,50 @@ def _dest_needs_transform_worker(dest_connector_type: str, snapshot_mode: str) -
     return True
 
 
+def _connection_parallelism(connection: Connection) -> int:
+    """v1.2.26: resolve the per-connection intra-table parallelism (K).
+
+    Reads ``connection.resource_limits["parallelism"]`` (set by the UI
+    "Max parallel workers" field); falls back to the
+    ``INITIAL_LOAD_DEFAULT_PARALLELISM`` env var (default 4). Clamped to
+    [1, MAX_PARALLELISM]. K=1 means a single task per stream (legacy
+    v1.2.25 behaviour) — no intra-table parallelism.
+    """
+    rl = connection.resource_limits or {}
+    if isinstance(rl, str):
+        try:
+            import json as _json
+            rl = _json.loads(rl) if rl else {}
+        except Exception:
+            rl = {}
+    try:
+        k = int(rl.get("parallelism") or DEFAULT_PARALLELISM)
+    except (TypeError, ValueError):
+        k = DEFAULT_PARALLELISM
+    return max(1, min(MAX_PARALLELISM, k))
+
+
+def _connection_chunk_size(connection: Connection) -> int:
+    """v1.2.26 Task 4: per-connection chunk size override (rows per chunk).
+
+    Reads ``connection.resource_limits["chunk_size"]``; falls back to the
+    ``INITIAL_LOAD_CHUNK_SIZE`` env var (default 10000). The worker's
+    adaptive chunk sizer may further adjust this at runtime.
+    """
+    rl = connection.resource_limits or {}
+    if isinstance(rl, str):
+        try:
+            import json as _json
+            rl = _json.loads(rl) if rl else {}
+        except Exception:
+            rl = {}
+    try:
+        cs = int(rl.get("chunk_size") or DEFAULT_CHUNK_SIZE)
+    except (TypeError, ValueError):
+        cs = DEFAULT_CHUNK_SIZE
+    return max(1, cs)
+
+
 def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
     """Enqueue ``initial_load`` tasks to ``fusion:transforms:high`` when the
     connection's destination is configured with ``snapshot_mode=transform_worker``.
@@ -532,43 +599,74 @@ def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> int:
         high_queue = os.environ.get("HIGH_PRIORITY_QUEUE", "fusion:transforms:high")
 
         pushed = 0
+        # v1.2.26 Task 1: per-connection intra-table parallelism (K) and
+        # chunk size. K partitions are enqueued per stream so KEDA can scale
+        # the transform-worker to K concurrent pods, each consuming one
+        # disjoint PK range of the same table (true intra-table parallelism).
+        k = _connection_parallelism(connection)
+        chunk_size = _connection_chunk_size(connection)
+        src_connector_type = (source.connector_definition.connector_type
+                              if source.connector_definition else "postgres")
         for stream in streams:
             to = stream.transform_overrides or {}
             steps = to.get("transforms", []) if isinstance(to, dict) else []
             pk = stream.primary_keys
             if isinstance(pk, list):
-                pk_str = ",".join(str(k) for k in pk) if pk else "id"
+                pk_str = ",".join(str(kc) for kc in pk) if pk else "id"
             elif isinstance(pk, dict):
-                pk_str = ",".join(str(k) for k in pk.keys()) if pk else "id"
+                pk_str = ",".join(str(kc) for kc in pk.keys()) if pk else "id"
             else:
                 pk_str = str(pk) if pk else "id"
-            task = {
-                "type": "initial_load",
-                "task_id": f"il-{connection.connection_id}-{stream.stream_id}",
-                "connection_id": str(connection.connection_id),
-                "stream_id": str(stream.stream_id),
-                "chunk_seq": 0,
-                "pk_start": None,
-                "pk_end": None,
-                # v1.2.17: PK-bounded chunk size (rows per chunk). The worker
-                # loops internally and resumes from last_pk on restart.
-                "chunk_size": int(os.environ.get("INITIAL_LOAD_CHUNK_SIZE", "10000")),
-                "transform_steps": steps,
-                "destination": dest_block,
-                "source": source_block,
-                "source_schema": stream.source_schema_name or "",
-                "source_table": stream.source_table_name,
-                "dest_schema": stream.destination_schema_name or "dw",
-                "dest_table": stream.destination_table_name or stream.source_table_name,
-                "primary_key": pk_str,
-            }
-            r.lpush(high_queue, _json.dumps(task))
-            pushed += 1
+            # First PK column drives the PK-bounded chunking (identity-style
+            # composite PKs). MongoDB chunks on the immutable _id field.
+            pk_col = str(pk_str).split(",")[0].strip() or "id"
+            if src_connector_type == "mongodb":
+                pk_col = "_id"
+            # v1.2.26 Task 1a: partition the table's [min(pk), max(pk)] range
+            # into K disjoint sub-ranges. Falls back to [(None, None)] (a
+            # single unbounded range) on error or when K<=1 — preserving the
+            # legacy v1.2.25 single-task-per-stream behaviour.
+            ranges = partition_pk_ranges(
+                source_block, stream.source_schema_name or "",
+                stream.source_table_name, pk_col, src_connector_type, k,
+            )
+            for seq, (pk_start, pk_end) in enumerate(ranges):
+                task = {
+                    "type": "initial_load",
+                    "task_id": f"il-{connection.connection_id}-{stream.stream_id}-{seq}",
+                    "connection_id": str(connection.connection_id),
+                    "stream_id": str(stream.stream_id),
+                    # v1.2.26: composite checkpoint key (connection_id,
+                    # stream_id, chunk_seq) — each of the K ranges checkpoints
+                    # under its own chunk_seq so concurrent pods do not stomp
+                    # the same row.
+                    "chunk_seq": seq,
+                    "pk_start": pk_start,
+                    "pk_end": pk_end,
+                    # v1.2.26: total number of ranges for this stream — the
+                    # control-plane uses this to decide when ALL ranges are
+                    # completed and the connection's initial load is done.
+                    "total_chunks": len(ranges),
+                    # v1.2.17: PK-bounded chunk size (rows per chunk). The
+                    # worker loops internally within [pk_start, pk_end] and
+                    # resumes from last_pk on restart.
+                    "chunk_size": chunk_size,
+                    "transform_steps": steps,
+                    "destination": dest_block,
+                    "source": source_block,
+                    "source_schema": stream.source_schema_name or "",
+                    "source_table": stream.source_table_name,
+                    "dest_schema": stream.destination_schema_name or "dw",
+                    "dest_table": stream.destination_table_name or stream.source_table_name,
+                    "primary_key": pk_str,
+                }
+                r.lpush(high_queue, _json.dumps(task))
+                pushed += 1
 
         log.info(
             "initial_load producer: enqueued %d task(s) for connection=%s "
-            "(snapshot_mode=transform_worker, queue=%s)",
-            pushed, connection.connection_id, high_queue,
+            "(snapshot_mode=transform_worker, queue=%s, parallelism=%d, chunk_size=%d)",
+            pushed, connection.connection_id, high_queue, k, chunk_size,
         )
         return pushed
     except Exception as exc:
