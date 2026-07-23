@@ -167,17 +167,20 @@ def test_trigger_dag_or_worker_calls_enqueue_initial_load():
     """
     src = (REPO_ROOT / "control-plane" / "app" / "api" / "connections.py").read_text(encoding="utf-8")
     # The call must appear inside _trigger_dag_or_worker's body. We find the
-    # function and check the call is present within its span.
+    # function and check the call is present within its span. v1.2.27: the
+    # function is now ``async def`` (partitioning is offloaded to a
+    # threadpool), so we match both ``def`` and ``async def`` prefixes.
     lines = src.splitlines()
     in_fn = False
     fn_lines = []
     for line in lines:
-        if line.startswith("def _trigger_dag_or_worker("):
+        if (line.startswith("def _trigger_dag_or_worker(")
+                or line.startswith("async def _trigger_dag_or_worker(")):
             in_fn = True
             fn_lines = [line]
             continue
         if in_fn:
-            if line.startswith("def ") or line.startswith("class "):
+            if line.startswith("def ") or line.startswith("async def ") or line.startswith("class "):
                 break
             fn_lines.append(line)
     fn_body = "\n".join(fn_lines)
