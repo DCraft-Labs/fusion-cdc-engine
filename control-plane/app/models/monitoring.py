@@ -344,6 +344,9 @@ class InitialLoadCheckpoint(BaseModel):
     status = Column(String(50), nullable=False, server_default=text("'running'::character varying"))
     started_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # v1.2.25 Bug 2.3: stamped on every chunk report so the UI can show
+    # "last progress N seconds ago" and detect stuck loads.
+    last_updated_at = Column(DateTime(timezone=True), nullable=True)
     error = Column(Text, nullable=True)
     # v1.2.17: PK-bounded chunked initial load resume state.
     # chunk_seq     — last completed chunk sequence (0 = no chunk done yet)

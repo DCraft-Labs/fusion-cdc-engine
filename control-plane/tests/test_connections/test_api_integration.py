@@ -454,7 +454,7 @@ class TestDeleteConnection:
             source_id=sample_source.source_id,
             destination_id=sample_destination.destination_id,
             sync_mode="cdc",
-            sync_frequency="manual",
+            schedule_cron="manual",
             status="draft",
             sub_tenant_id=sample_tenant,
             bank_id=uuid4(),
@@ -719,6 +719,58 @@ class TestScheduleConfiguration:
         data = response.json()
         assert data["schedule_config"]["sync_frequency"] == "manual"
 
+    def test_schedule_roundtrip_persists_to_schedule_cron(
+        self, client: TestClient, admin_headers: dict, sample_connection: Connection
+    ):
+        """v1.2.25 Bug 2.2 regression: POST /schedule with sync_frequency must
+        persist to the ORM schedule_cron column and survive a GET round-trip.
+
+        Before the fix, the endpoint set ``connection.sync_frequency`` which
+        does not exist on the ORM (the column is ``schedule_cron``), so the
+        value was silently dropped and GET /schedule returned None / 500.
+        """
+        payload = {"sync_frequency": "0 */6 * * *", "sync_enabled": True}
+
+        resp = client.post(
+            f"/api/v1/connections/{sample_connection.connection_id}/schedule",
+            json=payload,
+            headers=admin_headers,
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["schedule_config"]["sync_frequency"] == "0 */6 * * *"
+
+        # GET must return the same value (round-trip survives).
+        resp2 = client.get(
+            f"/api/v1/connections/{sample_connection.connection_id}/schedule",
+            headers=admin_headers,
+        )
+        assert resp2.status_code == 200, resp2.text
+        data2 = resp2.json()
+        assert data2["schedule_config"]["sync_frequency"] == "0 */6 * * *"
+
+    def test_resume_does_not_500_on_schedule_cron(
+        self, client: TestClient, admin_headers: dict, sample_connection: Connection
+    ):
+        """v1.2.25 Bug 2.2 regression: POST /{id}/resume must not 500 with
+        ``'Connection' object has no attribute 'sync_frequency'``.
+
+        Before the fix, resume read ``connection.sync_frequency`` which does
+        not exist on the ORM (the column is ``schedule_cron``).
+        """
+        # Activate first so resume is valid.
+        client.post(
+            f"/api/v1/connections/{sample_connection.connection_id}/activate",
+            json={"validate": False},
+            headers=admin_headers,
+        )
+        resp = client.post(
+            f"/api/v1/connections/{sample_connection.connection_id}/resume",
+            headers=admin_headers,
+        )
+        # Must not be a 500 (the old AttributeError surfaced as 500).
+        assert resp.status_code != 500, f"resume 500'd: {resp.text}"
+
 
 # ============================================================================
 # Test Connection Actions (POST /{id}/activate, pause, resume, trigger-sync)
@@ -744,7 +796,7 @@ class TestConnectionActions:
             source_id=sample_source.source_id,
             destination_id=sample_destination.destination_id,
             sync_mode="cdc",
-            sync_frequency="*/30 * * * *",
+            schedule_cron="*/30 * * * *",
             status="draft",
             sub_tenant_id=sample_tenant,
             bank_id=uuid4(),
@@ -811,7 +863,7 @@ class TestConnectionActions:
             source_id=sample_source.source_id,
             destination_id=sample_destination.destination_id,
             sync_mode="cdc",
-            sync_frequency="*/30 * * * *",
+            schedule_cron="*/30 * * * *",
             status="paused",
             sub_tenant_id=sample_tenant,
             bank_id=uuid4(),
@@ -881,7 +933,7 @@ class TestConnectionActions:
             source_id=sample_source.source_id,
             destination_id=sample_destination.destination_id,
             sync_mode="cdc",
-            sync_frequency="manual",
+            schedule_cron="manual",
             status="draft",
             sub_tenant_id=sample_tenant,
             bank_id=uuid4(),

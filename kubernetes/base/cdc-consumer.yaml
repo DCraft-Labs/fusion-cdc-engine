@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Fusion CDC Engine — CDC Consumer
-# Fast path: Kafka/Redis → destination Postgres (no transforms)
+# Fast path: Redis Streams → destination Postgres (no transforms)
 # KEDA-scaled on Redis stream pending entries. min=1, max=500.
 # ─────────────────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
@@ -52,11 +52,6 @@ spec:
                 configMapKeyRef:
                   name: fusion-config
                   key: REDIS_URL
-            - name: KAFKA_BOOTSTRAP_SERVERS
-              valueFrom:
-                configMapKeyRef:
-                  name: fusion-config
-                  key: KAFKA_BOOTSTRAP_SERVERS
             - name: ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:

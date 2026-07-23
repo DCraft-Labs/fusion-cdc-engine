@@ -60,6 +60,20 @@ def _check_redis() -> bool:
         return False
 
 
+def _dead_letter_count() -> int:
+    """v1.2.25 Task 6: count tasks in the dead-letter list.
+
+    Returns -1 when Redis is unreachable so the health endpoint can
+    distinguish "Redis down" from "0 dead-lettered tasks".
+    """
+    try:
+        import redis as redis_lib
+        r = redis_lib.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+        return int(r.llen("fusion:transforms:dead-letter"))
+    except Exception:
+        return -1
+
+
 def _check_db(db: Session) -> bool:
     """Try a trivial DB query. Returns True if reachable."""
     try:
@@ -69,41 +83,6 @@ def _check_db(db: Session) -> bool:
         return True
     except Exception:
         return False
-
-
-def _check_kafka() -> str:
-    """Probe the Kafka broker configured via KAFKA_BOOTSTRAP_SERVERS.
-
-    Returns one of:
-      - "healthy"        : broker reachable
-      - "unhealthy"      : KAFKA_BOOTSTRAP_SERVERS set but broker unreachable
-      - "not_configured" : KAFKA_BOOTSTRAP_SERVERS empty (Kafka not expected)
-
-    Never raises — the health endpoint must not crash when Kafka is down.
-    """
-    bootstrap = getattr(settings, "KAFKA_BOOTSTRAP_SERVERS", "") or ""
-    bootstrap = bootstrap.strip()
-    if not bootstrap:
-        return "not_configured"
-    # Prefer a lightweight TCP connect (no extra dep required) before falling
-    # back to kafka-python if it happens to be installed. The TCP probe is
-    # sufficient to report reachability for the health endpoint's purposes.
-    first_server = bootstrap.split(",")[0].strip()
-    if "://" in first_server:
-        first_server = first_server.split("://", 1)[1]
-    if not first_server:
-        return "unhealthy"
-    host, _, port = first_server.partition(":")
-    if not port:
-        port = "9092"
-    try:
-        import socket
-        with socket.create_connection((host, int(port)), timeout=2):
-            pass
-        return "healthy"
-    except Exception:
-        return "unhealthy"
-
 
 def _seed_health() -> str:
     """Return the last auto-seed outcome from `app.seed.seed_admin`.
@@ -132,31 +111,31 @@ def _seed_health() -> str:
 async def system_health(
     db: Session = Depends(get_db),
 ):
-    """System health check — pings DB, Redis, and (optionally) Kafka.
+    """System health check — pings DB and Redis.
 
-    Also surfaces the last auto-seed outcome so operators can detect a
-    failed self-healing seed without scraping logs.
+    Also surfaces the last auto-seed outcome and the dead-letter task count
+    so operators can detect a failed self-healing seed or a stuck task
+    without scraping logs.
     """
     db_healthy = _check_db(db)
     redis_healthy = _check_redis()
-    kafka_status = _check_kafka()
-    # Kafka only degrades the overall status when it is expected but down.
-    # not_configured means the operator hasn't wired Kafka in, so we don't
-    # penalize the overall status for it.
-    kafka_degrades = kafka_status == "unhealthy"
+    dead_letter = _dead_letter_count()
     seed_status = _seed_health()
     # A failed seed does not degrade the overall status (the control-plane
     # still starts so operators can debug), but it is surfaced explicitly so
     # monitoring can alert on `services.seed == "not_applied"`.
-    overall = "healthy" if (db_healthy and redis_healthy and not kafka_degrades) else "degraded"
+    # v1.2.25 Task 6: a non-zero dead-letter count does not degrade the
+    # overall status (the control-plane is still healthy), but it is surfaced
+    # explicitly so monitoring can alert on `services.dead_letter > 0`.
+    overall = "healthy" if (db_healthy and redis_healthy) else "degraded"
 
     return {
         "status": overall,
         "services": {
             "database": "healthy" if db_healthy else "unhealthy",
             "redis": "healthy" if redis_healthy else "unhealthy",
-            "kafka": kafka_status,
             "seed": seed_status,
+            "dead_letter": dead_letter,
         },
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }

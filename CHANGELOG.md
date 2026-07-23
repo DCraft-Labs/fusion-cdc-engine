@@ -4,6 +4,58 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.25] — 2026-07-23
+
+### Reliability
+- **Bug 2.1 (checkpoint persistence):** `transform-worker/loader.py` was
+  calling `/internal/load-checkpoints` (404) instead of
+  `/api/v1/internal/load-checkpoints`, leaving `initial_load_checkpoints`
+  empty and causing duplicate rows on worker restart. Fixed the URL prefix
+  in `_get_last_checkpoint` and `_report_checkpoint`, and made
+  `_report_checkpoint` re-raise on HTTP failure so the worker retry/dead-letter
+  path handles it instead of silently swallowing the error. Resume now starts
+  from `last_pk + 1`, preventing duplicate rows.
+- **Bug 2.2 (sync_frequency → schedule_cron):** `POST /connections/{id}/resume`,
+  `POST /{id}/schedule`, `GET /{id}/schedule`, and `PATCH /{id}` referenced
+  `connection.sync_frequency` which does not exist on the ORM (the column is
+  `schedule_cron`), causing 500s and silent no-ops. All four call sites now
+  use `connection.schedule_cron`; the public Pydantic field `sync_frequency`
+  is preserved via a `model_validator(mode="before")` that maps
+  `schedule_cron` → `sync_frequency` on responses.
+- **Bug 2.3 (progress reporting):** `GET /connections/{id}/initial-load` now
+  aggregates from `initial_load_checkpoints` and exposes `last_updated_at`
+  (per-table + connection-level) plus `chunk_seq`/`last_pk`/`current_chunk`/
+  `total_chunks` so the UI can show real progress and detect stuck loads.
+
+### Optimization
+- **Manifest compaction (Task 5):** `IcebergWriter.compact_manifests()` is now
+  invoked every `INITIAL_LOAD_COMPACTION_INTERVAL` chunks (default 50) during
+  long initial loads. `commit.manifest.min-count-to-merge=1` is set as a
+  default for initial-load destinations to auto-merge manifests on every
+  commit, flattening the ~30% throughput degradation curve.
+- **Retry backoff + dead-letter (Task 6):** `transform-worker/worker.py` now
+  applies exponential backoff (1, 2, 4, 8, 16, 32, 60s cap) between retries,
+  caps at `MAX_TASK_RETRIES` (default 10), and moves exhausted tasks to the
+  `fusion:transforms:dead-letter` Redis list. New endpoints surface and
+  requeue dead-lettered tasks: `GET /connections/{id}/tasks/dead-letter`,
+  `POST /tasks/dead-letter/{task_id}/requeue`, and the dead-letter count is
+  reported in `/api/v1/monitoring/health`.
+- **Delete-after-commit (Task 7):** `write.metadata.delete-after-commit.enabled=true`
+  is now the default for initial-load destinations (operators can opt out via
+  `write_metadata_delete_after_commit=false`), reducing metadata accumulation.
+
+### Infrastructure
+- **Remove Kafka (Task 1):** Kafka was unused dead infrastructure — CDC uses
+  Redis Streams (XADD/XREADGROUP) and KEDA scales on Redis list depth. Removed
+  `KAFKA_BOOTSTRAP_SERVERS` from `config.py`, `requirements.txt`
+  (`kafka-python`), `monitoring.py` (`_check_kafka`), and all Kubernetes
+  manifests (`kafka.yaml`, `kustomization.yaml`, `cdc-consumer.yaml`,
+  `configmap.yaml`, local `resources.yaml` patch). Frees ~480Mi.
+
+### Schema
+- Alembic migration `c5d6e7f8a9b0` adds `last_updated_at` to
+  `initial_load_checkpoints`.
+
 ## [1.2.24] — 2026-07-23
 
 **CI fix for v1.2.23.** The v1.2.23 `test` job failed because

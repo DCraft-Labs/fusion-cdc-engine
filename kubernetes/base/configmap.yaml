@@ -38,7 +38,6 @@ data:
   # These are correct for both local (Docker Desktop K8s) and production (EKS)
   CONTROL_PLANE_URL: "http://fusion-control-plane-svc.fusion.svc.cluster.local:8000"
   REDIS_URL: "redis://fusion-redis-master.fusion.svc.cluster.local:6379/0"
-  KAFKA_BOOTSTRAP_SERVERS: "fusion-kafka.fusion.svc.cluster.local:9092"
   POSTGRES_META_HOST: "fusion-postgres-meta.fusion.svc.cluster.local"
   POSTGRES_META_PORT: "5432"
   POSTGRES_META_DB: "fusion_cdc_metadata"

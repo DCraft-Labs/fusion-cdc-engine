@@ -394,7 +394,7 @@ def sample_connection(
         source_id=sample_source.source_id,
         destination_id=sample_destination.destination_id,
         sync_mode="cdc",
-        sync_frequency="*/15 * * * *",
+        schedule_cron="*/15 * * * *",
         sync_enabled=True,
         resource_limits={},
         config={},

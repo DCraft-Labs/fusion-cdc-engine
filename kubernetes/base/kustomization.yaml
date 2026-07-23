@@ -17,7 +17,6 @@ resources:
   - secrets.yaml
   - postgres-meta.yaml      # Metadata DB — runs inside K8s
   - redis.yaml              # Redis — runs inside K8s
-  - kafka.yaml              # Kafka KRaft — runs inside K8s
   - deployment.yaml         # Control-plane
   - frontend.yaml           # Next.js frontend
   - cdc-workers.yaml        # 3 typed CDC worker Deployments + KEDA

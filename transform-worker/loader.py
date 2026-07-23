@@ -28,6 +28,12 @@ STOP_EVENT = threading.Event()
 # memory bounded to ~a few MB per chunk for typical row widths.
 DEFAULT_CHUNK_SIZE = 10000
 
+# v1.2.25 Task 5: after every N chunks, compact the Iceberg manifest list +
+# expire old snapshots so a long initial load (one snapshot per chunk) does
+# not accumulate hundreds of manifests and degrade throughput ~30%.
+# Configurable via the INITIAL_LOAD_COMPACTION_INTERVAL env var.
+INITIAL_LOAD_COMPACTION_INTERVAL = int(os.environ.get("INITIAL_LOAD_COMPACTION_INTERVAL", "50"))
+
 
 # ---------------------------------------------------------------------------
 # Destination DSN builders — derive a SQLAlchemy-style DSN from a destination
@@ -265,6 +271,23 @@ class InitialLoadTask:
             log.info("InitialLoad connection=%s chunk=%d done — %d rows (total %d) last_pk=%s",
                      connection_id, chunk_seq, rows_written, total_rows, last_pk)
 
+            # v1.2.25 Task 5: periodic manifest compaction for Iceberg
+            # destinations. Every INITIAL_LOAD_COMPACTION_INTERVAL chunks,
+            # compact the manifest list + expire old snapshots so a long
+            # load does not degrade throughput ~30% from manifest/snapshot
+            # accumulation. Skipped for non-iceberg destinations (postgres
+            # has no manifests) and when the interval is <= 0 (disabled).
+            if (connector_type == "iceberg"
+                    and INITIAL_LOAD_COMPACTION_INTERVAL > 0
+                    and chunk_seq % INITIAL_LOAD_COMPACTION_INTERVAL == 0):
+                try:
+                    from iceberg_writer import IcebergWriter
+                    dest_config = dest.get("connection_config") or dest.get("config") or dest
+                    IcebergWriter(dest_config).compact_manifests(dest_table)
+                except Exception:
+                    log.exception("InitialLoad connection=%s compaction failed for table=%s chunk=%d — continuing (non-fatal)",
+                                  connection_id, dest_table, chunk_seq)
+
             # A short chunk means we've reached the end of the table.
             if len(rows) < chunk_size:
                 break
@@ -463,7 +486,7 @@ class InitialLoadTask:
             return None
         try:
             resp = requests.get(
-                f"{self.engine.control_plane_url}/internal/load-checkpoints/last/"
+                f"{self.engine.control_plane_url}/api/v1/internal/load-checkpoints/last/"
                 f"{connection_id}/{stream_id}",
                 headers={"X-Worker-Token": os.environ.get("WORKER_SHARED_SECRET", "")},
                 timeout=10,
@@ -491,7 +514,7 @@ class InitialLoadTask:
         import requests
         try:
             requests.post(
-                f"{self.engine.control_plane_url}/internal/load-checkpoints",
+                f"{self.engine.control_plane_url}/api/v1/internal/load-checkpoints",
                 json={
                     "connection_id": connection_id,
                     "stream_id": stream_id,
@@ -506,14 +529,16 @@ class InitialLoadTask:
                 timeout=10,
             )
         except Exception:
-            log.warning("_report_checkpoint: failed to report checkpoint for connection=%s chunk=%s",
-                        connection_id, chunk_seq, exc_info=True)
+            log.error("_report_checkpoint: failed to report checkpoint for connection=%s chunk=%s "
+                      "— re-raising so the worker retry/dead-letter path handles it (v1.2.25 Task 2)",
+                      connection_id, chunk_seq, exc_info=True)
+            raise
 
 
 class CDCTransformTask:
     """
     Handles a batch of CDC events that have a transform pipeline:
-      1. Receive event batch from Redis / Kafka
+      1. Receive event batch from Redis Streams
       2. Apply transform pipeline via DuckDB
       3. Upsert to destination Postgres
     """

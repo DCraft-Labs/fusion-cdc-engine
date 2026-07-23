@@ -130,33 +130,6 @@ spec:
             - name: DUCKDB_MEMORY_LIMIT
               value: "1GB"
 ---
-# Reduce Kafka resources for local dev
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: fusion-kafka
-  namespace: fusion
-spec:
-  template:
-    spec:
-      containers:
-        - name: kafka
-          resources:
-            requests:
-              cpu: "250m"
-              memory: "512Mi"
-            limits:
-              cpu: "1000m"
-              memory: "1Gi"
-          env:
-            - name: KAFKA_HEAP_OPTS
-              value: "-Xmx512m -Xms128m"
-      initContainers:
-        - name: kafka-init
-          env:
-            - name: KAFKA_HEAP_OPTS
-              value: "-Xmx128m -Xms64m"
----
 # Fix storageClass for Docker Desktop (uses "hostpath" not "standard")
 # Note: volumeClaimTemplates cannot be patched via strategic merge.
 # The base manifests already use "hostpath" — this is a no-op in local overlay

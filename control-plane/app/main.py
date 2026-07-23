@@ -15,6 +15,7 @@ from app.config import settings
 from app.middleware.auth import AuthMiddleware
 from app.middleware.tenant_isolation import TenantIsolationMiddleware
 from app.api import (
+    tasks,
     auth,
     connector_definitions,
     sources,
@@ -349,7 +350,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Fusion CDC Engine - Control Plane",
     description="Multi-tenant Change Data Capture Platform API",
-    version="1.2.24",
+    version="1.2.25",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json",
@@ -474,6 +475,12 @@ app.include_router(
     alerting.router,
     prefix="/api/v1",
     tags=["Alerts"]
+)
+
+app.include_router(
+    tasks.router,
+    prefix="/api/v1/tasks",
+    tags=["Tasks"]
 )
 
 app.include_router(

@@ -1008,6 +1008,9 @@ def upsert_load_checkpoint(
     if existing is not None:
         existing.rows_written = (existing.rows_written or 0) + payload.rows_written
         existing.status = status
+        # v1.2.25 Bug 2.3: stamp last_updated_at on every chunk report so the
+        # UI can show "last progress N seconds ago" and detect stuck loads.
+        existing.last_updated_at = now
         # v1.2.17: persist chunk-resume fields so a worker restart can
         # resume from the last processed PK instead of re-doing the table.
         existing.chunk_seq = payload.chunk_seq
@@ -1029,6 +1032,7 @@ def upsert_load_checkpoint(
         rows_written=payload.rows_written,
         status=status,
         started_at=now,
+        last_updated_at=now,
         completed_at=now if status == "completed" else None,
         chunk_seq=payload.chunk_seq,
         last_pk=(str(payload.last_pk) if payload.last_pk is not None else None),

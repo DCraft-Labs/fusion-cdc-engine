@@ -218,8 +218,26 @@ def _build_table_properties(dest_config: dict) -> dict:
         "write.object-storage.enabled": str(dest_config.get("object_storage_enabled", True)).lower(),
         "write.object-storage.partitioned-paths": str(dest_config.get("partitioned_paths", True)).lower(),
     }
-    if dest_config.get("write_metadata_delete_after_commit"):
+    # v1.2.25 Task 7: delete-after-commit default. For initial-load
+    # destinations, default to true so old metadata files are removed after
+    # each commit (reduces accumulation during a long load). An operator can
+    # explicitly opt out by setting write_metadata_delete_after_commit=false
+    # in the destination config — the explicit value always wins.
+    wmdac_explicit = "write_metadata_delete_after_commit" in dest_config
+    wmdac_value = bool(dest_config.get("write_metadata_delete_after_commit"))
+    if wmdac_value:
         props["write.metadata.delete-after-commit.enabled"] = "true"
+    elif dest_config.get("initial_load_destination", True) and not wmdac_explicit:
+        props["write.metadata.delete-after-commit.enabled"] = "true"
+    # v1.2.25 Task 5: auto-merge manifests on every commit so a long initial
+    # load (one snapshot per 10k-row chunk) does not accumulate hundreds of
+    # small manifests and degrade throughput ~30%. PyIceberg 0.7.1 honors
+    # this property on every table.append() commit. min-count-to-merge=1
+    # means "merge whenever there is more than 1 manifest", which keeps the
+    # manifest list flat. This is the actual compaction lever in 0.7.1 (the
+    # table.rewrite_manifests() API was added in 0.11+).
+    if dest_config.get("initial_load_destination", True):
+        props.setdefault("commit.manifest.min-count-to-merge", "1")
     return props
 
 
@@ -691,6 +709,71 @@ class IcebergWriter:
         except Exception:
             log.exception("Iceberg delete failed — skipping %d keys", len(delete_keys))
             return 0
+
+    def compact_manifests(self, table_name: str, keep_snapshots: int = 5) -> dict:
+        """v1.2.25 Task 5: compact the manifest list + expire old snapshots.
+
+        Called by ``InitialLoadTask`` after every ``INITIAL_LOAD_COMPACTION_INTERVAL``
+        chunks to flatten the ~30% throughput degradation caused by manifest /
+        snapshot accumulation during a long initial load (every 10k-row chunk
+        = 1 Iceberg snapshot commit; by row 8M that's ~800 snapshots).
+
+        PyIceberg 0.7.1 does NOT expose ``table.rewrite_manifests()`` or
+        ``table.expire_snapshots()`` (added in 0.11+). So this method:
+
+          1. Calls them defensively when available (forward-compatible with
+             newer PyIceberg) and logs the outcome.
+          2. When unavailable, relies on the table property
+             ``commit.manifest.min-count-to-merge=1`` set in
+             ``_build_table_properties`` for initial-load destinations, which
+             makes PyIceberg auto-merge manifests on every commit. This is
+             the actual compaction lever in 0.7.1 and is what flattens the
+             degradation curve.
+
+        Never raises — compaction is an optimization, not a correctness gate.
+        Returns a small dict describing what ran (for logging / tests).
+        """
+        result = {"table": table_name, "rewrote_manifests": False,
+                  "expired_snapshots": False, "note": ""}
+        try:
+            table = self.catalog.load_table(f"{self.namespace}.{table_name}")
+        except Exception:
+            log.exception("compact_manifests: could not load table %s", table_name)
+            result["note"] = "table load failed"
+            return result
+
+        # 1. Manifest rewrite (PyIceberg 0.11+ exposes table.rewrite_manifests()).
+        if hasattr(table, "rewrite_manifests"):
+            try:
+                table.rewrite_manifests()
+                result["rewrote_manifests"] = True
+                log.info("compact_manifests: rewrote manifests for %s", table_name)
+            except Exception:
+                log.exception("compact_manifests: rewrite_manifests failed for %s", table_name)
+        else:
+            # PyIceberg 0.7.1: rely on commit.manifest.min-count-to-merge=1
+            # (set in _build_table_properties) which auto-merges on commit.
+            result["note"] = "rewrite_manifests unavailable in pyiceberg 0.7.1; commit.manifest.min-count-to-merge handles auto-merge"
+
+        # 2. Snapshot expiration (PyIceberg 0.11+ exposes table.expire_snapshots()).
+        if hasattr(table, "expire_snapshots"):
+            try:
+                table.expire_snapshots()
+                result["expired_snapshots"] = True
+                log.info("compact_manifests: expired snapshots for %s (keep last %d)",
+                         table_name, keep_snapshots)
+            except Exception:
+                log.exception("compact_manifests: expire_snapshots failed for %s", table_name)
+        else:
+            # 0.7.1: no snapshot expiration available — the table properties
+            # history.expire.min-snapshots-to-keep / max-snapshot-age-ms are
+            # only honored by Spark/Airflow maintenance jobs, not pyiceberg.
+            if not result["note"]:
+                result["note"] = "expire_snapshots unavailable in pyiceberg 0.7.1"
+
+        log.info("compact_manifests: table=%s rewrote=%s expired=%s",
+                 table_name, result["rewrote_manifests"], result["expired_snapshots"])
+        return result
 
 
 def test_connection(dest_config: dict) -> dict:

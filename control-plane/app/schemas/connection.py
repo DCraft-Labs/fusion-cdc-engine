@@ -313,13 +313,33 @@ class ConnectionResponse(ConnectionBase):
             ),
         }
     
+    @model_validator(mode="before")
+    @classmethod
+    def _schedule_cron_to_sync_frequency(cls, data):
+        """v1.2.25 Bug 2.2: map ORM schedule_cron -> public sync_frequency.
+
+        When ``ConnectionResponse.model_validate(connection_orm)`` is called,
+        Pydantic reads each field by attribute name. The ORM exposes
+        ``schedule_cron`` (not ``sync_frequency``), so without this remap the
+        response would always report ``sync_frequency=None`` and the schedule
+        would silently disappear from GET /connections/{id} and PATCH
+        responses. We copy schedule_cron into sync_frequency here so the
+        public field round-trips correctly.
+        """
+        if hasattr(data, "schedule_cron") and not hasattr(data, "sync_frequency"):
+            try:
+                object.__setattr__(data, "sync_frequency", data.schedule_cron)
+            except Exception:
+                pass
+        return data
+
     class Config:
         from_attributes = True
 
 
 class ConnectionListResponse(BaseModel):
     """Schema for paginated connection list"""
-    
+
     connections: List[ConnectionResponse]
     total: int
     page: int

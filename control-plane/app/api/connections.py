@@ -850,6 +850,13 @@ async def update_connection(
     # Update fields
     update_dict = connection_data.model_dump(exclude_unset=True)
     
+    # v1.2.25 Bug 2.2: public Pydantic field is sync_frequency but the ORM
+    # column is schedule_cron. Remap so PATCH persists the schedule
+    # (previously setattr(connection, "sync_frequency", ...) set a
+    # non-mapped attribute and silently no-op'd for this field).
+    if "sync_frequency" in update_dict:
+        update_dict["schedule_cron"] = update_dict.pop("sync_frequency")
+    
     for field, value in update_dict.items():
         setattr(connection, field, value)
     
@@ -1005,7 +1012,8 @@ async def configure_schedule(
     connection = _get_connection_by_id(db, connection_id, current_user, include_relations=False)
     
     # Update schedule
-    connection.sync_frequency = schedule_config.sync_frequency
+    # v1.2.25 Bug 2.2: ORM column is schedule_cron (not sync_frequency).
+    connection.schedule_cron = schedule_config.sync_frequency
     connection.sync_enabled = schedule_config.sync_enabled
     
     # Store timezone in config
@@ -1045,7 +1053,7 @@ async def get_schedule(
     timezone = connection.config.get("schedule", {}).get("timezone", "UTC")
     
     schedule_config = ScheduleConfig(
-        sync_frequency=connection.sync_frequency or "manual",
+        sync_frequency=connection.schedule_cron or "manual",  # v1.2.25 Bug 2.2: ORM col is schedule_cron
         sync_enabled=connection.sync_enabled,
         timezone=timezone,
     )
@@ -1187,8 +1195,9 @@ async def resume_connection(
     connection.status = "active"
     connection.sync_enabled = True
     
-    if connection.sync_frequency:
-        connection.next_sync_at = _calculate_next_sync_time(connection.sync_frequency)
+    # v1.2.25 Bug 2.2: ORM column is schedule_cron (not sync_frequency).
+    if connection.schedule_cron:
+        connection.next_sync_at = _calculate_next_sync_time(connection.schedule_cron)
 
     # For CDC/REALTIME connections, notify the worker to resume streaming
     _trigger_dag_or_worker(connection, db)
@@ -1712,11 +1721,27 @@ async def get_initial_load_status(
             "status": "completed" if c.status in ("done", "completed") else c.status,
             "started_at": c.started_at.isoformat() if c.started_at else None,
             "completed_at": c.completed_at.isoformat() if c.completed_at else None,
+            # v1.2.25 Bug 2.3: expose last_updated_at so the UI can show
+            # "last progress N seconds ago" and detect stuck loads.
+            "last_updated_at": c.last_updated_at.isoformat() if c.last_updated_at else None,
             "duration_seconds": duration_sec,
             "error": c.error,
+            # v1.2.25: expose chunk-resume fields so the UI can show
+            # "chunk 7 of ? — last_pk=12345" for a running load.
+            "chunk_seq": int(c.chunk_seq or 0),
+            "last_pk": c.last_pk,
+            "current_chunk": int(c.current_chunk or 0),
+            "total_chunks": int(c.total_chunks) if c.total_chunks is not None else None,
         })
     total_rows = sum(t["rows_written"] for t in tables)
     completed = sum(1 for t in tables if t["status"] == "completed")
+    # v1.2.25 Bug 2.3: connection-level last_updated_at = the most recent
+    # per-table last_updated_at, so the UI can surface "last progress" for
+    # the whole load (not just per table).
+    per_table_updates = [
+        t["last_updated_at"] for t in tables if t["last_updated_at"]
+    ]
+    last_updated_at = max(per_table_updates) if per_table_updates else None
     return {
         "connection_id": str(connection_id),
         "initial_load_completed": connection.initial_load_completed,
@@ -1726,6 +1751,7 @@ async def get_initial_load_status(
         "tables_total": len(tables),
         "tables_completed": completed,
         "tables": tables,
+        "last_updated_at": last_updated_at,
     }
 
 
@@ -1897,3 +1923,61 @@ async def delete_stream(
     
     db.delete(stream)
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# v1.2.25 Task 6 — Dead-letter task inspection
+# ---------------------------------------------------------------------------
+
+@router.get("/{connection_id}/tasks/dead-letter")
+async def list_dead_letter_tasks(
+    connection_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("connections:read")),
+):
+    """List dead-lettered transform tasks for a connection.
+
+    Tasks that exhausted their retry budget (MAX_TASK_RETRIES) are moved by the
+    transform-worker to the Redis list ``fusion:transforms:dead-letter``. This
+    endpoint reads that list, filters by ``connection_id``, and returns the
+    entries so operators can inspect the failure reason and requeue the task
+    once the root cause is fixed.
+
+    Each entry has the shape::
+
+        {
+          "task_id": "...",
+          "connection_id": "...",
+          "type": "cdc_transform" | "initial_load",
+          "reason": "<truncated exception>",
+          "dead_lettered_at": "<iso8601>",
+          "payload": "<raw task json>"
+        }
+    """
+    from app.config import settings
+    import redis as redis_lib
+    import json as _json
+
+    try:
+        r = redis_lib.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+        raw_entries = r.lrange("fusion:transforms:dead-letter", 0, -1)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Could not read dead-letter list from Redis: {exc}",
+        )
+
+    items = []
+    for raw in raw_entries:
+        try:
+            entry = _json.loads(raw)
+        except Exception:
+            continue
+        # Filter by connection_id (string compare — task payloads store UUIDs
+        # as strings).
+        if str(entry.get("connection_id")) != str(connection_id):
+            continue
+        items.append(entry)
+
+    return {"connection_id": str(connection_id), "count": len(items), "tasks": items}
+
