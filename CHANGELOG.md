@@ -4,6 +4,22 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.28] — 2026-07-23
+
+### CI Fix
+- **Contract test recognizes `async def` (v1.2.27 follow-up):** the
+  `test_trigger_dag_or_worker_calls_enqueue_initial_load` contract test did a
+  static source check for `def _trigger_dag_or_worker(`, but v1.2.27 made the
+  function `async def` (to `await asyncio.to_thread(partition_pk_ranges, ...)`).
+  The test now matches both `def` and `async def` prefixes. No production code
+  changed — this is a test-only fix so the v1.2.27 partitioning fix can ship.
+
+### Version
+- Chart version + appVersion bumped to `1.2.28` (`helm/fusion-cdc/Chart.yaml`,
+  `control-plane/app/main.py`). The partitioning fix itself is unchanged from
+  v1.2.27 (commit `761b1c6`); v1.2.28 just re-tags on top of the CI fix
+  (commit `f3cd294`).
+
 ## [1.2.27] — 2026-07-23
 
 ### P0 Fix — Non-blocking partitioning (production MySQL was tied up by a stuck `COUNT(*)`)
