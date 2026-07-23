@@ -61,6 +61,13 @@ PIPELINE_QUEUE_SIZE = int(os.environ.get("INITIAL_LOAD_PIPELINE_QUEUE_SIZE", "2"
 # chunks. Only applies to Iceberg destinations (Postgres COPY is already
 # batched). The final partial batch is always flushed at the end of the
 # range.
+# v1.2.33 Bug #22 fix 3 (IMMEDIATE MITIGATION): default commit batching to 1
+# (one commit per chunk — the legacy v1.2.24 behavior). With commit_batch=1
+# the checkpoint-advance-after-commit fix (Bug #22 fix 1) is trivially
+# correct because there is no buffering — every chunk's write IS a commit,
+# so last_pk advances exactly with durability. Operators who want higher
+# throughput can opt in to larger batches via this env var, but the default
+# is safe (no duplicate rows on retry-after-conflict).
 INITIAL_LOAD_COMMIT_BATCH = int(os.environ.get("INITIAL_LOAD_COMMIT_BATCH", "1"))
 
 # v1.2.29 Task 1: DuckDB native scanner bulk mode (default OFF). Operators
@@ -314,6 +321,11 @@ class InitialLoadTask:
         if ctype == "mongodb":
             pk_col = "_id"
 
+        # v1.2.33 Bug #22 fix 2: stash pk_col on self so the write-path helpers
+        # can pass it to IcebergWriter for dedup-on-PK before append
+        # (idempotency under retry-after-conflict).
+        self._current_pk_col = pk_col
+
         dest = task.get("destination") or {}
         connector_type = dest.get("connector_type") or task.get("dest_connector_type", "postgres")
         dest_schema = task.get("dest_schema", "dw")
@@ -364,6 +376,18 @@ class InitialLoadTask:
         # fetch starts from the table's minimum PK.
         if last_pk is None and pk_start is not None:
             last_pk = pk_start
+
+        # v1.2.33 Bug #22 fix 1 (PRIMARY): ``last_pk`` is the checkpoint cursor
+        # and must only reflect rows that are DURABLE (committed to Iceberg /
+        # COPY'd to Postgres). ``last_buffered_pk`` tracks rows that have been
+        # fetched/transformed and buffered for a batched commit but NOT yet
+        # committed. With commit_batch>1, advancing ``last_pk`` on every
+        # buffered chunk would let a retry resume past rows that were never
+        # committed — re-fetching and re-appending already-durable rows
+        # (duplicate rows on retry-after-conflict). The checkpoint now advances
+        # only after a successful commit; the final flush (after the loop)
+        # promotes ``last_buffered_pk`` to ``last_pk``.
+        last_buffered_pk = last_pk
 
         total_rows = prior_rows
         # v1.2.22 Fix C4: stream, don't accumulate. Each chunk is converted to
@@ -591,6 +615,9 @@ class InitialLoadTask:
                     rows_written = self._write_arrow_to_iceberg(arrow_tbl, dest, dest_table)
                     INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
                     child_tables = {}
+                    # v1.2.33 Bug #22 fix 1: write_arrow IS the commit — advance
+                    # the checkpoint cursor only after it succeeds.
+                    last_pk = next_pk
                 elif kind == "arrow":
                     t_c0 = time.monotonic()
                     transformed = arrow_tbl.to_pylist()
@@ -608,6 +635,9 @@ class InitialLoadTask:
                     t_w0 = time.monotonic()
                     rows_written = self._copy_to_postgres(transformed, dest_dsn, dest_schema, dest_table)
                     INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+                    # v1.2.33 Bug #22 fix 1: COPY IS the commit — advance
+                    # the checkpoint cursor only after it succeeds.
+                    last_pk = next_pk
                 else:
                     # Apply transforms
                     if steps:
@@ -640,6 +670,13 @@ class InitialLoadTask:
                             pending_rows = []
                             pending_child = {}
                             chunks_since_commit = 0
+                            # v1.2.33 Bug #22 fix 1 (PRIMARY): the batched
+                            # commit just succeeded — NOW it is safe to advance
+                            # the checkpoint cursor. Advancing on every buffered
+                            # chunk (the old behavior) let a retry resume past
+                            # rows that were never committed, re-appending
+                            # already-durable rows on retry-after-conflict.
+                            last_pk = next_pk
                     else:
                         dest_dsn = _dest_dsn_from_dest(dest)
                         if not dest_dsn:
@@ -655,6 +692,9 @@ class InitialLoadTask:
                             if child_rows:
                                 self._copy_to_postgres(child_rows, dest_dsn, dest_schema, child_name)
                         INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+                        # v1.2.33 Bug #22 fix 1: COPY IS the commit — advance
+                        # the checkpoint cursor only after it succeeds.
+                        last_pk = next_pk
     
             except Exception:
                 log.exception("InitialLoad connection=%s chunk_seq=%d convert/write failed - reporting failed checkpoint and re-raising",
@@ -673,7 +713,13 @@ class InitialLoadTask:
             latency = time.monotonic() - t0
             total_rows += rows_written
             chunk_counter += 1
-            last_pk = next_pk
+            # v1.2.33 Bug #22 fix 1: track the buffered (possibly-uncommitted)
+            # cursor separately. ``last_pk`` (the checkpoint cursor) is advanced
+            # only inside each write path AFTER a successful commit (see above).
+            # With commit_batch=1 (the default, Bug #22 fix 3) every chunk
+            # commits so last_pk == last_buffered_pk every iteration; with
+            # commit_batch>1 last_pk lags until the flush succeeds.
+            last_buffered_pk = next_pk
 
             # v1.2.29 Task 2: per-chunk row counter.
             INITIAL_LOAD_ROWS_TOTAL.labels(_m_conn, _m_stream, _m_part).inc(rows_written)
@@ -809,6 +855,9 @@ class InitialLoadTask:
             pending_rows = []
             pending_child = {}
             chunks_since_commit = 0
+            # v1.2.33 Bug #22 fix 1: the final buffered batch is now durable —
+            # promote the buffered cursor to the checkpoint cursor.
+            last_pk = last_buffered_pk
 
         if STOP_EVENT.is_set():
             log.warning("InitialLoad connection=%s chunk_seq=%d stopped mid-load after chunk %d — checkpoint saved, will resume on restart",
@@ -856,7 +905,10 @@ class InitialLoadTask:
         dest_config = dest.get("connection_config") or dest.get("config") or dest
         writer = IcebergWriter(dest_config, redis_client=getattr(self, "redis", None),
                                connection_id=getattr(self, "_current_connection_id", None))
-        return writer.write_batch(rows, table_name=table_name, schema=schema)
+        # v1.2.33 Bug #22 fix 2: pass pk_col so IcebergWriter dedup-on-PK
+        # (delete-then-append) before each batch — idempotency safeguard.
+        return writer.write_batch(rows, table_name=table_name, schema=schema,
+                                  pk_col=getattr(self, "_current_pk_col", None))
 
     def _fetch_chunk(self, source: dict, schema_name: str, table_name: str,
                     pk_col: str, last_pk, chunk_size: int, ctype: str,
@@ -1104,7 +1156,10 @@ class InitialLoadTask:
         try:
             writer = IcebergWriter(dest, redis_client=getattr(self, "redis", None),
                                    connection_id=getattr(self, "_current_connection_id", None))
-            return writer.write_arrow(arrow_tbl, table_name=table_name)
+            # v1.2.33 Bug #22 fix 2: pass pk_col so IcebergWriter dedup-on-PK
+            # (delete-then-append) before each batch — idempotency safeguard.
+            return writer.write_arrow(arrow_tbl, table_name=table_name,
+                                      pk_col=getattr(self, "_current_pk_col", None))
         except Exception as e:
             log.error("InitialLoad: _write_arrow_to_iceberg failed (%s) — falling back to flush.", e)
             raise

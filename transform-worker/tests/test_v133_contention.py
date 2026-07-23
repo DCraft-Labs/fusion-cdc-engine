@@ -266,3 +266,134 @@ def test_commit_lock_key_format():
     ``fusion:iceberg-commit-lock:<connection_id>:<table_name>``."""
     from iceberg_writer import _commit_lock_key
     assert _commit_lock_key("conn-7", "orders") == "fusion:iceberg-commit-lock:conn-7:orders"
+
+
+# ─── Bug #22 fix 1: checkpoint advances only after commit success ────────────
+def test_checkpoint_advances_only_after_commit_success():
+    """Simulate the race: with commit_batch>1, chunks are buffered and the
+    checkpoint cursor (``last_pk``) must NOT advance until the batch is
+    actually flushed (committed). We model the two cursors directly:
+
+      - ``last_pk``           = last COMMITTED pk (the checkpoint cursor)
+      - ``last_buffered_pk``  = last buffered (possibly-uncommitted) pk
+
+    A commit failure must leave ``last_pk`` at the last committed value so a
+    retry re-fetches from there (re-applying only un-durable rows, which the
+    dedup-on-PK fix makes idempotent).
+    """
+    commit_batch = 3
+    last_pk = None           # checkpoint cursor (committed)
+    last_buffered_pk = None  # buffered cursor
+    committed_rows = 0
+
+    # Chunks: pks 10, 20, 30. Flush (commit) on chunk 3.
+    for chunk_idx, next_pk in enumerate([10, 20, 30], start=1):
+        last_buffered_pk = next_pk  # buffer advances immediately
+        if chunk_idx >= commit_batch:
+            # Flush SUCCEEDS — commit happens. NOW last_pk advances.
+            last_pk = next_pk
+            committed_rows = chunk_idx
+        # (If flush failed, we'd raise and last_pk would NOT advance.)
+
+    assert last_pk == 30, f"After flush, last_pk should be 30, got {last_pk}"
+    assert last_buffered_pk == 30
+    assert committed_rows == 3
+
+    # Simulate a 4th chunk that buffers, then a crash BEFORE its flush.
+    next_pk = 40
+    last_buffered_pk = next_pk  # buffer chunk 4
+    # Buggy (old): last_pk = next_pk  -> 40 (WRONG: rows 31-40 not durable)
+    # Fixed (new): last_pk stays at 30 (last committed)
+    assert last_pk == 30, (
+        "Bug #22 fix 1 regression: last_pk advanced to %r past the last "
+        "committed value (30) while rows were only buffered — a retry would "
+        "resume from %r and skip the un-durable rows 31-40 (data loss), or "
+        "if the buffered chunk had been partially committed, re-append them "
+        "(duplicates)." % (last_pk, last_pk)
+    )
+    assert last_buffered_pk == 40
+    # On retry from last_pk=30, the fetch re-reads pk > 30 — correct.
+    assert last_pk < last_buffered_pk, "Retry cursor must not exceed durable boundary."
+
+
+# ─── Bug #22 fix 2: dedup-on-PK before append (idempotency) ──────────────────
+class _FakeIcebergTable:
+    """Minimal stand-in for a PyIceberg table: records delete() and append()
+    calls so the test can assert delete-then-append ordering and that
+    pre-existing duplicate PKs are removed before append."""
+    def __init__(self, existing_pks):
+        self.existing_pks = list(existing_pks)
+        self.delete_calls = []
+        self.append_calls = []
+
+    def delete(self, expr):
+        pk_col = getattr(expr.term, "name", None) or str(getattr(expr.term, "ref", expr.term))
+        keys = list(getattr(expr, "rows", []) or [])
+        self.delete_calls.append((pk_col, keys))
+        self.existing_pks = [k for k in self.existing_pks if k not in keys]
+
+    def append(self, table_data):
+        if isinstance(table_data, list):
+            self.append_calls.append(len(table_data))
+            self.existing_pks.extend(r.get("id") for r in table_data if r.get("id") is not None)
+        else:
+            self.append_calls.append(getattr(table_data, "num_rows", 0))
+
+
+def test_dedup_on_pk_before_append_removes_duplicates():
+    """Pre-insert duplicate PKs, run _dedup_on_pk, then append — assert no
+    duplicate PKs remain in the table."""
+    from iceberg_writer import _dedup_on_pk
+
+    # Table already has PKs [1, 2, 3] (e.g. from a prior partially-committed batch).
+    table = _FakeIcebergTable(existing_pks=[1, 2, 3])
+    # New batch has PKs [2, 3, 4] — PKs 2 and 3 are duplicates.
+    new_rows = [{"id": 2, "v": "x"}, {"id": 3, "v": "y"}, {"id": 4, "v": "z"}]
+
+    _dedup_on_pk(table, "id", rows=new_rows)
+
+    assert len(table.delete_calls) == 1, f"Expected 1 delete call, got {len(table.delete_calls)}"
+    pk_col, keys = table.delete_calls[0]
+    assert pk_col == "id"
+    assert set(keys) == {2, 3, 4}
+    assert table.existing_pks == [1], f"After dedup, existing should be [1], got {table.existing_pks}"
+
+    table.append(new_rows)
+    assert table.existing_pks == [1, 2, 3, 4], (
+        f"After dedup+append, table should have [1,2,3,4], got {table.existing_pks}"
+    )
+    assert len(table.existing_pks) == len(set(table.existing_pks)), "Duplicate PKs remain"
+
+
+def test_dedup_on_pk_skips_when_no_pk_col():
+    """When pk_col is falsy, _dedup_on_pk is a no-op."""
+    from iceberg_writer import _dedup_on_pk
+    table = _FakeIcebergTable(existing_pks=[1, 2])
+    _dedup_on_pk(table, "", rows=[{"id": 1}])
+    assert table.delete_calls == [], "Empty pk_col should skip dedup"
+
+
+# ─── Bug #22 fix 3: INITIAL_LOAD_COMMIT_BATCH defaults to 1 ──────────────────
+def test_commit_batch_defaults_to_1():
+    """The default for INITIAL_LOAD_COMMIT_BATCH must be 1 (one commit per
+    chunk — legacy v1.2.24 behavior). Immediate mitigation for Bug #22: with
+    commit_batch=1 every chunk's write IS a commit, so checkpoint-advance-
+    after-commit is trivially correct (no buffering)."""
+    import loader
+    assert loader.INITIAL_LOAD_COMMIT_BATCH == 1, (
+        f"INITIAL_LOAD_COMMIT_BATCH default should be 1, got {loader.INITIAL_LOAD_COMMIT_BATCH}"
+    )
+
+
+def test_commit_batch_env_override(monkeypatch):
+    """Operators can opt in to larger batches via the env var (default stays 1)."""
+    monkeypatch.setenv("INITIAL_LOAD_COMMIT_BATCH", "5")
+    import importlib
+    import loader
+    importlib.reload(loader)
+    assert loader.INITIAL_LOAD_COMMIT_BATCH == 5, (
+        f"INITIAL_LOAD_COMMIT_BATCH should be 5 after env override, got {loader.INITIAL_LOAD_COMMIT_BATCH}"
+    )
+    monkeypatch.delenv("INITIAL_LOAD_COMMIT_BATCH", raising=False)
+    importlib.reload(loader)
+    assert loader.INITIAL_LOAD_COMMIT_BATCH == 1

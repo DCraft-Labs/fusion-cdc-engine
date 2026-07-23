@@ -88,6 +88,52 @@ def _release_commit_lock(redis_client, connection_id: str, table_name: str,
         log.exception("Iceberg commit lock: release failed for key=%s — relying on TTL", key)
 
 
+def _dedup_on_pk(table, pk_col: str,
+                 rows: "list[dict] | None" = None,
+                 arrow_tbl: "pa.Table | None" = None) -> None:
+    """v1.2.33 Bug #22 fix 2 (BELT-AND-SUSPENDERS): before appending a batch,
+    delete any existing rows whose PK is in this batch's PK set. This makes
+    each chunk idempotent — a retry that re-appends a chunk already committed
+    (e.g. a batched commit that partially succeeded before failing, or a
+    checkpoint that was advanced past durable data) will not produce
+    duplicate rows: the duplicates are deleted first, then re-appended
+    exactly once.
+
+    Must be called INSIDE the per-table commit mutex (Bug #21 fix 3) so the
+    delete+append is atomic w.r.t. other pods.
+
+    Either ``rows`` (list of dicts) or ``arrow_tbl`` (a pyarrow.Table) must
+    be provided; the PK values are extracted from whichever is present.
+    """
+    try:
+        from pyiceberg.expressions import In
+    except Exception:
+        log.warning("Iceberg dedup-on-PK: pyiceberg.expressions.In unavailable — skipping dedup (non-fatal)")
+        return
+    # Extract PK values.
+    keys: list = []
+    if rows:
+        keys = [r.get(pk_col) for r in rows if r.get(pk_col) is not None]
+    elif arrow_tbl is not None:
+        try:
+            keys = [v for v in arrow_tbl.column(pk_col).to_pylist() if v is not None]
+        except Exception:
+            log.exception("Iceberg dedup-on-PK: could not extract PK column %r from arrow table — skipping dedup", pk_col)
+            return
+    if not keys:
+        return
+    try:
+        table.delete(In(pk_col, keys))
+    except Exception:
+        # Non-fatal: the delete may fail if the table is empty (no rows match)
+        # or on a transient catalog error. The append still proceeds; the
+        # PRIMARY fix (Bug #22 fix 1, checkpoint-after-commit) prevents the
+        # duplicate scenario in the common case. This dedup is belt-and-
+        # suspenders.
+        log.exception("Iceberg dedup-on-PK: delete-before-append failed for %d keys — proceeding with append (non-fatal)", len(keys))
+
+
+
 
 # ─── Catalog factory ────────────────────────────────────────────────────────
 def load_catalog(dest_config: dict):
@@ -683,7 +729,8 @@ class IcebergWriter:
             pass
 
     def write_batch(self, rows: list[dict], table_name: str,
-                    schema: pa.Schema | None = None) -> int:
+                    schema: pa.Schema | None = None,
+                    pk_col: "str | None" = None) -> int:
         """Append a batch of rows (initial load or insert-only stream).
 
         v1.2.22 Bug A fix: when ``schema`` is provided (the explicit source
@@ -691,6 +738,14 @@ class IcebergWriter:
         conversion and the Iceberg table creation so all-NULL columns
         keep their declared type instead of being inferred as
         ``pa.null()`` (which PyIceberg rejects).
+
+        v1.2.33 Bug #22 fix 2 (BELT-AND-SUSPENDERS): when ``pk_col`` is
+        provided, delete any existing rows whose PK is in this batch BEFORE
+        appending. This makes each chunk idempotent — even if a retry
+        re-appends a chunk that was already committed (e.g. a batched commit
+        partially succeeded before failing), the duplicates are removed
+        first. The delete-then-append runs inside the same per-table commit
+        mutex (Bug #21 fix 3) so it is atomic w.r.t. other pods.
         """
         if not rows:
             return 0
@@ -719,16 +774,25 @@ class IcebergWriter:
         # lock so K concurrent writers don't all lose the optimistic-CAS race.
         _acquire_commit_lock(self.redis_client, self.connection_id, table_name)
         try:
+            # v1.2.33 Bug #22 fix 2: dedup-on-PK before append (idempotency).
+            if pk_col:
+                _dedup_on_pk(table, pk_col, rows=rows)
             table.append(table_data)
         finally:
             _release_commit_lock(self.redis_client, self.connection_id, table_name)
         return len(rows)
 
-    def write_arrow(self, arrow_tbl: "pa.Table", table_name: str) -> int:
+    def write_arrow(self, arrow_tbl: "pa.Table", table_name: str,
+                    pk_col: "str | None" = None) -> int:
         """v1.2.29 Task 1: append a pre-built Arrow table directly to Iceberg,
         skipping the Python row-dict → Arrow conversion (the DuckDB native
         scanner already produced typed Arrow). Used by the bulk initial-load
-        path. Returns the number of rows appended."""
+        path. Returns the number of rows appended.
+
+        v1.2.33 Bug #22 fix 2 (BELT-AND-SUSPENDERS): when ``pk_col`` is
+        provided, delete any existing rows whose PK is in this batch BEFORE
+        appending — makes each chunk idempotent under retry-after-conflict.
+        """
         if arrow_tbl is None or arrow_tbl.num_rows == 0:
             return 0
         create_schema = arrow_tbl.schema
@@ -740,6 +804,9 @@ class IcebergWriter:
         # lock so K concurrent writers don't all lose the optimistic-CAS race.
         _acquire_commit_lock(self.redis_client, self.connection_id, table_name)
         try:
+            # v1.2.33 Bug #22 fix 2: dedup-on-PK before append (idempotency).
+            if pk_col:
+                _dedup_on_pk(table, pk_col, arrow_tbl=arrow_tbl)
             table.append(arrow_tbl)
         finally:
             _release_commit_lock(self.redis_client, self.connection_id, table_name)
