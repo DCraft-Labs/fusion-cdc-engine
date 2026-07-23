@@ -4,6 +4,24 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.23] — 2026-07-23
+
+**CI fix for v1.2.22.** The v1.2.22 `test` CI job failed because the
+transform-worker unit tests import `engine.py` (which does
+`import requests` at module level) and patch `pymysql.connect` /
+`psycopg2.connect` (which requires those modules to be importable), but
+the CI test image only had `pytest` + `pyarrow` + `duckdb` installed.
+
+### Fixed
+- `.github/workflows/publish-images.yml` `test` job now also installs
+  `requests==2.31.0`, `pymysql==1.1.1`, `psycopg2-binary==2.9.9` before
+  running the transform-worker suite. All 31 transform-worker tests pass
+  locally with this exact dep set.
+
+### Changed
+- `control-plane/app/main.py` FastAPI `version` → `1.2.23`.
+- `helm/fusion-cdc/Chart.yaml` `version` / `appVersion` → `1.2.23`.
+
 ## [1.2.22] — 2026-07-23
 
 **Critical fix release.** Two confirmed blocking bugs in the transform-worker
