@@ -48,7 +48,8 @@ jobs:
       - name: Transform-worker unit tests (v1.2.22 Bug A + Bug B + Fix C)
         run: |
           python -m pip install --quiet pyarrow==16.0.0 duckdb==0.10.3 \
-            requests==2.31.0 pymysql==1.1.1 psycopg2-binary==2.9.9
+            requests==2.31.0 pymysql==1.1.1 psycopg2-binary==2.9.9 \
+            redis==5.0.4
           python -m pytest \
             transform-worker/tests/ \
             -q -p no:cacheprovider

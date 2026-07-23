@@ -4,6 +4,23 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.24] — 2026-07-23
+
+**CI fix for v1.2.23.** The v1.2.23 `test` job failed because
+`transform-worker/loader.py` does `import redis` at module level and the
+CI test image did not have `redis` installed.
+
+### Fixed
+- `.github/workflows/publish-images.yml` `test` job now also installs
+  `redis==5.0.4` before running the transform-worker suite. The full
+  transform-worker test dep set is now: `pyarrow`, `duckdb`, `requests`,
+  `pymysql`, `psycopg2-binary`, `redis` — all already in
+  `transform-worker/requirements.txt`.
+
+### Changed
+- `control-plane/app/main.py` FastAPI `version` → `1.2.24`.
+- `helm/fusion-cdc/Chart.yaml` `version` / `appVersion` → `1.2.24`.
+
 ## [1.2.23] — 2026-07-23
 
 **CI fix for v1.2.22.** The v1.2.22 `test` CI job failed because the

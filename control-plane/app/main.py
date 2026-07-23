@@ -349,7 +349,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Fusion CDC Engine - Control Plane",
     description="Multi-tenant Change Data Capture Platform API",
-    version="1.2.23",
+    version="1.2.24",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json",
