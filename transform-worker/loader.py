@@ -325,6 +325,15 @@ class InitialLoadTask:
         # can pass it to IcebergWriter for dedup-on-PK before append
         # (idempotency under retry-after-conflict).
         self._current_pk_col = pk_col
+        # v1.2.34 Bug #23 fix: stash retry count so the dedup-on-PK delete is
+        # ONLY run on retried tasks (retry_count > 0). On a first attempt there
+        # is no prior commit to dedup against, so the delete scan is pure
+        # overhead — and on unpartitioned Iceberg tables it scans every
+        # manifest accumulated so far, growing 1:1 with commits and making
+        # each commit progressively slower. Gating on retry_count > 0 removes
+        # the cost from the common path while leaving dedup fully intact for
+        # the exact retry-after-conflict scenario it was added to protect.
+        self._current_retry_count = int(task.get("_retry_count", 0))
 
         dest = task.get("destination") or {}
         connector_type = dest.get("connector_type") or task.get("dest_connector_type", "postgres")
@@ -907,8 +916,15 @@ class InitialLoadTask:
                                connection_id=getattr(self, "_current_connection_id", None))
         # v1.2.33 Bug #22 fix 2: pass pk_col so IcebergWriter dedup-on-PK
         # (delete-then-append) before each batch — idempotency safeguard.
+        # v1.2.34 Bug #23 fix: gate dedup on retry_count > 0. On a first
+        # attempt there is no prior commit to dedup against, so the delete
+        # scan is pure overhead (and on unpartitioned tables it scans every
+        # manifest, growing 1:1 with commits). Only retried tasks can have
+        # a prior successful commit whose rows need deleting.
+        _pk = getattr(self, "_current_pk_col", None)
+        _dedup_pk = _pk if getattr(self, "_current_retry_count", 0) > 0 else None
         return writer.write_batch(rows, table_name=table_name, schema=schema,
-                                  pk_col=getattr(self, "_current_pk_col", None))
+                                  pk_col=_dedup_pk)
 
     def _fetch_chunk(self, source: dict, schema_name: str, table_name: str,
                     pk_col: str, last_pk, chunk_size: int, ctype: str,
@@ -1158,8 +1174,12 @@ class InitialLoadTask:
                                    connection_id=getattr(self, "_current_connection_id", None))
             # v1.2.33 Bug #22 fix 2: pass pk_col so IcebergWriter dedup-on-PK
             # (delete-then-append) before each batch — idempotency safeguard.
+            # v1.2.34 Bug #23 fix: gate dedup on retry_count > 0 (see write_batch
+            # call site above for rationale).
+            _pk = getattr(self, "_current_pk_col", None)
+            _dedup_pk = _pk if getattr(self, "_current_retry_count", 0) > 0 else None
             return writer.write_arrow(arrow_tbl, table_name=table_name,
-                                      pk_col=getattr(self, "_current_pk_col", None))
+                                      pk_col=_dedup_pk)
         except Exception as e:
             log.error("InitialLoad: _write_arrow_to_iceberg failed (%s) — falling back to flush.", e)
             raise
