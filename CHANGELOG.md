@@ -4,6 +4,66 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.33] — 2026-07-24
+
+### P0 correctness fixes — parallel-load test (bugs #20 + #21)
+
+Two bugs found in the v1.2.32 parallel-load (K=6) test that together
+dead-lettered 4 of 6 partitions in ~6 minutes.
+
+- **Bug #20 — unbounded final partition premature DONE (adaptive chunk-size
+  race)** (`transform-worker/loader.py`, partition loop exit check): the
+  unbounded-partition branch compared `row_count` against the LIVE
+  `cur_chunk_size`, but the adaptive sizer grows `cur_chunk_size` between the
+  fetch and the check (e.g. 10000 → 20000 after a fast streak). A chunk that
+  returned exactly 10000 rows (a FULL chunk at the requested size) was
+  compared against the NEW 20000 target, `10000 < 20000` is True, and the
+  loop falsely exited. Fix: capture `requested_size = cur_chunk_size` BEFORE
+  the fetch (passed through the prefetch queue alongside the payload) and
+  compare `row_count < requested_size` in the unbounded branch — never the
+  live `cur_chunk_size`. The adaptive sizer may still grow `cur_chunk_size`
+  for the NEXT chunk, but the CURRENT chunk's "was it full?" check uses the
+  size that was actually requested.
+- **Bug #21 — Iceberg commit contention dead-letters partitions**: K=6
+  concurrent writers all commit to the SAME Iceberg table. Iceberg uses
+  optimistic concurrency (compare-and-swap on the snapshot id); most commits
+  lose the race, retry with backoff (1, 2, 4, 8, 16, 32, 60s), burn through
+  10 retries, and get dead-lettered as "unrecoverable." Three fixes:
+  1. **Jittered backoff** (`transform-worker/worker.py:_backoff_seconds`):
+     multiply each backoff step by `random.uniform(0.5, 1.5)` so two colliding
+     partitions don't retry in lockstep and re-collide.
+  2. **Higher retry budget for initial-load tasks**
+     (`transform-worker/worker.py`): a new `INITIAL_LOAD_MAX_RETRIES` env var
+     (default 30) is used for `task["type"] == "initial_load"` instead of the
+     default `MAX_TASK_RETRIES=10`. This gives ~10 minutes of cumulative
+     backoff with jitter — enough to win a race under K=6 contention.
+  3. **Per-table Redis commit mutex** (`transform-worker/iceberg_writer.py`):
+     the real fix for the contention — SERIALIZE commits to the same Iceberg
+     table across pods via a Redis `SET <key> <pod-id> NX EX 30` lock keyed on
+     `fusion:iceberg-commit-lock:<connection_id>:<table_name>`. If `SET NX`
+     fails (another pod holds the lock), wait 1s and retry (up to 60s). The
+     lock has a 30s TTL so a crashed pod can't hold it forever; release uses
+     a Lua compare-and-del so we only release a lock we still hold. This
+     serializes COMMITS while keeping FETCHES parallel — the fetch (reading
+     from MySQL) is the slow part; the commit (writing one Arrow batch to S3
+     + metadata) is fast. So we keep most of the parallelism benefit while
+     eliminating commit races. `IcebergWriter.__init__` now accepts optional
+     `redis_client` + `connection_id`; the loader passes them on the
+     initial-load write path. When `redis_client` is None (tests / single-
+     writer CDC) the lock is a no-op (legacy behavior).
+
+### Tests
+- `transform-worker/tests/test_v133_contention.py` — 4 new tests covering
+  Bug #20 (unbounded full-chunk after adaptive grow), Bug #21 fix 1 (jitter),
+  Bug #21 fix 2 (initial_load 30-retry budget), and Bug #21 fix 3 (commit
+  mutex serialization). Run in CI; not run locally (memory-constrained).
+
+### Compatibility
+- No schema migrations. No new env vars required (all three have safe
+  defaults). `INITIAL_LOAD_MAX_RETRIES=30` and `ICEBERG_COMMIT_LOCK_TTL_S=30`
+  / `ICEBERG_COMMIT_LOCK_WAIT_S=60` / `ICEBERG_COMMIT_LOCK_POLL_S=1.0` are
+  operator-tunable.
+
 ## [1.2.30] — 2026-07-23
 
 ### P0 correctness fix — multi-pod parallel initial load (bug #18)

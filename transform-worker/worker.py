@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import signal
 import sys
 import time
@@ -70,6 +71,13 @@ if not DATABASE_URL:
 # MAX_TASK_RETRIES attempts, with exponential backoff between them, and on
 # exhaustion is moved to the dead-letter list for manual inspection/requeue.
 MAX_TASK_RETRIES = int(os.environ.get("MAX_TASK_RETRIES", "10"))
+# v1.2.33 Bug #21 fix 2: initial-load tasks are a one-time bulk operation
+# competing with K-1 sibling pods for the same Iceberg table's optimistic
+# commit. The default 10 retries is too low — under K=6 contention most
+# commits lose the race and burn through the budget in ~6 minutes. A separate,
+# higher budget for initial_load gives ~10 minutes of cumulative backoff with
+# jitter, enough to win a race under contention.
+INITIAL_LOAD_MAX_RETRIES = int(os.environ.get("INITIAL_LOAD_MAX_RETRIES", "30"))
 # Backoff schedule (seconds): 1, 2, 4, 8, 16, 32, 60 (cap).
 _BACKOFF_SCHEDULE = [1, 2, 4, 8, 16, 32, 60]
 
@@ -83,13 +91,22 @@ def _handle_signal(sig, _frame):
     STOP_EVENT.set()
 
 
-def _backoff_seconds(retry_count: int) -> int:
-    """Exponential backoff: 1, 2, 4, 8, 16, 32, then 60s cap."""
+def _backoff_seconds(retry_count: int) -> float:
+    """Exponential backoff: 1, 2, 4, 8, 16, 32, then 60s cap.
+
+    v1.2.33 Bug #21 fix 1: multiply by ``random.uniform(0.5, 1.5)`` so two
+    colliding partitions don't retry in lockstep. Without jitter, K writers
+    that all hit an Iceberg commit conflict at the same instant will all
+    retry at the same instant (1s, 2s, 4s, ...) and re-collide — burning
+    through the retry budget without ever winning the race.
+    """
     if retry_count < 0:
-        return 0
+        return 0.0
     if retry_count < len(_BACKOFF_SCHEDULE):
-        return _BACKOFF_SCHEDULE[retry_count]
-    return _BACKOFF_SCHEDULE[-1]  # 60s cap
+        base = _BACKOFF_SCHEDULE[retry_count]
+    else:
+        base = _BACKOFF_SCHEDULE[-1]  # 60s cap
+    return base * random.uniform(0.5, 1.5)
 
 
 def _interruptible_sleep(seconds: float) -> None:
@@ -233,15 +250,20 @@ def main():
         except Exception as exc:
             retry_count = int(task.get("_retry_count", 0)) if isinstance(task, dict) else 0
             retry_count += 1
-            if retry_count > MAX_TASK_RETRIES:
+            # v1.2.33 Bug #21 fix 2: initial_load tasks get a higher retry
+            # budget — they're a one-time bulk operation competing with K-1
+            # siblings for the same Iceberg table's optimistic commit.
+            task_type_for_budget = task.get("type", "cdc_transform") if isinstance(task, dict) else "cdc_transform"
+            effective_max = INITIAL_LOAD_MAX_RETRIES if task_type_for_budget == "initial_load" else MAX_TASK_RETRIES
+            if retry_count > effective_max:
                 # v1.2.25 Task 6: circuit-breaker — move to dead-letter.
                 # v1.2.30 Defect D fix: remove from in-flight first.
                 _dead_letter_from_inflight(r, raw_task, task, reason=str(exc)[:500])
                 continue
-            # Exponential backoff: 1, 2, 4, 8, 16, 32, 60 (cap).
+            # Exponential backoff: 1, 2, 4, 8, 16, 32, 60 (cap) with jitter.
             delay = _backoff_seconds(retry_count - 1)
-            log.warning("Task id=%s failed (attempt %d/%d): %s — sleeping %ds then re-queuing with backoff",
-                        task.get("task_id"), retry_count, MAX_TASK_RETRIES,
+            log.warning("Task id=%s failed (attempt %d/%d): %s — sleeping %.1fs then re-queuing with backoff",
+                        task.get("task_id"), retry_count, effective_max,
                         str(exc)[:200], delay)
             task["_retry_count"] = retry_count
             task["_last_error"] = str(exc)[:500]

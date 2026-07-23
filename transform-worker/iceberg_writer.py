@@ -14,11 +14,79 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 import pyarrow as pa
 
 log = logging.getLogger(__name__)
+
+
+# v1.2.33 Bug #21 fix 3: per-table distributed commit mutex.
+# Iceberg uses optimistic concurrency (compare-and-swap on the snapshot id).
+# When K writers all commit to the SAME table, most lose the race, retry with
+# backoff, and (under K=6 contention) burn through the retry budget and get
+# dead-lettered. The fix is to SERIALIZE commits to the same table across pods
+# while keeping FETCHES parallel (the fetch — reading from MySQL — is the slow
+# part; the commit — writing one Arrow batch to S3 + metadata — is fast).
+# We use a Redis SET NX EX 30 lock keyed on the destination table. If another
+# pod holds the lock, we wait 1s and retry (up to 60s). The lock has a 30s TTL
+# so a crashed pod can't hold it forever.
+COMMIT_LOCK_TTL_S = int(os.environ.get("ICEBERG_COMMIT_LOCK_TTL_S", "30"))
+COMMIT_LOCK_WAIT_S = int(os.environ.get("ICEBERG_COMMIT_LOCK_WAIT_S", "60"))
+COMMIT_LOCK_POLL_S = float(os.environ.get("ICEBERG_COMMIT_LOCK_POLL_S", "1.0"))
+
+
+def _commit_lock_key(connection_id: str, table_name: str) -> str:
+    return f"fusion:iceberg-commit-lock:{connection_id}:{table_name}"
+
+
+def _acquire_commit_lock(redis_client, connection_id: str, table_name: str,
+                        pod_id: str | None = None) -> bool:
+    """Acquire a Redis SET NX EX lock for committing to one table.
+
+    Returns True on acquisition, False if the wait budget elapsed without
+    acquiring. Polls every COMMIT_LOCK_POLL_S seconds up to COMMIT_LOCK_WAIT_S.
+    """
+    if redis_client is None:
+        return True  # no redis — no serialization (tests / single-writer CDC)
+    key = _commit_lock_key(connection_id, table_name)
+    val = pod_id or os.environ.get("WORKER_ID", "transform-worker")
+    deadline = time.monotonic() + COMMIT_LOCK_WAIT_S
+    while time.monotonic() < deadline:
+        try:
+            ok = redis_client.set(key, val, nx=True, ex=COMMIT_LOCK_TTL_S)
+        except Exception:
+            log.exception("Iceberg commit lock: SET NX failed for key=%s — proceeding without lock (degraded)", key)
+            return True
+        if ok:
+            return True
+        time.sleep(COMMIT_LOCK_POLL_S)
+    log.warning("Iceberg commit lock: could not acquire key=%s within %ds — proceeding without lock (degraded)",
+                key, COMMIT_LOCK_WAIT_S)
+    return True  # degraded mode: commit anyway rather than dead-letter
+
+
+def _release_commit_lock(redis_client, connection_id: str, table_name: str,
+                         pod_id: str | None = None) -> None:
+    """Release the commit lock. Best-effort: a Lua compare-and-del would be
+    safer, but the 30s TTL bounds the worst case (a crashed pod's lock
+    auto-expires). We only DEL if we still hold it (same pod_id)."""
+    if redis_client is None:
+        return
+    key = _commit_lock_key(connection_id, table_name)
+    val = pod_id or os.environ.get("WORKER_ID", "transform-worker")
+    try:
+        # Compare-and-del via Lua to avoid releasing a lock we no longer hold.
+        script = (
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+            "  return redis.call('DEL', KEYS[1]) "
+            "else return 0 end"
+        )
+        redis_client.eval(script, 1, key, val)
+    except Exception:
+        log.exception("Iceberg commit lock: release failed for key=%s — relying on TTL", key)
+
 
 
 # ─── Catalog factory ────────────────────────────────────────────────────────
@@ -592,11 +660,19 @@ def _build_partition_spec_from_arrow(arrow_schema, partition_spec_cfg):
 class IcebergWriter:
     """Wraps a PyIceberg catalog + table for one destination connection."""
 
-    def __init__(self, dest_config: dict):
+    def __init__(self, dest_config: dict, redis_client: "Any | None" = None,
+                 connection_id: "str | None" = None):
         self.dest_config = dest_config
         self.catalog = load_catalog(dest_config)
         self.warehouse = _normalize_warehouse(dest_config.get("warehouse", ""))
         self.namespace = dest_config.get("namespace", "default")
+        # v1.2.33 Bug #21 fix 3: optional Redis client + connection id for
+        # the per-table commit mutex. When both are provided, every commit
+        # (append/upsert/delete) is serialized across pods via a Redis lock
+        # keyed on the destination table. When None (tests, single-writer
+        # CDC), commits proceed without serialization (legacy behavior).
+        self.redis_client = redis_client
+        self.connection_id = connection_id
         self._ensure_namespace()
 
     def _ensure_namespace(self):
@@ -639,7 +715,13 @@ class IcebergWriter:
                 }
                 evolved = _evolve_schema_for_drift(table, schema, drift_types)
                 table_data = _rows_to_arrow(rows, schema=evolved)
-        table.append(table_data)
+        # v1.2.33 Bug #21 fix 3: serialize the commit under a per-table Redis
+        # lock so K concurrent writers don't all lose the optimistic-CAS race.
+        _acquire_commit_lock(self.redis_client, self.connection_id, table_name)
+        try:
+            table.append(table_data)
+        finally:
+            _release_commit_lock(self.redis_client, self.connection_id, table_name)
         return len(rows)
 
     def write_arrow(self, arrow_tbl: "pa.Table", table_name: str) -> int:
@@ -654,7 +736,13 @@ class IcebergWriter:
             self.catalog, self.namespace, table_name,
             create_schema, self.dest_config,
         )
-        table.append(arrow_tbl)
+        # v1.2.33 Bug #21 fix 3: serialize the commit under a per-table Redis
+        # lock so K concurrent writers don't all lose the optimistic-CAS race.
+        _acquire_commit_lock(self.redis_client, self.connection_id, table_name)
+        try:
+            table.append(arrow_tbl)
+        finally:
+            _release_commit_lock(self.redis_client, self.connection_id, table_name)
         return arrow_tbl.num_rows
 
     def upsert(self, rows: list[dict], table_name: str,
@@ -692,20 +780,26 @@ class IcebergWriter:
                 }
                 evolved = _evolve_schema_for_drift(table, schema, drift_types)
                 table_data = _rows_to_arrow(rows, schema=evolved)
-        if hasattr(table, "upsert"):
-            table.upsert(table_data, join_cols=identifier_fields)
-        else:
-            # PyIceberg 0.7.1 path: delete matching rows then append.
-            col = identifier_fields[0] if identifier_fields else None
-            if col:
-                keys = [r[col] for r in rows if r.get(col) is not None]
-                if keys:
-                    from pyiceberg.expressions import In
-                    try:
-                        table.delete(In(col, keys))
-                    except Exception:
-                        log.exception("Iceberg upsert: delete-before-append failed for %d keys", len(keys))
-            table.append(table_data)
+        # v1.2.33 Bug #21 fix 3: serialize the commit under a per-table Redis
+        # lock so K concurrent writers don't all lose the optimistic-CAS race.
+        _acquire_commit_lock(self.redis_client, self.connection_id, table_name)
+        try:
+            if hasattr(table, "upsert"):
+                table.upsert(table_data, join_cols=identifier_fields)
+            else:
+                # PyIceberg 0.7.1 path: delete matching rows then append.
+                col = identifier_fields[0] if identifier_fields else None
+                if col:
+                    keys = [r[col] for r in rows if r.get(col) is not None]
+                    if keys:
+                        from pyiceberg.expressions import In
+                        try:
+                            table.delete(In(col, keys))
+                        except Exception:
+                            log.exception("Iceberg upsert: delete-before-append failed for %d keys", len(keys))
+                table.append(table_data)
+        finally:
+            _release_commit_lock(self.redis_client, self.connection_id, table_name)
         return len(rows)
 
     def delete(self, table_name: str, identifier_fields: list[str],

@@ -273,6 +273,12 @@ class InitialLoadTask:
 
     def run(self, task: dict):
         connection_id = task["connection_id"]
+        # v1.2.33 Bug #21 fix 3: stash the current connection_id on self so
+        # the write-path helpers (_write_to_iceberg / _write_arrow_to_iceberg)
+        # can pass it to IcebergWriter for the per-table commit mutex. A new
+        # InitialLoadTask instance is created per task (see worker.py), so
+        # this is safe — no cross-task leakage.
+        self._current_connection_id = connection_id
         stream_id = task.get("stream_id")
         steps = task.get("transform_steps", [])
         source = task.get("source") or {}
@@ -441,12 +447,18 @@ class InitialLoadTask:
                         duckdb_conn, source, source_schema, source_table,
                         pk_col, cursor_pk, limit, ctype, pk_end,
                     )
-                    prefetch_q.put(("arrow", arrow_tbl))
+                    # v1.2.33 Bug #20 fix: pass `limit` (the requested_size
+                    # captured before the fetch) through the queue so the
+                    # consumer's "was this chunk full?" check compares against
+                    # the size that was actually requested — NOT the live
+                    # cur_chunk_size, which the adaptive sizer may grow
+                    # between the fetch and the check.
+                    prefetch_q.put(("arrow", arrow_tbl, limit))
                 else:
                     rows = self._fetch_chunk(source, source_schema, source_table,
                                              pk_col, cursor_pk, limit, ctype, pk_end,
                                              conn=src_conn)
-                    prefetch_q.put(("rows", rows))
+                    prefetch_q.put(("rows", rows, limit))
             except Exception as exc:  # noqa: BLE001
                 fetch_exc.append(exc)
                 prefetch_q.put(None)
@@ -507,7 +519,7 @@ class InitialLoadTask:
                                             chunk_seq, 0, last_pk, state="failed",
                                             total_chunks=total_chunks)
                 break
-            kind, payload = item
+            kind, payload, requested_size = item
             rows = payload if kind == "rows" else None
             arrow_tbl = payload if kind == "arrow" else None
 
@@ -547,7 +559,13 @@ class InitialLoadTask:
                 reached_end = True
             elif pk_end is not None and next_pk is not None and next_pk >= pk_end:
                 reached_end = True
-            elif pk_end is None and row_count < cur_chunk_size:
+            elif pk_end is None and row_count < requested_size:
+                # v1.2.33 Bug #20 fix: compare against `requested_size` (the
+                # size captured before the fetch), NOT the live cur_chunk_size.
+                # The adaptive sizer may grow cur_chunk_size between the fetch
+                # and this check (e.g. 10000 -> 20000 after a fast streak); a
+                # full chunk that returned exactly 10000 rows would otherwise
+                # be compared against the new 20000 target and falsely exit.
                 reached_end = True
             if not reached_end:
                 threading.Thread(
@@ -753,7 +771,11 @@ class InitialLoadTask:
                 # to pk <= pk_end). Do NOT break on ``row_count < cur_chunk_size``.
             else:
                 # Unbounded last partition: short chunk means end of table.
-                if row_count < cur_chunk_size:
+                # v1.2.33 Bug #20 fix: compare against `requested_size` (the
+                # size captured before the fetch), NOT the live cur_chunk_size
+                # — the adaptive sizer may grow cur_chunk_size between the
+                # fetch and this check, causing a full chunk to falsely exit.
+                if row_count < requested_size:
                     break
 
             # Fix C4: release the chunk's memory before fetching the next.
@@ -832,7 +854,8 @@ class InitialLoadTask:
         """
         from iceberg_writer import IcebergWriter
         dest_config = dest.get("connection_config") or dest.get("config") or dest
-        writer = IcebergWriter(dest_config)
+        writer = IcebergWriter(dest_config, redis_client=getattr(self, "redis", None),
+                               connection_id=getattr(self, "_current_connection_id", None))
         return writer.write_batch(rows, table_name=table_name, schema=schema)
 
     def _fetch_chunk(self, source: dict, schema_name: str, table_name: str,
@@ -1079,8 +1102,9 @@ class InitialLoadTask:
         row-dict intermediate). Delegates to IcebergWriter.write_arrow."""
         from iceberg_writer import IcebergWriter  # local import; module already imported at top in prod
         try:
-            writer = IcebergWriter(dest, table_name)
-            return writer.write_arrow(arrow_tbl)
+            writer = IcebergWriter(dest, redis_client=getattr(self, "redis", None),
+                                   connection_id=getattr(self, "_current_connection_id", None))
+            return writer.write_arrow(arrow_tbl, table_name=table_name)
         except Exception as e:
             log.error("InitialLoad: _write_arrow_to_iceberg failed (%s) — falling back to flush.", e)
             raise
