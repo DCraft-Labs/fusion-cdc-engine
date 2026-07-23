@@ -384,20 +384,21 @@ class TestNoDuplicateDequeue:
             def _get(self, key):
                 return self.lists.setdefault(key, [])
 
-            def blmove(self, src, dst, src_dir, dst_dir, timeout=0):
+            def blmove(self, first_list, second_list, timeout, src="LEFT", dest="RIGHT"):
                 # Non-blocking: return immediately if the source list is empty
                 # (the test does not need real blocking semantics — it just
                 # needs the atomic move + in-flight ownership invariant).
+                # Signature matches redis-py 5.0.4: blmove(first_list, second_list, timeout, src, dest).
                 with self.lock:
-                    s = self._get(src)
+                    s = self._get(first_list)
                     if s:
                         item = s.pop()  # RIGHT pop
-                        self._get(dst).insert(0, item)  # LEFT push
+                        self._get(second_list).insert(0, item)  # LEFT push
                         return item
                 return None
 
             def brpoplpush(self, src, dst, timeout=0):
-                return self.blmove(src, dst, "RIGHT", "LEFT", timeout)
+                return self.blmove(src, dst, timeout, "RIGHT", "LEFT")
 
             def lrem(self, key, count, value):
                 with self.lock:
@@ -458,17 +459,17 @@ class TestNoDuplicateDequeue:
             def _get(self, key):
                 return self.lists.setdefault(key, [])
 
-            def blmove(self, src, dst, src_dir, dst_dir, timeout=0):
+            def blmove(self, first_list, second_list, timeout, src="LEFT", dest="RIGHT"):
                 with self.lock:
-                    s = self._get(src)
+                    s = self._get(first_list)
                     if s:
                         item = s.pop()
-                        self._get(dst).insert(0, item)
+                        self._get(second_list).insert(0, item)
                         return item
                 return None
 
             def brpoplpush(self, src, dst, timeout=0):
-                return self.blmove(src, dst, "RIGHT", "LEFT", timeout)
+                return self.blmove(src, dst, timeout, "RIGHT", "LEFT")
 
             def lrem(self, key, count, value):
                 with self.lock:

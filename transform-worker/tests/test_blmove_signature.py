@@ -11,10 +11,12 @@ def test_blmove_signature_high_queue_call_binds():
     """The HIGH_QUEUE blmove call in _atomic_dequeue must bind to the real
     redis.Redis.blmove signature without raising TypeError."""
     sig = inspect.signature(redis.Redis.blmove)
-    # Mirror the exact call from worker.py _atomic_dequeue (HIGH_QUEUE branch)
+    # Mirror the exact call from worker.py _atomic_dequeue (HIGH_QUEUE branch).
+    # redis.Redis.blmove is accessed via the class, so the signature includes
+    # `self` as the first param — pass None for self in bind().
     HIGH_QUEUE = "fusion:transforms:high"
     IN_FLIGHT_QUEUE = "fusion:transforms:in-flight"
-    sig.bind(HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1, src="RIGHT", dest="LEFT")
+    sig.bind(None, HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1, src="RIGHT", dest="LEFT")
 
 
 def test_blmove_signature_normal_queue_call_binds():
@@ -24,7 +26,7 @@ def test_blmove_signature_normal_queue_call_binds():
     NORMAL_QUEUE = "fusion:transforms:normal"
     IN_FLIGHT_QUEUE = "fusion:transforms:in-flight"
     timeout = 5
-    sig.bind(NORMAL_QUEUE, IN_FLIGHT_QUEUE, timeout=max(1, timeout - 1), src="RIGHT", dest="LEFT")
+    sig.bind(None, NORMAL_QUEUE, IN_FLIGHT_QUEUE, timeout=max(1, timeout - 1), src="RIGHT", dest="LEFT")
 
 
 def test_blmove_timeout_is_third_positional_param():
@@ -47,6 +49,7 @@ def test_blmove_timeout_is_third_positional_param():
 def test_brpoplpush_fallback_signature_binds():
     """The brpoplpush fallback (for Redis <6.2) must also bind correctly."""
     sig = inspect.signature(redis.Redis.brpoplpush)
+    # brpoplpush(self, src, dst, timeout=0) — pass None for self.
     HIGH_QUEUE = "fusion:transforms:high"
     IN_FLIGHT_QUEUE = "fusion:transforms:in-flight"
-    sig.bind(HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1)
+    sig.bind(None, HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1)
