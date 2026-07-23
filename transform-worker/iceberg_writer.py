@@ -753,27 +753,36 @@ class IcebergWriter:
         # Prefer the explicit schema for table creation; fall back to the
         # inferred schema only when the caller did not supply one.
         create_schema = schema if schema is not None else table_data.schema
-        table = _get_or_create_table(
-            self.catalog, self.namespace, table_name,
-            create_schema, self.dest_config,
-        )
-        # If the cached schema is a subset of the row keys (schema drift),
-        # evolve the Iceberg table before appending.
-        if schema is not None:
-            row_keys = set(rows[0].keys()) if rows else set()
-            cached_names = {f.name for f in schema}
-            new_cols = row_keys - cached_names
-            if new_cols:
-                drift_types = {
-                    k: _py_val_to_arrow(rows[0].get(k))
-                    for k in new_cols
-                }
-                evolved = _evolve_schema_for_drift(table, schema, drift_types)
-                table_data = _rows_to_arrow(rows, schema=evolved)
-        # v1.2.33 Bug #21 fix 3: serialize the commit under a per-table Redis
-        # lock so K concurrent writers don't all lose the optimistic-CAS race.
+        # v1.2.36 Bug #24 fix: acquire the commit lock BEFORE loading the
+        # table object. Previously _get_or_create_table() ran outside the
+        # lock, so the table object referenced a STALE snapshot id by the
+        # time the pod got into the lock — and table.append() against the
+        # stale snapshot raised CommitFailedException: snapshot id changed.
+        # This was the root cause of partitions dead-lettering under real
+        # K=6 contention (the "snapshot id changed" errors that burned
+        # through 10 retries). Loading the table INSIDE the lock
+        # guarantees the table object reflects the latest committed
+        # snapshot. The schema-drift evolution below is also an Iceberg
+        # commit, so it must be inside the lock too.
         _acquire_commit_lock(self.redis_client, self.connection_id, table_name)
         try:
+            table = _get_or_create_table(
+                self.catalog, self.namespace, table_name,
+                create_schema, self.dest_config,
+            )
+            # If the cached schema is a subset of the row keys (schema drift),
+            # evolve the Iceberg table before appending.
+            if schema is not None:
+                row_keys = set(rows[0].keys()) if rows else set()
+                cached_names = {f.name for f in schema}
+                new_cols = row_keys - cached_names
+                if new_cols:
+                    drift_types = {
+                        k: _py_val_to_arrow(rows[0].get(k))
+                        for k in new_cols
+                    }
+                    evolved = _evolve_schema_for_drift(table, schema, drift_types)
+                    table_data = _rows_to_arrow(rows, schema=evolved)
             # v1.2.33 Bug #22 fix 2: dedup-on-PK before append (idempotency).
             if pk_col:
                 _dedup_on_pk(table, pk_col, rows=rows)
@@ -796,14 +805,17 @@ class IcebergWriter:
         if arrow_tbl is None or arrow_tbl.num_rows == 0:
             return 0
         create_schema = arrow_tbl.schema
-        table = _get_or_create_table(
-            self.catalog, self.namespace, table_name,
-            create_schema, self.dest_config,
-        )
-        # v1.2.33 Bug #21 fix 3: serialize the commit under a per-table Redis
-        # lock so K concurrent writers don't all lose the optimistic-CAS race.
+        # v1.2.36 Bug #24 fix: acquire the commit lock BEFORE loading the
+        # table object (see write_batch for the full rationale). Loading
+        # inside the lock guarantees the table object reflects the latest
+        # committed snapshot, eliminating the stale-snapshot
+        # CommitFailedException that was dead-lettering partitions.
         _acquire_commit_lock(self.redis_client, self.connection_id, table_name)
         try:
+            table = _get_or_create_table(
+                self.catalog, self.namespace, table_name,
+                create_schema, self.dest_config,
+            )
             # v1.2.33 Bug #22 fix 2: dedup-on-PK before append (idempotency).
             if pk_col:
                 _dedup_on_pk(table, pk_col, arrow_tbl=arrow_tbl)
@@ -832,25 +844,28 @@ class IcebergWriter:
             return 0
         table_data = _rows_to_arrow(rows, schema=schema)
         create_schema = schema if schema is not None else table_data.schema
-        table = _get_or_create_table(
-            self.catalog, self.namespace, table_name,
-            create_schema, self.dest_config,
-        )
-        if schema is not None:
-            row_keys = set(rows[0].keys()) if rows else set()
-            cached_names = {f.name for f in schema}
-            new_cols = row_keys - cached_names
-            if new_cols:
-                drift_types = {
-                    k: _py_val_to_arrow(rows[0].get(k))
-                    for k in new_cols
-                }
-                evolved = _evolve_schema_for_drift(table, schema, drift_types)
-                table_data = _rows_to_arrow(rows, schema=evolved)
-        # v1.2.33 Bug #21 fix 3: serialize the commit under a per-table Redis
-        # lock so K concurrent writers don't all lose the optimistic-CAS race.
+        # v1.2.36 Bug #24 fix: acquire the commit lock BEFORE loading the
+        # table object (see write_batch for the full rationale). Loading
+        # inside the lock guarantees the table object reflects the latest
+        # committed snapshot, eliminating the stale-snapshot
+        # CommitFailedException that was dead-lettering partitions.
         _acquire_commit_lock(self.redis_client, self.connection_id, table_name)
         try:
+            table = _get_or_create_table(
+                self.catalog, self.namespace, table_name,
+                create_schema, self.dest_config,
+            )
+            if schema is not None:
+                row_keys = set(rows[0].keys()) if rows else set()
+                cached_names = {f.name for f in schema}
+                new_cols = row_keys - cached_names
+                if new_cols:
+                    drift_types = {
+                        k: _py_val_to_arrow(rows[0].get(k))
+                        for k in new_cols
+                    }
+                    evolved = _evolve_schema_for_drift(table, schema, drift_types)
+                    table_data = _rows_to_arrow(rows, schema=evolved)
             if hasattr(table, "upsert"):
                 table.upsert(table_data, join_cols=identifier_fields)
             else:
