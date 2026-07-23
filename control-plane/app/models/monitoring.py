@@ -357,6 +357,28 @@ class InitialLoadCheckpoint(BaseModel):
     last_pk = Column(Text, nullable=True)
     total_chunks = Column(BigInteger, nullable=True)
     current_chunk = Column(BigInteger, nullable=False, server_default=text("0"))
+    # v1.2.29 Task 3: per-partition range bounds + estimated rows, for the
+    # real-time progress / ETA endpoint.
+    pk_start = Column(Text, nullable=True)
+    pk_end = Column(Text, nullable=True)
+    rows_estimated = Column(BigInteger, nullable=True)
 
     def __repr__(self) -> str:
         return f"<InitialLoadCheckpoint(connection={self.connection_id}, table={self.source_table})>"
+
+
+class CdcAppliedEvent(BaseModel):
+    """v1.2.29 Task 4: idempotency ledger — one row per CDC event_id that has
+    been applied to a destination. The CDC consumer checks this table before
+    applying an event so re-delivered / reprocessed events are no-ops."""
+
+    __tablename__ = "cdc_applied_events"
+
+    event_id = Column(Text, primary_key=True, nullable=False)
+    applied_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    connection_id = Column(Text, nullable=True, index=True)
+    stream_id = Column(Text, nullable=True, index=True)
+    table_name = Column(Text, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<CdcAppliedEvent(event_id={self.event_id}, table={self.table_name})>"

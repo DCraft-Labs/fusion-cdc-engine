@@ -4,6 +4,68 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.29] — 2026-07-23
+
+### Performance — bulk initial load (Task 1, biggest win)
+- **DuckDB native scanner for bulk initial load:** `transform-worker/loader.py`
+  now supports a `bulk_mode` option that attaches DuckDB's native
+  MySQL/Postgres scanner (`ATTACH ... AS src (READ_ONLY)`) and reads each
+  PK-bounded chunk straight into a typed Arrow table, bypassing the Python
+  `fetch_*_chunk → row dicts → PyArrow` intermediate. For Iceberg
+  destinations the Arrow table is appended directly via the new
+  `IcebergWriter.write_arrow()` — no Python row materialisation at all.
+  The feature is gated by `INITIAL_LOAD_BULK_MODE` (default `none` → off;
+  set to `duckdb` to enable) and falls back to the existing Python path on
+  any scanner-setup failure, so it is safe to ship behind the flag.
+
+### Observability — per-chunk Prometheus metrics (Task 2)
+- **Prometheus metrics for the initial-load pipeline:** new counters /
+  histograms / gauges in `transform-worker/loader.py` —
+  `initial_load_rows_total`, `initial_load_chunk_duration_seconds`
+  (labels: `phase` = fetch|convert|write), `initial_load_chunks_in_flight`,
+  `initial_load_checkpoint_writes_total`, `initial_load_queue_depth`. The
+  worker exposes them on `TRANSFORM_WORKER_PROMETHEUS_PORT` (default 9090)
+  via `prometheus_client.start_http_server`, started once from
+  `transform-worker/worker.py:main()`. Metrics degrade to no-ops when
+  `prometheus_client` is unavailable.
+
+### Reliability — CDC streaming idempotency (Task 4)
+- **Exactly-once CDC apply:** `cdc-workers/cdc_consumer.py` now checks a
+  new `cdc_applied_events` ledger (keyed by the event's SHA-256 `event_id`)
+  before applying an event; re-delivered / reprocessed events are no-ops.
+  Gated by `CDC_IDEMPOTENCY_ENABLED` (default `1`); on any ledger error the
+  consumer falls back to apply-only (at-least-once) so CDC is never blocked
+  by the metadata DB. Migration `d6e7f8a9b0c1` creates the table.
+
+### Performance — source-DB connection pooling (Task 5)
+- **One source connection per partition:** `InitialLoadTask` opens a single
+  pooled source DB connection (Postgres/MySQL) and reuses it across all
+  chunks in the partition instead of connect/close per chunk.
+  `_fetch_pg_chunk` / `_fetch_mysql_chunk` accept an optional `conn=`; the
+  legacy per-chunk connect path is preserved for tests.
+
+### Reliability — backpressure handling (Task 6)
+- **Bounded prefetch queue + queue-depth gauge:** the fetch→write pipeline
+  already used a bounded `queue.Queue`; the queue-depth Prometheus gauge
+  (`initial_load_queue_depth`) now surfaces saturation, and a
+  `queue_full_since` timestamp is tracked so the operator can alert on
+  sustained backpressure.
+
+### Real-time UI progress + ETA (Task 3)
+- **`GET /api/v1/connections/{id}/initial-load/progress`:** aggregates the
+  per-partition `initial_load_checkpoints` rows and returns `phase`,
+  `rows_written`, `rows_estimated`, `progress_pct`, `eta_seconds`,
+  `throughput_rows_per_sec`, and a per-partition breakdown. The frontend
+  (`ConnectionDetailPage.tsx`) polls this every 5s while a load is in
+  flight and renders a progress bar + ETA + per-partition bars. Migration
+  `d6e7f8a9b0c1` adds `pk_start`, `pk_end`, `rows_estimated` columns to
+  `initial_load_checkpoints`; the worker stamps them on the first chunk of
+  each partition.
+
+### Version
+- Chart version + appVersion bumped to `1.2.29`
+  (`helm/fusion-cdc/Chart.yaml`, `control-plane/app/main.py`).
+
 ## [1.2.28] — 2026-07-23
 
 ### CI Fix

@@ -948,6 +948,11 @@ class LoadCheckpointRequest(PydanticModel):
     # "done" (replacing the prior value), matching the worker's accounting.
     current_chunk: Optional[int] = None
     total_chunks: Optional[int] = None
+    # v1.2.29 Task 3: per-partition range bounds + estimated rows for the
+    # real-time progress / ETA endpoint.
+    pk_start: Optional[Any] = None
+    pk_end: Optional[Any] = None
+    rows_estimated: Optional[int] = None
 
 
 class LoadCheckpointResponse(PydanticModel):
@@ -1030,6 +1035,13 @@ def upsert_load_checkpoint(
             existing.current_chunk = payload.current_chunk
         if payload.total_chunks is not None:
             existing.total_chunks = payload.total_chunks
+        # v1.2.29 Task 3: persist range bounds + estimated rows.
+        if payload.pk_start is not None:
+            existing.pk_start = str(payload.pk_start)
+        if payload.pk_end is not None:
+            existing.pk_end = str(payload.pk_end)
+        if payload.rows_estimated is not None:
+            existing.rows_estimated = payload.rows_estimated
         if status == "completed":
             existing.completed_at = now
         db.commit()
@@ -1049,6 +1061,9 @@ def upsert_load_checkpoint(
         last_pk=(str(payload.last_pk) if payload.last_pk is not None else None),
         current_chunk=(payload.current_chunk if payload.current_chunk is not None else 0),
         total_chunks=payload.total_chunks,
+        pk_start=(str(payload.pk_start) if payload.pk_start is not None else None),
+        pk_end=(str(payload.pk_end) if payload.pk_end is not None else None),
+        rows_estimated=payload.rows_estimated,
     ))
     db.commit()
     _maybe_mark_initial_load_completed(db, conn_uuid, stream_uuid)

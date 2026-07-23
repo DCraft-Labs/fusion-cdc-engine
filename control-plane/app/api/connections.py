@@ -1734,6 +1734,104 @@ async def get_initial_load_status(
     }
 
 
+@router.get("/{connection_id}/initial-load/progress", response_model=dict)
+async def get_initial_load_progress(
+    connection_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """v1.2.29 Task 3: real-time initial-load progress + ETA. Aggregates the
+    per-partition ``initial_load_checkpoints`` rows for the connection and
+    returns:
+
+      - ``phase``: idle | partitioning | enqueued | running | completed | failed
+      - ``rows_written``: cumulative rows written across all partitions
+      - ``rows_estimated``: sum of per-partition estimates (NULL when unknown)
+      - ``progress_pct``: 0..100 (NULL when estimate unknown)
+      - ``eta_seconds``: estimated seconds to completion (NULL when unknown)
+      - ``throughput_rows_per_sec``: recent throughput
+      - ``partitions``: [{chunk_seq, status, rows_written, rows_estimated,
+                          pk_start, pk_end, last_pk, last_updated_at, progress_pct}]
+
+    The frontend polls this every 5s while a load is in flight.
+    """
+    from datetime import datetime, timezone
+    _get_connection_by_id(db, connection_id, current_user)
+    conn_id_str = str(connection_id)
+    state = _get_initial_load_state(conn_id_str)
+
+    rows = (
+        db.query(InitialLoadCheckpoint)
+        .filter(InitialLoadCheckpoint.connection_id == connection_id)
+        .order_by(InitialLoadCheckpoint.chunk_seq)
+        .all()
+    )
+
+    now = datetime.now(timezone.utc)
+    total_written = sum((r.rows_written or 0) for r in rows)
+    total_estimated = sum((r.rows_estimated or 0) for r in rows if r.rows_estimated)
+    has_estimate = any(r.rows_estimated for r in rows)
+
+    # Throughput: rows written since the oldest partition's started_at.
+    throughput = None
+    if rows:
+        started = min((r.started_at for r in rows if r.started_at), default=None)
+        if started is not None:
+            # Compute elapsed treating started_at as tz-aware.
+            s = started if started.tzinfo else started.replace(tzinfo=timezone.utc)
+            elapsed = (now - s).total_seconds()
+            if elapsed > 0:
+                throughput = total_written / elapsed
+
+    progress_pct = None
+    eta_seconds = None
+    if has_estimate and total_estimated > 0:
+        progress_pct = round(min(100.0, (total_written / total_estimated) * 100.0), 2)
+        if throughput and throughput > 0 and total_written < total_estimated:
+            eta_seconds = int((total_estimated - total_written) / throughput)
+
+    # Overall phase: prefer the in-memory partitioning state; otherwise infer
+    # from checkpoint statuses.
+    phase = state.get("phase", "idle")
+    if phase in ("idle", None):
+        statuses = {r.status for r in rows}
+        if statuses and all(s == "completed" for s in statuses):
+            phase = "completed"
+        elif statuses and any(s == "failed" for s in statuses):
+            phase = "failed"
+        elif statuses:
+            phase = "running"
+
+    partitions = []
+    for r in rows:
+        est = r.rows_estimated
+        written = r.rows_written or 0
+        p_pct = round(min(100.0, (written / est) * 100.0), 2) if est else None
+        partitions.append({
+            "chunk_seq": r.chunk_seq,
+            "status": r.status,
+            "rows_written": written,
+            "rows_estimated": est,
+            "pk_start": r.pk_start,
+            "pk_end": r.pk_end,
+            "last_pk": r.last_pk,
+            "last_updated_at": r.last_updated_at.isoformat() if r.last_updated_at else None,
+            "progress_pct": p_pct,
+        })
+
+    return {
+        "connection_id": conn_id_str,
+        "phase": phase,
+        "rows_written": total_written,
+        "rows_estimated": total_estimated if has_estimate else None,
+        "progress_pct": progress_pct,
+        "eta_seconds": eta_seconds,
+        "throughput_rows_per_sec": round(throughput, 2) if throughput else None,
+        "partitions": partitions,
+        "updated_at": state.get("updated_at"),
+    }
+
+
 # ===========================
 # Statistics
 # ===========================

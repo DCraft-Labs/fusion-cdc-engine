@@ -117,6 +117,13 @@ def main():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    # v1.2.28 Task 2: expose Prometheus metrics for the initial-load pipeline.
+    try:
+        from loader import _start_metrics_http_server
+        _start_metrics_http_server()
+    except Exception as e:
+        log.warning("Prometheus metrics server not started: %s", e)
+
     r = redis.from_url(REDIS_URL, decode_responses=True)
     engine = DuckDBTransformEngine(
         metadata_db_dsn=DATABASE_URL,

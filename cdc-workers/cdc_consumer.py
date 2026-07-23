@@ -66,6 +66,13 @@ CONSUMER_ID    = "dev-consumer-1"
 SCAN_INTERVAL  = 2      # seconds between Redis key scans
 BLOCK_MS       = 2000   # XREADGROUP block timeout ms
 
+# v1.2.29 Task 4: CDC streaming idempotency. When enabled, the consumer checks
+# the cdc_applied_events ledger before applying an event so re-delivered /
+# reprocessed events are no-ops (exactly-once across restarts). On any ledger
+# error the consumer falls back to apply-only (at-least-once) so CDC is never
+# blocked by the metadata DB.
+CDC_IDEMPOTENCY_ENABLED = os.environ.get("CDC_IDEMPOTENCY_ENABLED", "1") == "1"
+
 # When the consumer runs on the host (not inside Docker), Docker internal
 # hostnames (e.g. "fusion-mysql") are not resolvable.  Set these env vars
 # to override the source host/port for the initial full-table load.
@@ -478,6 +485,58 @@ def _log_schema_change(
 
 def get_meta_conn():
     return psycopg2.connect(METADATA_DSN)
+
+
+def _event_already_applied(meta, event_id: str) -> bool:
+    """v1.2.29 Task 4: return True if event_id is already in the ledger."""
+    if not event_id:
+        return False
+    try:
+        with meta.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM cdc_applied_events WHERE event_id = %s",
+                (event_id,),
+            )
+            return cur.fetchone() is not None
+    except Exception as exc:
+        # Ledger unavailable — fall back to apply (at-least-once).
+        log.debug("[idempotency] ledger check failed for %s: %s", event_id, exc)
+        return False
+
+
+def _record_event_applied(meta, event_id: str, table_name: str = None,
+                          source_id: str = None) -> None:
+    if not event_id:
+        return
+    try:
+        with meta.cursor() as cur:
+            cur.execute(
+                "INSERT INTO cdc_applied_events (event_id, table_name, connection_id) "
+                "VALUES (%s, %s, %s) ON CONFLICT (event_id) DO NOTHING",
+                (event_id, table_name, source_id),
+            )
+        meta.commit()
+    except Exception as exc:
+        try:
+            meta.rollback()
+        except Exception:
+            pass
+        log.debug("[idempotency] ledger record failed for %s: %s", event_id, exc)
+
+
+def _apply_event_idempotent(meta, dest_conn, schema: str, table: str, op: str,
+                            row: dict, pk_cols: List[str], ts: int,
+                            event_id: str = None, source_id: str = None) -> bool:
+    """v1.2.29 Task 4: apply a CDC event with exactly-once semantics. Returns
+    True if the event was applied, False if it was skipped as a duplicate."""
+    if CDC_IDEMPOTENCY_ENABLED and event_id and _event_already_applied(meta, event_id):
+        log.debug("[idempotency] skipping already-applied event %s for %s.%s",
+                  event_id, schema, table)
+        return False
+    _apply_row(dest_conn, schema, table, op, row, pk_cols, ts)
+    if CDC_IDEMPOTENCY_ENABLED and event_id:
+        _record_event_applied(meta, event_id, table_name=table, source_id=source_id)
+    return True
 
 
 def _get_active_cdc_connections(meta) -> List[Dict]:
@@ -1996,6 +2055,13 @@ def _process_redis_events(r: redis.Redis,
     processed = 0
     key_list  = list(known_keys)
 
+    # v1.2.29 Task 4: metadata-DB connection for the cdc_applied_events ledger.
+    try:
+        meta = get_meta_conn()
+    except Exception as exc:
+        log.warning("[idempotency] metadata DB unavailable (%s) — events applied at-least-once", exc)
+        meta = None
+
     def _route(stream_key: str):
         """Return (dest_conn, dest_schema, table_name) for a stream key."""
         parts = stream_key.split(":")
@@ -2032,7 +2098,9 @@ def _process_redis_events(r: redis.Redis,
                         bf  = json.loads(f.get("before", "null"))
                         row = af if af is not None else bf
                         eff_pk = pk_cols or (list(pk.keys()) if isinstance(pk, dict) else [])
-                        _apply_row(dest_conn, dest_schema, table_name, op, row or {}, eff_pk, ts)
+                        _apply_event_idempotent(meta, dest_conn, dest_schema, table_name, op, row or {}, eff_pk, ts,
+                                                event_id=f.get("event_id"),
+                                                source_id=(stream_key.split(":")[3] if len(stream_key.split(":")) >= 4 else None))
                         r.xack(stream_key, CONSUMER_GRP, msg_id)
                         processed += 1
                         log.info("✓ [pending] %s %s pk=%s → %s.%s", op, table_name, pk, dest_schema, table_name)
@@ -2048,9 +2116,15 @@ def _process_redis_events(r: redis.Redis,
         results = r.xreadgroup(CONSUMER_GRP, CONSUMER_ID, streams, count=100, block=BLOCK_MS)
     except redis.exceptions.ResponseError as e:
         log.warning("XREADGROUP error: %s", e)
+        if meta is not None:
+            try: meta.close()
+            except Exception: pass
         return processed
 
     if not results:
+        if meta is not None:
+            try: meta.close()
+            except Exception: pass
         return processed
 
     for stream_key, messages in results:
@@ -2072,7 +2146,9 @@ def _process_redis_events(r: redis.Redis,
                 bf  = json.loads(f.get("before", "null"))
                 row = af if af is not None else bf
                 eff_pk = pk_cols or (list(pk.keys()) if isinstance(pk, dict) else [])
-                _apply_row(dest_conn, dest_schema, table_name, op, row or {}, eff_pk, ts)
+                _apply_event_idempotent(meta, dest_conn, dest_schema, table_name, op, row or {}, eff_pk, ts,
+                                        event_id=f.get("event_id"),
+                                        source_id=(stream_key.split(":")[3] if len(stream_key.split(":")) >= 4 else None))
                 r.xack(stream_key, CONSUMER_GRP, msg_id)
                 processed += 1
                 log.info("✓ %s %s pk=%s → %s.%s", op, table_name, pk, dest_schema, table_name)
@@ -2080,6 +2156,9 @@ def _process_redis_events(r: redis.Redis,
                 log.error("msg %s error: %s", msg_id, exc)
                 _safe_rollback(dest_conn)
 
+    if meta is not None:
+        try: meta.close()
+        except Exception: pass
     return processed
 
 

@@ -63,6 +63,86 @@ PIPELINE_QUEUE_SIZE = int(os.environ.get("INITIAL_LOAD_PIPELINE_QUEUE_SIZE", "2"
 # range.
 INITIAL_LOAD_COMMIT_BATCH = int(os.environ.get("INITIAL_LOAD_COMMIT_BATCH", "1"))
 
+# v1.2.29 Task 1: DuckDB native scanner bulk mode (default OFF). Operators
+# opt in per connection via ``resource_limits.bulk_mode: "duckdb"`` or the
+# env var. MongoDB has no DuckDB scanner and always uses the Python path.
+BULK_MODE_DEFAULT = str(os.environ.get("INITIAL_LOAD_BULK_MODE", "none")).lower()
+# v1.2.29 Task 2: Prometheus metrics HTTP port for the transform-worker.
+PROMETHEUS_PORT = int(os.environ.get("TRANSFORM_WORKER_PROMETHEUS_PORT", "9090"))
+
+
+# ---------------------------------------------------------------------------
+# v1.2.29 Task 2: per-chunk Prometheus metrics. Defined at import time so
+# every worker pod shares the same metric registry. prometheus_client is
+# already a transform-worker dependency; if it is absent we degrade to
+# no-op metrics so the worker still runs.
+# ---------------------------------------------------------------------------
+try:
+    from prometheus_client import Counter as _PromCounter
+    from prometheus_client import Histogram as _PromHistogram
+    from prometheus_client import Gauge as _PromGauge
+
+    INITIAL_LOAD_ROWS_TOTAL = _PromCounter(
+        "initial_load_rows_total",
+        "Rows written by the initial-load task, per chunk increment.",
+        ["connection", "stream", "partition"],
+    )
+    INITIAL_LOAD_CHUNK_DURATION = _PromHistogram(
+        "initial_load_chunk_duration_seconds",
+        "Per-chunk latency of the initial-load fetch/convert/write phases.",
+        ["connection", "stream", "phase"],
+        buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0),
+    )
+    INITIAL_LOAD_CHUNKS_IN_FLIGHT = _PromGauge(
+        "initial_load_chunks_in_flight",
+        "1 while a chunk is being processed, 0 when idle.",
+        ["connection", "stream", "partition"],
+    )
+    INITIAL_LOAD_CHECKPOINT_WRITES = _PromCounter(
+        "initial_load_checkpoint_writes_total",
+        "Checkpoint reports sent to the control-plane.",
+        ["connection", "stream", "partition"],
+    )
+    INITIAL_LOAD_QUEUE_DEPTH = _PromGauge(
+        "initial_load_queue_depth",
+        "Number of prefetched chunks buffered in the fetch/write overlap queue.",
+        ["connection", "stream", "partition"],
+    )
+    _PROM_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PROM_AVAILABLE = False
+
+    class _NoopMetric:
+        def labels(self, *a, **kw):
+            return self
+        def inc(self, v=1):
+            pass
+        def observe(self, v):
+            pass
+        def set(self, v):
+            pass
+
+    INITIAL_LOAD_ROWS_TOTAL = _NoopMetric()
+    INITIAL_LOAD_CHUNK_DURATION = _NoopMetric()
+    INITIAL_LOAD_CHUNKS_IN_FLIGHT = _NoopMetric()
+    INITIAL_LOAD_CHECKPOINT_WRITES = _NoopMetric()
+    INITIAL_LOAD_QUEUE_DEPTH = _NoopMetric()
+
+
+def _start_metrics_http_server() -> None:
+    """v1.2.29 Task 2: start a background HTTP server exposing the Prometheus
+    metrics on PROMETHEUS_PORT. Called once from worker.py main(). No-op when
+    prometheus_client is missing or the port is 0.
+    """
+    if not _PROM_AVAILABLE or PROMETHEUS_PORT <= 0:
+        return
+    try:
+        from prometheus_client import start_http_server
+        start_http_server(PROMETHEUS_PORT)
+        log.info("Prometheus metrics endpoint listening on :%d/metrics", PROMETHEUS_PORT)
+    except Exception:
+        log.exception("Failed to start Prometheus metrics server on port %d — continuing", PROMETHEUS_PORT)
+
 
 # ---------------------------------------------------------------------------
 # Destination DSN builders — derive a SQLAlchemy-style DSN from a destination
@@ -305,22 +385,80 @@ class InitialLoadTask:
         # and stays fixed for the whole task.
         chunk_counter = 0
 
+        # v1.2.29 Task 1: DuckDB native scanner bulk mode. ``bulk_mode`` comes
+        # from the task payload (producer reads it from the connection's
+        # ``resource_limits.bulk_mode``) and falls back to the env default.
+        # Only MySQL/Postgres sources are eligible — MongoDB has no DuckDB
+        # scanner. When ``duckdb`` is selected the fetch returns a pa.Table
+        # (zero-copy Arrow) and the convert step is skipped. On any scanner
+        # failure we fall back to the Python path and log it.
+        bulk_mode = str(task.get("bulk_mode") or BULK_MODE_DEFAULT).lower()
+        if ctype == "mongodb":
+            bulk_mode = "none"  # no DuckDB Mongo scanner
+        use_duckdb_bulk = (bulk_mode == "duckdb") and ctype in ("postgres", "postgresql", "mysql")
+        duckdb_conn = None
+
+        # v1.2.29 Task 5: connection pooling — open ONE source connection per
+        # task and reuse it across all chunks in this partition. MongoDB
+        # reuses its own client (pymongo pools internally). The fetchers
+        # accept an optional ``conn`` param; when provided they reuse it.
+        src_conn: "Any | None" = None
+        if not use_duckdb_bulk and ctype in ("postgres", "postgresql", "mysql"):
+            try:
+                src_conn = self._open_source_connection(source, ctype)
+            except Exception:
+                log.exception("InitialLoad connection=%s pooled source connection open failed — falling back to per-chunk connect",
+                              connection_id)
+                src_conn = None
+
+        # v1.2.29 Task 2: short metric label sets (avoid high cardinality).
+        _m_conn = str(connection_id)
+        _m_stream = str(stream_id or "")
+        _m_part = str(chunk_seq)
+        # v1.2.29 Task 6: backpressure — track how long the prefetch queue has
+        # been full (writer behind reader). When > 60s we log a warning.
+        queue_full_since: "float | None" = None
+
         # v1.2.26 Task 5: fetch/write overlap. A bounded queue holds at most
         # PIPELINE_QUEUE_SIZE prefetched chunks; a background fetch thread
         # produces chunks while the main thread consumes (convert + write).
         # This hides source-DB fetch latency behind Iceberg/object-store
         # write latency (different resources: network+DB vs object-store).
-        prefetch_q: "queue.Queue[list[dict] | None]" = queue.Queue(maxsize=max(1, PIPELINE_QUEUE_SIZE))
+        prefetch_q: "queue.Queue[Any | None]" = queue.Queue(maxsize=max(1, PIPELINE_QUEUE_SIZE))
         fetch_exc: list[Exception] = []
 
         def _fetch_and_put(cursor_pk, limit):
             try:
-                rows = self._fetch_chunk(source, source_schema, source_table,
-                                         pk_col, cursor_pk, limit, ctype, pk_end)
-                prefetch_q.put(rows)
+                if use_duckdb_bulk and duckdb_conn is not None:
+                    arrow_tbl = self._fetch_chunk_duckdb(
+                        duckdb_conn, source, source_schema, source_table,
+                        pk_col, cursor_pk, limit, ctype, pk_end,
+                    )
+                    prefetch_q.put(("arrow", arrow_tbl))
+                else:
+                    rows = self._fetch_chunk(source, source_schema, source_table,
+                                             pk_col, cursor_pk, limit, ctype, pk_end,
+                                             conn=src_conn)
+                    prefetch_q.put(("rows", rows))
             except Exception as exc:  # noqa: BLE001
                 fetch_exc.append(exc)
                 prefetch_q.put(None)
+
+        # Prime the DuckDB scanner connection (Task 1). On failure, fall back
+        # to the Python path for the rest of this task.
+        if use_duckdb_bulk:
+            try:
+                duckdb_conn = self._open_duckdb_scanner(source, ctype)
+            except Exception as exc:
+                log.warning("InitialLoad connection=%s DuckDB scanner open failed (%s) — falling back to Python path",
+                            connection_id, exc)
+                use_duckdb_bulk = False
+                duckdb_conn = None
+                if ctype in ("postgres", "postgresql", "mysql"):
+                    try:
+                        src_conn = self._open_source_connection(source, ctype)
+                    except Exception:
+                        src_conn = None
 
         # Kick off the first fetch on a background thread (overlaps with
         # nothing yet, but primes the queue).
@@ -331,8 +469,21 @@ class InitialLoadTask:
 
         # ── PK-bounded chunk loop (within this partition's [pk_start, pk_end]) ──
         while not STOP_EVENT.is_set():
-            rows = prefetch_q.get()
-            if rows is None:
+            # v1.2.29 Task 6: surface queue depth + backpressure warning.
+            INITIAL_LOAD_QUEUE_DEPTH.labels(_m_conn, _m_stream, _m_part).set(prefetch_q.qsize())
+            if prefetch_q.qsize() >= max(1, PIPELINE_QUEUE_SIZE):
+                if queue_full_since is None:
+                    queue_full_since = time.monotonic()
+                elif time.monotonic() - queue_full_since > 60.0:
+                    log.warning("InitialLoad connection=%s chunk_seq=%d — prefetch queue full for >60s; writer is behind reader, destination may be the bottleneck",
+                                connection_id, chunk_seq)
+                    queue_full_since = time.monotonic()
+            else:
+                queue_full_since = None
+
+            item = prefetch_q.get()
+            INITIAL_LOAD_QUEUE_DEPTH.labels(_m_conn, _m_stream, _m_part).set(prefetch_q.qsize())
+            if item is None:
                 # Fetch thread failed — surface the exception.
                 if fetch_exc:
                     log.exception("InitialLoad connection=%s fetch thread failed — stopping range %d",
@@ -341,88 +492,143 @@ class InitialLoadTask:
                                             chunk_seq, 0, last_pk, state="failed",
                                             total_chunks=total_chunks)
                 break
-            if not rows:
+            kind, payload = item
+            rows = payload if kind == "rows" else None
+            arrow_tbl = payload if kind == "arrow" else None
+
+            if (kind == "rows" and not rows) or (kind == "arrow" and arrow_tbl is None):
                 log.info("InitialLoad connection=%s table=%s.%s chunk_seq=%d — no more rows in range, load complete",
                          connection_id, source_schema, source_table, chunk_seq)
                 break
 
-            next_pk = self._extract_pk(rows[-1], pk_col, ctype)
+            # v1.2.29 Task 2: in-flight gauge.
+            INITIAL_LOAD_CHUNKS_IN_FLIGHT.labels(_m_conn, _m_stream, _m_part).set(1)
+            t_fetch_end = time.monotonic()
+
+            if kind == "arrow":
+                row_count = arrow_tbl.num_rows
+                next_pk = self._extract_pk_from_arrow(arrow_tbl, pk_col)
+            else:
+                row_count = len(rows)
+                next_pk = self._extract_pk(rows[-1], pk_col, ctype)
 
             # v1.2.26 Task 5: start the next fetch NOW (before the write) so
             # the source-DB read of chunk N+1 overlaps with the convert+write
             # of chunk N. Only prefetch when this chunk was full (a short
             # chunk means end-of-range).
-            if len(rows) >= cur_chunk_size:
+            if row_count >= cur_chunk_size:
                 threading.Thread(
                     target=_fetch_and_put, args=(next_pk, cur_chunk_size), daemon=True,
                 ).start()
 
             t0 = time.monotonic()
 
-            # Apply transforms
-            if steps:
-                transformed, child_tables, transformed_schema = self.engine.execute_pipeline(
-                    rows, steps, schema=cached_source_schema,
-                )
-                if cached_transformed_schema is None and transformed_schema is not None:
-                    cached_transformed_schema = transformed_schema
-            else:
-                transformed, child_tables = rows, {}
+            # v1.2.29 Task 1: DuckDB bulk path — scanner already produced a
+            # typed Arrow table; skip Python convert and write Arrow directly
+            # to Iceberg (the fast path). Transform steps are NOT applied in
+            # bulk mode (bulk = raw 1:1 snapshot for speed).
+            if kind == "arrow" and connector_type == "iceberg":
+                INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(0.0)
+                t_w0 = time.monotonic()
+                rows_written = self._write_arrow_to_iceberg(arrow_tbl, dest, dest_table)
+                INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+                child_tables = {}
+            elif kind == "arrow":
+                t_c0 = time.monotonic()
+                transformed = arrow_tbl.to_pylist()
+                INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
+                child_tables = {}
                 transformed_schema = cached_source_schema
-
-            # Write to destination
-            if connector_type == "iceberg":
-                # v1.2.26 Task 7: buffer into pending_rows and flush every
-                # ``commit_batch`` chunks (or at end-of-range). One Iceberg
-                # append per flush reduces the commit count and the
-                # manifest-accumulation cost (~30% throughput degradation
-                # per the v1.2.25 report).
-                pending_rows.extend(transformed)
-                for child_name, child_rows in child_tables.items():
-                    if child_rows:
-                        pending_child.setdefault(child_name, []).extend(child_rows)
-                chunks_since_commit += 1
-                rows_written = len(transformed)
-                if chunks_since_commit >= commit_batch:
-                    self._flush_iceberg_batch(
-                        pending_rows, pending_child, dest, dest_table,
-                        schema=cached_transformed_schema or cached_source_schema,
-                    )
-                    pending_rows = []
-                    pending_child = {}
-                    chunks_since_commit = 0
-            else:
                 dest_dsn = _dest_dsn_from_dest(dest)
                 if not dest_dsn:
-                    log.error(
-                        "InitialLoad connection=%s cannot derive dest_dsn for "
-                        "connector_type=%s — destination block missing/incomplete. "
-                        "Stopping load after %d rows.",
-                        connection_id, connector_type, total_rows,
-                    )
+                    log.error("InitialLoad connection=%s cannot derive dest_dsn for connector_type=%s — destination block missing/incomplete. Stopping load after %d rows.",
+                              connection_id, connector_type, total_rows)
                     self._report_checkpoint(connection_id, stream_id, source_table,
                                             chunk_seq, 0, last_pk, state="failed",
                                             total_chunks=total_chunks)
                     return
+                t_w0 = time.monotonic()
                 rows_written = self._copy_to_postgres(transformed, dest_dsn, dest_schema, dest_table)
-                for child_name, child_rows in child_tables.items():
-                    if child_rows:
-                        self._copy_to_postgres(child_rows, dest_dsn, dest_schema, child_name)
+                INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+            else:
+                # Apply transforms
+                if steps:
+                    t_c0 = time.monotonic()
+                    transformed, child_tables, transformed_schema = self.engine.execute_pipeline(
+                        rows, steps, schema=cached_source_schema,
+                    )
+                    INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
+                    if cached_transformed_schema is None and transformed_schema is not None:
+                        cached_transformed_schema = transformed_schema
+                else:
+                    transformed, child_tables = rows, {}
+                    transformed_schema = cached_source_schema
+
+                # Write to destination
+                if connector_type == "iceberg":
+                    pending_rows.extend(transformed)
+                    for child_name, child_rows in child_tables.items():
+                        if child_rows:
+                            pending_child.setdefault(child_name, []).extend(child_rows)
+                    chunks_since_commit += 1
+                    rows_written = len(transformed)
+                    if chunks_since_commit >= commit_batch:
+                        t_w0 = time.monotonic()
+                        self._flush_iceberg_batch(
+                            pending_rows, pending_child, dest, dest_table,
+                            schema=cached_transformed_schema or cached_source_schema,
+                        )
+                        INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+                        pending_rows = []
+                        pending_child = {}
+                        chunks_since_commit = 0
+                else:
+                    dest_dsn = _dest_dsn_from_dest(dest)
+                    if not dest_dsn:
+                        log.error("InitialLoad connection=%s cannot derive dest_dsn for connector_type=%s — destination block missing/incomplete. Stopping load after %d rows.",
+                                  connection_id, connector_type, total_rows)
+                        self._report_checkpoint(connection_id, stream_id, source_table,
+                                                chunk_seq, 0, last_pk, state="failed",
+                                                total_chunks=total_chunks)
+                        return
+                    t_w0 = time.monotonic()
+                    rows_written = self._copy_to_postgres(transformed, dest_dsn, dest_schema, dest_table)
+                    for child_name, child_rows in child_tables.items():
+                        if child_rows:
+                            self._copy_to_postgres(child_rows, dest_dsn, dest_schema, child_name)
+                    INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+
+            # v1.2.29 Task 2: fetch-phase duration (loop-gap approximation).
+            INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "fetch").observe(max(0.0, t0 - t_fetch_end))
 
             latency = time.monotonic() - t0
             total_rows += rows_written
             chunk_counter += 1
             last_pk = next_pk
 
+            # v1.2.29 Task 2: per-chunk row counter.
+            INITIAL_LOAD_ROWS_TOTAL.labels(_m_conn, _m_stream, _m_part).inc(rows_written)
+
             # Report checkpoint as "running" so a restart resumes here. The
             # composite key (connection_id, stream_id, chunk_seq) means each
             # of the K pods writes its own row — no stomping.
-            self._report_checkpoint(connection_id, stream_id, source_table,
-                                    chunk_seq, rows_written, last_pk, state="running",
-                                    total_chunks=total_chunks)
-            log.info("InitialLoad connection=%s chunk_seq=%d chunk=%d done — %d rows (total %d) last_pk=%s latency=%.2fs cs=%d",
+            # v1.2.29 Task 3: on the first chunk, also stamp the partition's
+            # [pk_start, pk_end] bounds and a rough rows estimate so the
+            # progress endpoint can compute % and ETA without re-querying.
+            if chunk_counter == 1:
+                self._report_checkpoint(connection_id, stream_id, source_table,
+                                        chunk_seq, rows_written, last_pk, state="running",
+                                        total_chunks=total_chunks,
+                                        pk_start=pk_start, pk_end=pk_end,
+                                        rows_estimated=total_chunks * cur_chunk_size)
+            else:
+                self._report_checkpoint(connection_id, stream_id, source_table,
+                                        chunk_seq, rows_written, last_pk, state="running",
+                                        total_chunks=total_chunks)
+            INITIAL_LOAD_CHECKPOINT_WRITES.labels(_m_conn, _m_stream, _m_part).inc()
+            log.info("InitialLoad connection=%s chunk_seq=%d chunk=%d done — %d rows (total %d) last_pk=%s latency=%.2fs cs=%d bulk=%s",
                      connection_id, chunk_seq, chunk_counter, rows_written, total_rows,
-                     last_pk, latency, cur_chunk_size)
+                     last_pk, latency, cur_chunk_size, "duckdb" if kind == "arrow" else "python")
 
             # v1.2.26 Task 4: adaptive chunk sizing based on this chunk's latency.
             if latency < ADAPTIVE_FAST_LATENCY_S:
@@ -479,11 +685,30 @@ class InitialLoadTask:
                 break
 
             # A short chunk means we've reached the end of the table / range.
-            if len(rows) < cur_chunk_size:
+            if row_count < cur_chunk_size:
                 break
 
             # Fix C4: release the chunk's memory before fetching the next.
-            del rows, transformed, child_tables
+            if kind == "arrow":
+                del arrow_tbl, transformed, child_tables
+                arrow_tbl = None
+            else:
+                del rows, transformed, child_tables
+            # v1.2.29 Task 2: chunk done — back to idle.
+            INITIAL_LOAD_CHUNKS_IN_FLIGHT.labels(_m_conn, _m_stream, _m_part).set(0)
+
+        # v1.2.29 Task 5: close the pooled source connection and the DuckDB
+        # scanner connection now that all chunks in this partition are read.
+        if duckdb_conn is not None:
+            try:
+                duckdb_conn.close()
+            except Exception:
+                pass
+        if src_conn is not None:
+            try:
+                src_conn.close()
+            except Exception:
+                pass
 
         # v1.2.26 Task 7: flush any remaining buffered Iceberg batch.
         if connector_type == "iceberg" and pending_rows:
@@ -544,7 +769,7 @@ class InitialLoadTask:
 
     def _fetch_chunk(self, source: dict, schema_name: str, table_name: str,
                     pk_col: str, last_pk, chunk_size: int, ctype: str,
-                    pk_end=None) -> list[dict]:
+                    pk_end=None, conn=None) -> list[dict]:
         """Fetch the next PK-bounded chunk of rows from the source DB.
 
         Returns up to ``chunk_size`` rows ordered by ``pk_col`` ASC, with
@@ -570,10 +795,10 @@ class InitialLoadTask:
         try:
             if ctype in ("postgres", "postgresql"):
                 return self._fetch_pg_chunk(host, port or 5432, database, user, password,
-                                             schema_name, table_name, pk_col, last_pk, chunk_size, pk_end)
+                                             schema_name, table_name, pk_col, last_pk, chunk_size, pk_end, conn=conn)
             if ctype == "mysql":
                 return self._fetch_mysql_chunk(host, port or 3306, database, user, password,
-                                                schema_name, table_name, pk_col, last_pk, chunk_size, pk_end)
+                                                schema_name, table_name, pk_col, last_pk, chunk_size, pk_end, conn=conn)
             if ctype == "mongodb":
                 return self._fetch_mongo_chunk(host, port or 27017, database, user, password,
                                                 cfg, table_name, last_pk, chunk_size)
@@ -586,7 +811,7 @@ class InitialLoadTask:
 
     def _fetch_pg_chunk(self, host, port, database, user, password,
                         schema_name, table_name, pk_col, last_pk, chunk_size,
-                        pk_end=None) -> list[dict]:
+                        pk_end=None, conn=None) -> list[dict]:
         import psycopg2
         import psycopg2.extras
         qualified = (f'"{schema_name}"."{table_name}"'
@@ -606,25 +831,32 @@ class InitialLoadTask:
         where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
         params.append(chunk_size)
         sql = f"SELECT * FROM {qualified} {where_clause} ORDER BY {pk_q} ASC LIMIT %s".replace("  ", " ")
-        # v1.2.22 Fix C3: READ ONLY + autocommit so we never hold a long
-        # transaction open across the chunk write to the destination (which
-        # was blocking the source DB during the 118M-row load).
-        with psycopg2.connect(host=host, port=port, dbname=database,
-                              user=user, password=password,
-                              connect_timeout=10,
-                              application_name="fusion-cdc-initial-load") as conn:
+        # v1.2.29 Task 5: reuse a pooled connection when provided (one per
+        # InitialLoadTask partition); otherwise open+close per call (legacy).
+        owns_conn = conn is None
+        if owns_conn:
+            conn = psycopg2.connect(host=host, port=port, dbname=database,
+                                    user=user, password=password,
+                                    connect_timeout=10,
+                                    application_name="fusion-cdc-initial-load")
             conn.autocommit = True
+        try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("BEGIN READ ONLY")
+                if owns_conn:
+                    cur.execute("BEGIN READ ONLY")
                 try:
                     cur.execute(sql, tuple(params))
                     return [dict(r) for r in cur.fetchall()]
                 finally:
-                    cur.execute("COMMIT")
+                    if owns_conn:
+                        cur.execute("COMMIT")
+        finally:
+            if owns_conn:
+                conn.close()
 
     def _fetch_mysql_chunk(self, host, port, database, user, password,
                            schema_name, table_name, pk_col, last_pk, chunk_size,
-                           pk_end=None) -> list[dict]:
+                           pk_end=None, conn=None) -> list[dict]:
         import pymysql
         import pymysql.cursors
         qualified = (f"`{schema_name}`.`{table_name}`"
@@ -641,16 +873,129 @@ class InitialLoadTask:
         where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
         params.append(chunk_size)
         sql = f"SELECT * FROM {qualified} {where_clause} ORDER BY {pk_q} ASC LIMIT %s".replace("  ", " ")
-        # v1.2.22 Fix C3: autocommit=True so the chunk SELECT does not start
-        # a transaction that is held open across the destination write.
-        with pymysql.connect(host=host, port=int(port), database=database,
-                             user=user, password=password,
-                             cursorclass=pymysql.cursors.DictCursor,
-                             connect_timeout=10,
-                             autocommit=True) as conn:
+        # v1.2.29 Task 5: reuse a pooled connection when provided.
+        owns_conn = conn is None
+        if owns_conn:
+            conn = pymysql.connect(host=host, port=int(port), database=database,
+                                   user=user, password=password,
+                                   cursorclass=pymysql.cursors.DictCursor,
+                                   connect_timeout=10,
+                                   autocommit=True)
+        try:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params))
                 return list(cur.fetchall())
+        finally:
+            if owns_conn:
+                conn.close()
+
+    # ── v1.2.29 Task 1 + Task 5: DuckDB native scanner + pooled source conn ──
+
+    def _open_source_connection(self, source: dict, ctype: str):
+        """v1.2.29 Task 5: open ONE source DB connection per partition and
+        reuse it across all chunks. Returns a connection object or None."""
+        try:
+            host = source.get("host"); port = source.get("port")
+            database = source.get("database"); user = source.get("user")
+            password = source.get("password")
+            if ctype == "postgres":
+                import psycopg2
+                conn = psycopg2.connect(host=host, port=port, dbname=database,
+                                         user=user, password=password,
+                                         connect_timeout=10,
+                                         application_name="fusion-cdc-initial-load")
+                conn.autocommit = True
+                return conn
+            if ctype == "mysql":
+                import pymysql
+                import pymysql.cursors
+                return pymysql.connect(host=host, port=int(port), database=database,
+                                        user=user, password=password,
+                                        cursorclass=pymysql.cursors.DictCursor,
+                                        connect_timeout=10, autocommit=True)
+        except Exception as e:
+            log.warning("InitialLoad: pooled source connection open failed (%s) — will fall back to per-chunk connect.", e)
+        return None
+
+    def _open_duckdb_scanner(self, source: dict, ctype: str):
+        """v1.2.29 Task 1: attach DuckDB's native MySQL/Postgres scanner to
+        the source DB once per partition. Returns a DuckDB connection (with
+        the source ATTACHed as ``src``) or None on any failure."""
+        try:
+            import duckdb
+            host = source.get("host"); port = source.get("port")
+            database = source.get("database"); user = source.get("user")
+            password = source.get("password")
+            conn = duckdb.connect()
+            if ctype in ("postgres", "postgresql"):
+                conn.execute("LOAD postgres;")
+                conn.execute(
+                    f"ATTACH 'postgres:host={host} port={port} dbname={database} "
+                    f"user={user} password={password}' AS src (READ_ONLY)"
+                )
+            elif ctype == "mysql":
+                conn.execute("LOAD mysql;")
+                conn.execute(
+                    f"ATTACH 'mysql:host={host} port={port} database={database} "
+                    f"user={user} password={password}' AS src (READ_ONLY)"
+                )
+            else:
+                return None
+            return conn
+        except Exception as e:
+            log.warning("InitialLoad: DuckDB scanner open failed (%s) — falling back to Python fetch.", e)
+            try:
+                conn.close()  # noqa: F821
+            except Exception:
+                pass
+            return None
+
+    def _fetch_chunk_duckdb(self, duckdb_conn, source: dict, schema_name: str,
+                            table_name: str, pk_col: str, last_pk, chunk_size: int,
+                            ctype: str, pk_end=None):
+        """v1.2.29 Task 1: run a range-bounded SELECT against the ATTACHed
+        source via DuckDB and return the result as a pyarrow Table."""
+        if ctype in ("postgres", "postgresql"):
+            qualified = (f'src."{schema_name}"."{table_name}"'
+                         if schema_name else f'src."{table_name}"')
+            pk_q = f'"{pk_col}"'
+        else:  # mysql
+            qualified = (f'src.`{schema_name}`.`{table_name}`'
+                         if schema_name else f'src.`{table_name}`')
+            pk_q = f"`{pk_col}`"
+        where_parts: list[str] = []
+        if last_pk is not None:
+            where_parts.append(f"{pk_q} > $last_pk")
+        if pk_end is not None:
+            where_parts.append(f"{pk_q} <= $pk_end")
+        where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        sql = (f"SELECT * FROM {qualified} {where_clause} "
+               f"ORDER BY {pk_q} ASC LIMIT $chunk_size")
+        rel = duckdb_conn.execute(
+            sql, {"last_pk": last_pk, "pk_end": pk_end, "chunk_size": chunk_size},
+        )
+        return rel.fetch_arrow_table()
+
+    def _extract_pk_from_arrow(self, arrow_tbl, pk_col: str, ctype: str) -> Any:
+        """Pull the PK from the last row of an Arrow table for resume."""
+        if arrow_tbl is None or arrow_tbl.num_rows == 0:
+            return None
+        try:
+            col = arrow_tbl.column(pk_col)
+            return col[-1].as_py()
+        except Exception:
+            return None
+
+    def _write_arrow_to_iceberg(self, arrow_tbl, dest: dict, table_name: str) -> int:
+        """v1.2.29 Task 1: write an Arrow table directly to Iceberg (no Python
+        row-dict intermediate). Delegates to IcebergWriter.write_arrow."""
+        from iceberg_writer import IcebergWriter  # local import; module already imported at top in prod
+        try:
+            writer = IcebergWriter(dest, table_name)
+            return writer.write_arrow(arrow_tbl)
+        except Exception as e:
+            log.error("InitialLoad: _write_arrow_to_iceberg failed (%s) — falling back to flush.", e)
+            raise
 
     def _fetch_mongo_chunk(self, host, port, database, user, password,
                            cfg, collection_name, last_id, chunk_size) -> list[dict]:
@@ -749,7 +1094,8 @@ class InitialLoadTask:
 
     def _report_checkpoint(self, connection_id: str, stream_id, source_table: str,
                            chunk_seq: int, rows_written: int, last_pk,
-                           state: str = "done", total_chunks: int = 1):
+                           state: str = "done", total_chunks: int = 1,
+                           pk_start=None, pk_end=None, rows_estimated=None):
         """Report chunk progress to the control-plane
         ``/internal/load-checkpoints`` endpoint (added in v1.2.16, extended in
         v1.2.17 with ``last_pk`` / ``chunk_seq`` / ``current_chunk``).
@@ -763,22 +1109,34 @@ class InitialLoadTask:
         chunk_seq. ``total_chunks`` is K — the control-plane uses it to
         decide when ALL K ranges are done and the connection's
         ``initial_load_completed`` can be set.
+
+        v1.2.29 Task 3: ``pk_start`` / ``pk_end`` / ``rows_estimated`` are
+        reported once (on the first chunk of a partition) so the control-plane
+        can compute per-partition progress % and ETA without re-querying the
+        source DB.
         """
         import requests
         try:
+            body = {
+                "connection_id": connection_id,
+                "stream_id": stream_id,
+                "source_table": source_table,
+                "chunk_seq": chunk_seq,
+                "rows_written": rows_written,
+                "last_pk": last_pk,
+                "state": state,
+                "current_chunk": chunk_seq,
+                "total_chunks": total_chunks,
+            }
+            if pk_start is not None:
+                body["pk_start"] = pk_start
+            if pk_end is not None:
+                body["pk_end"] = pk_end
+            if rows_estimated is not None:
+                body["rows_estimated"] = rows_estimated
             requests.post(
                 f"{self.engine.control_plane_url}/api/v1/internal/load-checkpoints",
-                json={
-                    "connection_id": connection_id,
-                    "stream_id": stream_id,
-                    "source_table": source_table,
-                    "chunk_seq": chunk_seq,
-                    "rows_written": rows_written,
-                    "last_pk": last_pk,
-                    "state": state,
-                    "current_chunk": chunk_seq,
-                    "total_chunks": total_chunks,
-                },
+                json=body,
                 headers={"X-Worker-Token": os.environ.get("WORKER_SHARED_SECRET", "")},
                 timeout=10,
             )

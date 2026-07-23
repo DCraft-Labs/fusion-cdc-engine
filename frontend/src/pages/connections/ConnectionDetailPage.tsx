@@ -88,6 +88,22 @@ export function ConnectionDetailPage() {
     refetchInterval: 30000,
   });
 
+  // v1.2.29 Task 3: real-time initial-load progress + ETA. Poll every 5s
+  // while a load is in flight; stop once the phase is terminal.
+  const { data: loadProgress } = useQuery({
+    queryKey: ["connections", id, "initial-load-progress"],
+    queryFn: () =>
+      api.get(`/connections/${id}/initial-load/progress`).then((r) => r.data).catch(() => null),
+    enabled: !!id,
+    refetchInterval: (query) => {
+      const d = query.state.data as any | undefined;
+      if (!d) return 5000;
+      const phase = d.phase as string | undefined;
+      if (phase === "completed" || phase === "failed" || phase === "idle") return false;
+      return 5000;
+    },
+  });
+
   const pauseMutation = useMutation({
     mutationFn: () => api.post(`/connections/${id}/pause`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["connections", id] }),
@@ -263,6 +279,89 @@ export function ConnectionDetailPage() {
         >
           {retryMsg.kind === "success" ? "✓ " : "✗ "}
           {retryMsg.text}
+        </div>
+      )}
+
+      {/* v1.2.29 Task 3: real-time initial-load progress + ETA */}
+      {loadProgress && loadProgress.phase && loadProgress.phase !== "idle" && (
+        <div className="rounded-md border bg-card p-4 text-sm shadow-sm">
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="text-base font-semibold">Initial Load Progress</h3>
+            <span
+              className={
+                "rounded px-2 py-0.5 text-xs font-medium " +
+                (loadProgress.phase === "completed"
+                  ? "bg-green-500/15 text-green-700 dark:text-green-400"
+                  : loadProgress.phase === "failed"
+                  ? "bg-destructive/15 text-destructive"
+                  : "bg-blue-500/15 text-blue-700 dark:text-blue-400")
+              }
+            >
+              {loadProgress.phase}
+            </span>
+          </div>
+          <div className="mb-3 h-2 w-full overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full bg-primary transition-all"
+              style={{ width: `${loadProgress.progress_pct ?? 0}%` }}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground sm:grid-cols-4">
+            <div>
+              <div className="font-medium text-foreground">{(loadProgress.rows_written ?? 0).toLocaleString()}</div>
+              <div>rows written</div>
+            </div>
+            <div>
+              <div className="font-medium text-foreground">
+                {loadProgress.rows_estimated != null ? (loadProgress.rows_estimated as number).toLocaleString() : "—"}
+              </div>
+              <div>rows estimated</div>
+            </div>
+            <div>
+              <div className="font-medium text-foreground">
+                {loadProgress.progress_pct != null ? `${loadProgress.progress_pct}%` : "—"}
+              </div>
+              <div>progress</div>
+            </div>
+            <div>
+              <div className="font-medium text-foreground">
+                {loadProgress.eta_seconds != null
+                  ? loadProgress.eta_seconds > 60
+                    ? `${Math.ceil(loadProgress.eta_seconds / 60)} min`
+                    : `${loadProgress.eta_seconds} s`
+                  : "—"}
+              </div>
+              <div>ETA</div>
+            </div>
+          </div>
+          {loadProgress.throughput_rows_per_sec != null && (
+            <div className="mt-1 text-xs text-muted-foreground">
+              {loadProgress.throughput_rows_per_sec.toLocaleString()} rows/s
+            </div>
+          )}
+          {Array.isArray(loadProgress.partitions) && loadProgress.partitions.length > 0 && (
+            <div className="mt-3">
+              <div className="mb-1 text-xs font-medium">Partitions</div>
+              <div className="space-y-1">
+                {loadProgress.partitions.map((p: any) => (
+                  <div key={p.chunk_seq} className="flex items-center gap-2 text-xs">
+                    <span className="w-16 shrink-0 text-muted-foreground">#{p.chunk_seq}</span>
+                    <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+                      <div
+                        className="h-full bg-primary/70"
+                        style={{ width: `${p.progress_pct ?? 0}%` }}
+                      />
+                    </div>
+                    <span className="w-24 shrink-0 text-right tabular-nums text-muted-foreground">
+                      {(p.rows_written ?? 0).toLocaleString()}
+                      {p.rows_estimated != null ? ` / ${(p.rows_estimated as number).toLocaleString()}` : ""}
+                    </span>
+                    <span className="w-16 shrink-0 text-muted-foreground">{p.status}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

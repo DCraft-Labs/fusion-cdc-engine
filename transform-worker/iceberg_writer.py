@@ -642,6 +642,21 @@ class IcebergWriter:
         table.append(table_data)
         return len(rows)
 
+    def write_arrow(self, arrow_tbl: "pa.Table", table_name: str) -> int:
+        """v1.2.29 Task 1: append a pre-built Arrow table directly to Iceberg,
+        skipping the Python row-dict → Arrow conversion (the DuckDB native
+        scanner already produced typed Arrow). Used by the bulk initial-load
+        path. Returns the number of rows appended."""
+        if arrow_tbl is None or arrow_tbl.num_rows == 0:
+            return 0
+        create_schema = arrow_tbl.schema
+        table = _get_or_create_table(
+            self.catalog, self.namespace, table_name,
+            create_schema, self.dest_config,
+        )
+        table.append(arrow_tbl)
+        return arrow_tbl.num_rows
+
     def upsert(self, rows: list[dict], table_name: str,
                identifier_fields: list[str],
                schema: pa.Schema | None = None) -> int:
