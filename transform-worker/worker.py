@@ -137,7 +137,7 @@ def _atomic_dequeue(r: redis.Redis, timeout: int = 5):
     # Try the high-priority queue first (1s block so a pending high task is
     # picked up immediately, but we don't block the whole timeout on it).
     try:
-        raw = r.blmove(HIGH_QUEUE, IN_FLIGHT_QUEUE, "RIGHT", "LEFT", timeout=1)
+        raw = r.blmove(HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1, src="RIGHT", dest="LEFT")
     except redis.ResponseError:
         # Older Redis (<6.2) has no BLMOVE — fall back to BRPOPLPUSH.
         raw = r.brpoplpush(HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1)
@@ -145,7 +145,7 @@ def _atomic_dequeue(r: redis.Redis, timeout: int = 5):
         return HIGH_QUEUE, raw
     # Then the normal-priority queue for the remainder of the window.
     try:
-        raw = r.blmove(NORMAL_QUEUE, IN_FLIGHT_QUEUE, "RIGHT", "LEFT", timeout=max(1, timeout - 1))
+        raw = r.blmove(NORMAL_QUEUE, IN_FLIGHT_QUEUE, timeout=max(1, timeout - 1), src="RIGHT", dest="LEFT")
     except redis.ResponseError:
         raw = r.brpoplpush(NORMAL_QUEUE, IN_FLIGHT_QUEUE, timeout=max(1, timeout - 1))
     if raw is not None:

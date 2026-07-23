@@ -1,0 +1,266 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.4.2, pluggy-1.6.0 -- C:\Users\rishi\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\python.exe
+cachedir: .pytest_cache
+rootdir: E:\Dcraft\.tmp\fusion-cdc-engine-private
+plugins: anyio-4.11.0, asyncio-1.2.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 10 items
+
+transform-worker/tests/test_v130_correctness.py::TestPartitionLoopContinuesPastShortChunk::test_dense_range_fetches_both_chunks_and_stops_at_boundary PASSED [ 10%]
+transform-worker/tests/test_v130_correctness.py::TestPartitionLoopContinuesPastShortChunk::test_short_first_chunk_with_room_left_continues PASSED [ 20%]
+transform-worker/tests/test_v130_correctness.py::TestAllPartitionsGetCheckpoint::test_four_concurrent_partitions_all_report PASSED [ 30%]
+transform-worker/tests/test_v130_correctness.py::TestAllPartitionsGetCheckpoint::test_exception_path_reports_failed_checkpoint PASSED [ 40%]
+transform-worker/tests/test_v130_correctness.py::TestRowsEstimatedFromPartitioning::test_worker_stamps_payload_estimate_on_first_checkpoint PASSED [ 50%]
+transform-worker/tests/test_v130_correctness.py::TestRowsEstimatedFromPartitioning::test_progress_pct_below_100_until_estimate_reached PASSED [ 60%]
+transform-worker/tests/test_v130_correctness.py::TestRowsEstimatedFromPartitioning::test_density_estimate_partitions_sum_to_table_rows PASSED [ 70%]
+transform-worker/tests/test_v130_correctness.py::TestNoDuplicateDequeue::test_two_workers_never_get_same_task FAILED [ 80%]
+transform-worker/tests/test_v130_correctness.py::TestNoDuplicateDequeue::test_two_workers_never_get_same_task_concurrent FAILED [ 90%]
+transform-worker/tests/test_v130_correctness.py::TestPrematureDoneFixRegression::test_25m_range_does_not_done_at_50k FAILED [100%]
+
+================================== FAILURES ===================================
+_________ TestNoDuplicateDequeue.test_two_workers_never_get_same_task _________
+
+self = <tests.test_v130_correctness.TestNoDuplicateDequeue object at 0x0000025F593C4410>
+tmp_path = WindowsPath('C:/Users/rishi/AppData/Local/Temp/pytest-of-rishi/pytest-0/test_two_workers_never_get_sam0')
+
+    def test_two_workers_never_get_same_task(self, tmp_path):
+        """Prove the atomic-dequeue invariant directly without real threads:
+        enqueue ONE task, dequeue it (BLMOVE moves it to in-flight), then a
+        second dequeue attempt on the now-empty main queue returns None. The
+        task is exclusively owned by the first dequeue ù a second worker
+        cannot get it. Then ack (LREM) removes it from in-flight."""
+        class FakeRedis:
+            def __init__(self):
+                self.lists = {}
+                self.lock = threading.Lock()
+    
+            def _get(self, key):
+                return self.lists.setdefault(key, [])
+    
+            def blmove(self, src, dst, src_dir, dst_dir, timeout=0):
+                # Non-blocking: return immediately if the source list is empty
+                # (the test does not need real blocking semantics ù it just
+                # needs the atomic move + in-flight ownership invariant).
+                with self.lock:
+                    s = self._get(src)
+                    if s:
+                        item = s.pop()  # RIGHT pop
+                        self._get(dst).insert(0, item)  # LEFT push
+                        return item
+                return None
+    
+            def brpoplpush(self, src, dst, timeout=0):
+                return self.blmove(src, dst, "RIGHT", "LEFT", timeout)
+    
+            def lrem(self, key, count, value):
+                with self.lock:
+                    s = self._get(key)
+                    removed = 0
+                    for _ in range(count):
+                        try:
+                            s.remove(value)
+                            removed += 1
+                        except ValueError:
+                            break
+                    return removed
+    
+            def lpush(self, key, value):
+                with self.lock:
+                    self._get(key).insert(0, value)
+    
+        r = FakeRedis()
+        high = "fusion:transforms:high"
+        inflight = "fusion:transforms:in-flight:w1"
+        r.lpush(high, json.dumps({"task_id": "task-0", "type": "initial_load"}))
+    
+>       import worker as w_mod
+
+transform-worker\tests\test_v130_correctness.py:413: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+transform-worker\worker.py:33: in <module>
+    REDIS_URL = os.environ["REDIS_URL"]
+                ^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = environ({'AGENT_TRANSCRIPTS': 'C:\\Users\\rishi\\.cursor\\projects\\e-Dcraft\\agent-transcripts', 'ALLUSERSPROFILE': '...transform-worker/tests/test_v130_correctness.py::TestNoDuplicateDequeue::test_two_workers_never_get_same_task (call)'})
+key = 'REDIS_URL'
+
+>   ???
+E   KeyError: 'REDIS_URL'
+
+<frozen os>:714: KeyError
+___ TestNoDuplicateDequeue.test_two_workers_never_get_same_task_concurrent ____
+
+self = <tests.test_v130_correctness.TestNoDuplicateDequeue object at 0x0000025F6A1641D0>
+
+    def test_two_workers_never_get_same_task_concurrent(self):
+        """Stress the atomic-dequeue with TWO real worker threads pulling from
+        a shared FakeRedis. Enqueue N distinct tasks; assert every task is
+        processed by exactly one worker (no duplicate task_id)."""
+        class FakeRedis:
+            def __init__(self):
+                self.lists = {}
+                self.lock = threading.Lock()
+    
+            def _get(self, key):
+                return self.lists.setdefault(key, [])
+    
+            def blmove(self, src, dst, src_dir, dst_dir, timeout=0):
+                with self.lock:
+                    s = self._get(src)
+                    if s:
+                        item = s.pop()
+                        self._get(dst).insert(0, item)
+                        return item
+                return None
+    
+            def brpoplpush(self, src, dst, timeout=0):
+                return self.blmove(src, dst, "RIGHT", "LEFT", timeout)
+    
+            def lrem(self, key, count, value):
+                with self.lock:
+                    s = self._get(key)
+                    removed = 0
+                    for _ in range(count):
+                        try:
+                            s.remove(value)
+                            removed += 1
+                        except ValueError:
+                            break
+                    return removed
+    
+            def lpush(self, key, value):
+                with self.lock:
+                    self._get(key).insert(0, value)
+    
+        r = FakeRedis()
+        high = "fusion:transforms:high"
+        N = 20
+        for i in range(N):
+            r.lpush(high, json.dumps({"task_id": f"task-{i}", "type": "initial_load"}))
+    
+        processed = []
+        proc_lock = threading.Lock()
+    
+        def worker(wid):
+            inflight = f"fusion:transforms:in-flight:{wid}"
+            import worker as w_mod
+            from worker import _atomic_dequeue, _ack
+            with patch.object(w_mod, "HIGH_QUEUE", high), \
+                 patch.object(w_mod, "NORMAL_QUEUE", "fusion:transforms:normal"), \
+                 patch.object(w_mod, "IN_FLIGHT_QUEUE", inflight):
+                for _ in range(N):  # bounded loop, no blocking on empty
+                    d = _atomic_dequeue(r, timeout=1)
+                    if d is None:
+                        break
+                    _, raw = d
+                    task = json.loads(raw)
+                    with proc_lock:
+                        processed.append((wid, task["task_id"]))
+                    _ack(r, raw)
+    
+        t1 = threading.Thread(target=worker, args=("w1",))
+        t2 = threading.Thread(target=worker, args=("w2",))
+        t1.start(); t2.start()
+        t1.join(timeout=30); t2.join(timeout=30)
+    
+>       assert len(processed) == N, (len(processed), processed)
+E       AssertionError: (0, [])
+E       assert 0 == 20
+E        +  where 0 = len([])
+
+transform-worker\tests\test_v130_correctness.py:510: AssertionError
+_____ TestPrematureDoneFixRegression.test_25m_range_does_not_done_at_50k ______
+
+self = <tests.test_v130_correctness.TestPrematureDoneFixRegression object at 0x0000025F6A164410>
+
+    def test_25m_range_does_not_done_at_50k(self):
+        loader = _make_loader()
+        # Scaled-down proxy of the bug scenario: a 1M-key range, chunk_size
+        # 10k \u2192 100 chunks. The bug report's 25M/10k = 2500 chunks would make
+        # this test slow; 1M/10k = 100 chunks proves the same invariant in
+        # well under a second. The OLD code (premature DONE on the first
+        # short chunk) would stop after ~5 chunks at ~50k rows; the v1.2.30 fix
+        # continues until last_pk >= pk_end.
+        pk_end = 1_000_000
+        chunk_size = 10_000
+        fetch_calls = []
+        lock = threading.Lock()
+    
+        def fake_fetch(source, schema_name, table_name, pk_col, last_pk,
+                        chunk_size, ctype, pk_end=None, conn=None):
+            with lock:
+                fetch_calls.append((last_pk, chunk_size, pk_end))
+            lo = -1 if last_pk is None else last_pk
+            # Dense: one row per PK from lo+1 up to pk_end, capped at chunk_size.
+            end = min(lo + chunk_size, pk_end if pk_end is not None else lo + chunk_size)
+            rows = [{"id": pk} for pk in range(lo + 1, end + 1)]
+            return rows
+    
+        with patch.object(InitialLoadTask, "_fetch_chunk", side_effect=fake_fetch), \
+             patch.object(InitialLoadTask, "_get_last_checkpoint", return_value=None), \
+             patch.object(InitialLoadTask, "_report_checkpoint") as mock_ckpt, \
+             patch.object(InitialLoadTask, "_copy_to_postgres",
+                           side_effect=lambda rows, *a, **k: len(rows)), \
+             _sync_threads():
+            task = _build_task(pk_start=0, pk_end=pk_end, chunk_size=chunk_size,
+                                total_chunks=1, chunk_seq=0)
+            loader.run(task)
+    
+        # The loop must have fetched ~100 chunks (1M / 10k), not just 5.
+>       assert len(fetch_calls) > 50, fetch_calls
+E       AssertionError: [(0, 10000, 1000000), (10000, 10000, 1000000), (20000, 10000, 1000000), (30000, 10000, 1000000), (40000, 10000, 1000000), (50000, 10000, 1000000), ...]
+E       assert 24 > 50
+E        +  where 24 = len([(0, 10000, 1000000), (10000, 10000, 1000000), (20000, 10000, 1000000), (30000, 10000, 1000000), (40000, 10000, 1000000), (50000, 10000, 1000000), ...])
+
+transform-worker\tests\test_v130_correctness.py:555: AssertionError
+------------------------------ Captured log call ------------------------------
+WARNING  loader:loader.py:1005 InitialLoad: pooled source connection open failed (could not translate host name "sh" to address: No such host is known. 
+) ù will fall back to per-chunk connect.
+============================== warnings summary ===============================
+transform-worker/tests/test_v130_correctness.py::TestNoDuplicateDequeue::test_two_workers_never_get_same_task_concurrent
+  C:\Users\rishi\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-42 (worker)
+  
+  Traceback (most recent call last):
+    File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1075, in _bootstrap_inner
+      self.run()
+    File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1012, in run
+      self._target(*self._args, **self._kwargs)
+    File "E:\Dcraft\.tmp\fusion-cdc-engine-private\transform-worker\tests\test_v130_correctness.py", line 491, in worker
+      from worker import _atomic_dequeue, _ack
+    File "E:\Dcraft\.tmp\fusion-cdc-engine-private\transform-worker\worker.py", line 33, in <module>
+      REDIS_URL = os.environ["REDIS_URL"]
+                  ~~~~~~~~~~^^^^^^^^^^^^^
+    File "<frozen os>", line 714, in __getitem__
+  KeyError: 'REDIS_URL'
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+transform-worker/tests/test_v130_correctness.py::TestNoDuplicateDequeue::test_two_workers_never_get_same_task_concurrent
+  C:\Users\rishi\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-41 (worker)
+  
+  Traceback (most recent call last):
+    File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1075, in _bootstrap_inner
+      self.run()
+    File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1012, in run
+      self._target(*self._args, **self._kwargs)
+    File "E:\Dcraft\.tmp\fusion-cdc-engine-private\transform-worker\tests\test_v130_correctness.py", line 490, in worker
+      import worker as w_mod
+    File "E:\Dcraft\.tmp\fusion-cdc-engine-private\transform-worker\worker.py", line 33, in <module>
+      REDIS_URL = os.environ["REDIS_URL"]
+                  ~~~~~~~~~~^^^^^^^^^^^^^
+    File "<frozen os>", line 714, in __getitem__
+  KeyError: 'REDIS_URL'
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED transform-worker/tests/test_v130_correctness.py::TestNoDuplicateDequeue::test_two_workers_never_get_same_task
+FAILED transform-worker/tests/test_v130_correctness.py::TestNoDuplicateDequeue::test_two_workers_never_get_same_task_concurrent
+FAILED transform-worker/tests/test_v130_correctness.py::TestPrematureDoneFixRegression::test_25m_range_does_not_done_at_50k
+================== 3 failed, 7 passed, 2 warnings in 45.94s ===================
