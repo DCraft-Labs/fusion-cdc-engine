@@ -350,6 +350,30 @@ def _build_table_properties(dest_config: dict) -> dict:
     # means "merge whenever there is more than 1 manifest", which keeps the
     # manifest list flat. This is the actual compaction lever in 0.7.1 (the
     # table.rewrite_manifests() API was added in 0.11+).
+    #
+    # v1.2.37 §8 item 4 investigation: the property IS set correctly here,
+    # but the live observation (§2 of the master report) is that 120 commits
+    # still produced 120 manifests — i.e. the property has NO effect on
+    # PyIceberg 0.7.1's ``table.append()`` / ``fast_append`` path. Confirmed
+    # by source inspection of pyiceberg 0.7.1's
+    # ``pyiceberg/table/update/snapshot.py``: ``FastAppend`` / ``MergeAppend``
+    # do NOT read ``commit.manifest.min-count-to-merge`` anywhere — that
+    # property is a Java-Iceberg-core concept (``org.apache.iceberg.Snapshot``
+    # summarization / ``ManifestListMergeManager``) and is not wired into
+    # PyIceberg's append path through 0.7.1 (or 0.11.1). PyIceberg's
+    # ``MergeAppend`` does merge manifests when ``snapshot.new`` /
+    # ``snapshot.cherry-pick`` are used, but plain ``fast_append`` (which
+    # ``table.append()`` and ``Transaction.add_files`` both use) always
+    # creates a fresh manifest per call — there is no min-count gate.
+    # The property is therefore kept here as a no-op placeholder so that
+    # IF PyIceberg adds support later it picks the value up automatically,
+    # but the manifest-growth problem is NOT fixed by this property on
+    # 0.7.1. The real fix is the v1.2.39 single-committer + ``add_files()``
+    # redesign (§6), which collapses N chunk commits into 1 batched commit
+    # per drain cycle — structurally limiting manifest count regardless of
+    # whether PyIceberg honors the min-count property. Upgrading to
+    # PyIceberg >= 0.11 to gain ``table.rewrite_manifests()`` is a separate
+    # follow-up and not required for the redesign.
     if dest_config.get("initial_load_destination", True):
         props.setdefault("commit.manifest.min-count-to-merge", "1")
     return props

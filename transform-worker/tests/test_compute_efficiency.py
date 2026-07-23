@@ -64,7 +64,12 @@ def test_get_source_schema_called_once_per_initial_load():
     task._extract_pk = lambda row, pk, ctype: row.get(pk)
     task._write_to_iceberg = MagicMock(return_value=2)
 
-    with patch("iceberg_writer._get_source_schema") as inner_spy:
+    # v1.2.37: INITIAL_LOAD_COMMIT_BATCH default was raised 1→5. This test
+    # asserts per-chunk writer calls, which only happens at commit_batch=1.
+    # Patch the module constant so the test is robust against the default
+    # change.
+    with patch("loader.INITIAL_LOAD_COMMIT_BATCH", 1), \
+         patch("iceberg_writer._get_source_schema") as inner_spy:
         inner_spy.return_value = pa.schema([
             pa.field("id", pa.int64()),
             pa.field("name", pa.string()),

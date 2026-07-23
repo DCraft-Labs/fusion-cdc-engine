@@ -68,7 +68,12 @@ PIPELINE_QUEUE_SIZE = int(os.environ.get("INITIAL_LOAD_PIPELINE_QUEUE_SIZE", "2"
 # so last_pk advances exactly with durability. Operators who want higher
 # throughput can opt in to larger batches via this env var, but the default
 # is safe (no duplicate rows on retry-after-conflict).
-INITIAL_LOAD_COMMIT_BATCH = int(os.environ.get("INITIAL_LOAD_COMMIT_BATCH", "1"))
+# v1.2.37 §8 item 3: raise the default to 5. The prerequisites
+# (checkpoint-after-commit, v1.2.33 Bug #22 fix 1; retry-gated dedup,
+# v1.2.34 Bug #23 fix) are both in place, so a larger default is safe and
+# pays the per-commit lock/reload/dedup tax ~5x less often per row. The
+# env var still overrides for operators who want a different value.
+INITIAL_LOAD_COMMIT_BATCH = int(os.environ.get("INITIAL_LOAD_COMMIT_BATCH", "5"))
 
 # v1.2.29 Task 1: DuckDB native scanner bulk mode (default OFF). Operators
 # opt in per connection via ``resource_limits.bulk_mode: "duckdb"`` or the
@@ -1099,13 +1104,42 @@ class InitialLoadTask:
     def _open_duckdb_scanner(self, source: dict, ctype: str):
         """v1.2.29 Task 1: attach DuckDB's native MySQL/Postgres scanner to
         the source DB once per partition. Returns a DuckDB connection (with
-        the source ATTACHed as ``src``) or None on any failure."""
+        the source ATTACHed as ``src``) or None on any failure.
+
+        v1.2.37 Bug #25 fix (§7b): use ``database_name``/``username`` with
+        fallback to ``database``/``user`` — identical to the sibling
+        ``_open_source_connection`` ("v1.2.30 Defect E fix"). The producer
+        stamps ``database_name``/``username`` into every task's source dict
+        (control-plane/app/api/connections.py:612-613), never
+        ``database``/``user``, so the previous ``source.get("database")`` /
+        ``source.get("user")`` left both as None and the ATTACH failed with
+        a misleading "access denied" — fixing the extension alone (Bug #26)
+        was not sufficient; both fixes are required together to engage bulk
+        mode.
+
+        v1.2.37 Bug #26 fix (§7a): set ``extension_directory`` to a fixed,
+        non-``$HOME``-dependent path (``/opt/duckdb_extensions``) right after
+        ``duckdb.connect()``. The image builds as root (``HOME=/root``) but
+        runs as the non-root ``transform`` user (``HOME=/app``); a naive
+        ``RUN INSTALL mysql`` at build time lands in ``/root/.duckdb/...``
+        but the runtime process looks in ``/app/.duckdb/...`` and won't find
+        it. The Dockerfile bakes the mysql extension into
+        ``/opt/duckdb_extensions`` (owned by ``transform``) and this line
+        makes the runtime connection look there. Pin stays
+        ``duckdb==0.10.3`` — an unpinned/bumped duckdb package would
+        invalidate the pre-baked extension (fails loudly, per GitHub #16337).
+        """
         try:
             import duckdb
             host = source.get("host"); port = source.get("port")
-            database = source.get("database"); user = source.get("user")
+            # Match _fetch_chunk / _open_source_connection extraction
+            # (database_name first, then database; username first, then user).
+            database = source.get("database_name") or source.get("database")
+            user = source.get("username") or source.get("user")
             password = source.get("password")
             conn = duckdb.connect()
+            # Bug #26: look for the baked extension in the fixed path, not $HOME.
+            conn.execute("SET extension_directory='/opt/duckdb_extensions'")
             if ctype in ("postgres", "postgresql"):
                 conn.execute("LOAD postgres;")
                 conn.execute(

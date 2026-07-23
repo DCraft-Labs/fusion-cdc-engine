@@ -51,8 +51,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /install /usr/local
 COPY transform-worker/ .
 
-RUN mkdir -p /tmp/duckdb \
-    && chown -R transform:transform /app /tmp/duckdb
+# v1.2.37 Bug #26 fix (§7a): bake the DuckDB ``mysql`` extension into a
+# fixed, non-``$HOME``-dependent path (``/opt/duckdb_extensions``) so the
+# runtime process (which runs as the non-root ``transform`` user with
+# ``HOME=/app``, while the image builds as root with ``HOME=/root``) can
+# find it. A naive ``RUN python3 -c "import duckdb; ... INSTALL mysql"``
+# lands in ``/root/.duckdb/extensions/...`` and the runtime looks in
+# ``/app/.duckdb/extensions/...`` — reproducing the missing-extension error
+# even though the file exists elsewhere in the image (GitHub #12775, #18237,
+# #15471). Setting ``extension_directory`` explicitly at install AND at
+# runtime (loader.py ``_open_duckdb_scanner``) avoids the ``$HOME`` trap
+# entirely. ``duckdb==0.10.3`` is pinned in requirements.txt — bumping it
+# would invalidate the pre-baked extension (fails loudly, per #16337).
+RUN mkdir -p /opt/duckdb_extensions /tmp/duckdb \
+    && python3 -c "import duckdb; c=duckdb.connect(); c.execute(\"SET extension_directory='/opt/duckdb_extensions'\"); c.execute('INSTALL mysql'); c.execute('LOAD mysql')" \
+    && chown -R transform:transform /app /tmp/duckdb /opt/duckdb_extensions
 
 USER transform
 

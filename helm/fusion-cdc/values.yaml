@@ -175,6 +175,60 @@ transformWorker:
     tag: latest
     pullPolicy: IfNotPresent
 
+# ── Nessie (Iceberg REST catalog) ─────────────────────────────────────────────
+# v1.2.37 §1 + §8 item 1: Nessie persistence. The default in-memory version
+# store wipes the entire Iceberg catalog on every pod restart — a Priority-0
+# data-loss bug. The chart deploys Nessie with a persistent backend:
+#   * type=JDBC against an external Postgres (preferred, set jdbc.url/user/password)
+#   * type=ROCKSDB + a PVC (fallback when no external Postgres is available)
+# Production should point jdbc.url at a managed Postgres (RDS / Cloud SQL).
+# A PersistentVolumeClaim is always created so RocksDB mode (and any local
+# cache) survives restarts even if JDBC is not configured.
+nessie:
+  enabled: true
+  image:
+    repository: ghcr.io/projectnessie/nessie
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    apiPort: 19120
+    mgmtPort: 19121
+  # Backend type: "JDBC" (preferred) or "ROCKSDB" (fallback). When JDBC is
+  # selected, jdbc.url/user/password MUST be provided (either inline here or
+  # via an existing secret referenced by jdbc.existingSecret).
+  backend:
+    type: JDBC
+    jdbc:
+      url: ""          # e.g. jdbc:postgresql://postgres:5432/nessie
+      driver: "org.postgresql.Driver"
+      user: ""
+      password: ""
+      existingSecret: ""   # secret keys: NESSIE_JDBC_URL, NESSIE_JDBC_USER, NESSIE_JDBC_PASSWORD
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes: ["ReadWriteOnce"]
+    size: 5Gi
+    mountPath: /var/lib/nessie
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop: ["ALL"]
+
 # ── Redis (Bitnami subchart) ──────────────────────────────────────────────────
 redis:
   enabled: true

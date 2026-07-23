@@ -4,6 +4,81 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.37] — 2026-07-24
+
+### Priority 0 — Nessie persistence + bulk-mode blockers + commit-batch tuning
+
+Four fixes from the "Fusion CDC — Speed vs. Correctness Master Report v2"
+(`Markdown content.md`), shipped together as the cheapest high-leverage
+baseline before the v1.2.39 single-committer redesign.
+
+- **Nessie persistence (§1 + §8 item 1, Priority 0):** Nessie was running
+  on its default in-memory version store with a 512Mi limit (bumped to 2Gi
+  as a stopgap) and OOMKilled, wiping the entire Iceberg catalog on every
+  restart — confirmed live (`transaction` dropped 655K→~370-390K rows,
+  sequence number reset 68→~42-46). Fixed by switching Nessie to a
+  persistent JDBC2 backend against the existing infra Postgres (new
+  `nessie` database, created by `03-nessie.sql` in the local-dev
+  `00-infra.yaml`). Memory restored to a sane 1Gi now that state is
+  durable. The helm chart also gains a new `nessie` section + template
+  (`helm/fusion-cdc/templates/nessie.yaml`) with a PVC and configurable
+  JDBC/RocksDB backend for production deploys.
+- **Bug #25 (§7b):** `loader.py` `_open_duckdb_scanner` read
+  `source.get("database")` / `source.get("user")` but the producer stamps
+  `database_name` / `username`, so the DuckDB bulk-mode scanner always
+  failed with a misleading "access denied" and fell back to the slow
+  Python path. Fixed to `database_name or database` / `username or user` —
+  identical to the sibling `_open_source_connection` ("v1.2.30 Defect E
+  fix"). Both Bug #25 and Bug #26 are required together to engage bulk
+  mode.
+- **Bug #26 (§7a):** the DuckDB `mysql` extension was never baked into the
+  transform-worker image. The image builds as root (`HOME=/root`) but runs
+  as the non-root `transform` user (`HOME=/app`), so a naive
+  `RUN INSTALL mysql` lands in `/root/.duckdb/...` and runtime looks in
+  `/app/.duckdb/...`. Fixed by baking the extension into a fixed
+  `/opt/duckdb_extensions` path in the Dockerfile and setting
+  `extension_directory='/opt/duckdb_extensions'` in
+  `_open_duckdb_scanner` right after `duckdb.connect()`. `duckdb==0.10.3`
+  pin stays (bumping would invalidate the baked extension).
+- **§8 item 3:** raised `INITIAL_LOAD_COMMIT_BATCH` default 1→5. The
+  prerequisites (checkpoint-after-commit, v1.2.33 Bug #22 fix 1;
+  retry-gated dedup, v1.2.34 Bug #23 fix) are both in place, so a larger
+  default is safe and pays the per-commit lock/reload/dedup tax ~5x less
+  often per row. Env var still overrides.
+- **§8 item 4 (investigation):** `commit.manifest.min-count-to-merge=1`
+  is set in `_build_table_properties` but has NO effect on PyIceberg 0.7.1
+  — confirmed by source inspection of
+  `pyiceberg/table/update/snapshot.py`: `FastAppend` / `MergeAppend` do
+  not read this property anywhere; it is a Java-Iceberg-core concept not
+  wired into PyIceberg's append path through 0.7.1 (or 0.11.1). The
+  property is kept as a no-op placeholder (auto-engages if PyIceberg adds
+  support later), and the manifest-growth problem is instead fixed
+  structurally by the v1.2.39 single-committer + `add_files()` redesign
+  (one commit per drain cycle, not one per chunk). Documented in the
+  code comment on `_build_table_properties`.
+
+### Tests
+- `transform-worker/tests/test_v137_bugs_25_26.py` (new): Bug #25
+  key-name extraction (mysql + postgres + legacy fallback), Bug #26
+  `SET extension_directory` ordering before `LOAD mysql`, commit-batch
+  default=5, manifest property still set for initial-load destinations.
+- `transform-worker/tests/test_v133_contention.py`: replaced the
+  `importlib.reload(loader)`-based env-override test (which re-registered
+  prometheus metrics and crashed with
+  `ValueError: Duplicated timeseries in CollectorRegistry`, leaking
+  state into later tests) with a non-reloading variant.
+- `transform-worker/tests/test_compute_efficiency.py`: pinned
+  `INITIAL_LOAD_COMMIT_BATCH=1` for the per-chunk-writer-call assertion
+  so it is robust against the default change.
+
+### Follow-ups (not in this release)
+- Upgrade PyIceberg to ≥0.8.0 to gain `check_duplicate_files` as a
+  library-level safety net on top of the v1.2.39 committer's own
+  at-most-once logic (not a prerequisite for the redesign).
+- Deploy + verify Nessie persistence by deliberately restarting the
+  Nessie pod during a test load — catalog state must survive (user's
+  job, not CI's).
+
 ## [1.2.33] — 2026-07-24
 
 ### P0 correctness fixes — parallel-load test (bugs #20, #21, #22)
