@@ -79,6 +79,18 @@ INITIAL_LOAD_COMMIT_BATCH = int(os.environ.get("INITIAL_LOAD_COMMIT_BATCH", "5")
 # opt in per connection via ``resource_limits.bulk_mode: "duckdb"`` or the
 # env var. MongoDB has no DuckDB scanner and always uses the Python path.
 BULK_MODE_DEFAULT = str(os.environ.get("INITIAL_LOAD_BULK_MODE", "none")).lower()
+# v1.2.39 section 6: single-committer staging mode (default OFF). Operators
+# opt in per connection via ``resource_limits.committer_mode: "staged"`` or
+# the env var. When ``staged``, the iceberg write path writes Parquet files
+# directly to ``table.location()/data/`` (NO catalog call) and RPUSHes the
+# path onto the pending-files Redis list; a separate committer process
+# (transform-worker/iceberg_committer.py) drains the list and registers
+# all drained files in ONE ``table.transaction().add_files()`` commit. This
+# is the standard "many writers, one table" pattern (Flink IcebergFiles-
+# Committer, Adobe Consolidation Worker) and removes the v1.2.33-36 Redis
+# mutex + dedup-on-PK workaround from the bulk-append path. The CDC
+# upsert/delete path stays on the mutex (different conflict profile).
+COMMITTER_MODE_DEFAULT = str(os.environ.get("INITIAL_LOAD_COMMITTER_MODE", "none")).lower()
 # v1.2.29 Task 2: Prometheus metrics HTTP port for the transform-worker.
 PROMETHEUS_PORT = int(os.environ.get("TRANSFORM_WORKER_PROMETHEUS_PORT", "9090"))
 
@@ -453,6 +465,11 @@ class InitialLoadTask:
         if ctype == "mongodb":
             bulk_mode = "none"  # no DuckDB Mongo scanner
         use_duckdb_bulk = (bulk_mode == "duckdb") and ctype in ("postgres", "postgresql", "mysql")
+        # v1.2.39 section 6: single-committer staging mode (opt-in). When
+        # ``staged``, the iceberg write path stages Parquet files + RPUSHes
+        # to the pending list instead of calling table.append/write_arrow.
+        committer_mode = str(task.get("committer_mode") or COMMITTER_MODE_DEFAULT).lower()
+        use_committer = (committer_mode == "staged") and (connector_type == "iceberg")
         duckdb_conn = None
 
         # v1.2.29 Task 5: connection pooling — open ONE source connection per
@@ -632,11 +649,26 @@ class InitialLoadTask:
                 if kind == "arrow" and connector_type == "iceberg":
                     INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(0.0)
                     t_w0 = time.monotonic()
-                    rows_written = self._write_arrow_to_iceberg(arrow_tbl, dest, dest_table)
+                    if use_committer:
+                        # v1.2.39 section 6: stage Parquet file + RPUSH to
+                        # pending list (NO catalog call). The committer
+                        # process drains and commits in ONE add_files() call.
+                        self._stage_arrow_to_pending(
+                            arrow_tbl, dest, dest_table,
+                            partition_id=str(chunk_seq), chunk_seq=chunk_seq,
+                            pk_range=(last_pk, next_pk), stream_id=stream_id,
+                            source_table=source_table, connection_id=connection_id,
+                        )
+                        rows_written = int(arrow_tbl.num_rows)
+                    else:
+                        rows_written = self._write_arrow_to_iceberg(arrow_tbl, dest, dest_table)
                     INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
                     child_tables = {}
                     # v1.2.33 Bug #22 fix 1: write_arrow IS the commit — advance
-                    # the checkpoint cursor only after it succeeds.
+                    # the checkpoint cursor only after it succeeds. In committer
+                    # mode, the file is staged (not yet committed) but the
+                    # staged cursor advances so the fetch loop continues; the
+                    # committer promotes the checkpoint state to "durable".
                     last_pk = next_pk
                 elif kind == "arrow":
                     t_c0 = time.monotonic()
@@ -684,30 +716,65 @@ class InitialLoadTask:
                             child_tables = {}
                             transformed_schema = cached_source_schema
 
-                        if arrow_out is not None and arrow_out.num_rows > 0:
-                            pending_arrow.append(arrow_out)
-                        for child_name, child_rows in child_tables.items():
-                            if child_rows:
-                                pending_child.setdefault(child_name, []).extend(child_rows)
-                        chunks_since_commit += 1
-                        rows_written = arrow_out.num_rows if arrow_out is not None else 0
-                        if chunks_since_commit >= commit_batch:
-                            t_w0 = time.monotonic()
-                            self._flush_iceberg_batch_arrow(
-                                pending_arrow, pending_child, dest, dest_table,
-                                schema=cached_transformed_schema or cached_source_schema,
-                            )
-                            INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
-                            pending_arrow = []
-                            pending_child = {}
-                            chunks_since_commit = 0
-                            # v1.2.33 Bug #22 fix 1 (PRIMARY): the batched
-                            # commit just succeeded — NOW it is safe to advance
-                            # the checkpoint cursor. Advancing on every buffered
-                            # chunk (the old behavior) let a retry resume past
-                            # rows that were never committed, re-appending
-                            # already-durable rows on retry-after-conflict.
+                        if use_committer:
+                            # v1.2.39 section 6: stage each chunk's Arrow
+                            # table to a Parquet file + RPUSH to the pending
+                            # list (NO catalog call, NO batch buffering - each
+                            # staged file is independently inert until the
+                            # committer picks it up). The committer drains and
+                            # commits in ONE add_files() call.
+                            if arrow_out is not None and arrow_out.num_rows > 0:
+                                self._stage_arrow_to_pending(
+                                    arrow_out, dest, dest_table,
+                                    partition_id=str(chunk_seq),
+                                    chunk_seq=chunk_seq,
+                                    pk_range=(last_pk, next_pk),
+                                    stream_id=stream_id,
+                                    source_table=source_table,
+                                    connection_id=connection_id,
+                                )
+                            for child_name, child_rows in child_tables.items():
+                                if child_rows:
+                                    pending_child.setdefault(child_name, []).extend(child_rows)
+                            chunks_since_commit += 1
+                            rows_written = arrow_out.num_rows if arrow_out is not None else 0
+                            # Staged cursor advances immediately (the file is
+                            # written); the committer promotes the checkpoint
+                            # state to "durable" after its commit confirms.
                             last_pk = next_pk
+                            # Flush any child tables (still dict-based) at the
+                            # batch boundary.
+                            if chunks_since_commit >= commit_batch and pending_child:
+                                for child_name, child_rows in pending_child.items():
+                                    if child_rows:
+                                        self._write_to_iceberg(child_rows, dest, child_name)
+                                pending_child = {}
+                                chunks_since_commit = 0
+                        else:
+                            if arrow_out is not None and arrow_out.num_rows > 0:
+                                pending_arrow.append(arrow_out)
+                            for child_name, child_rows in child_tables.items():
+                                if child_rows:
+                                    pending_child.setdefault(child_name, []).extend(child_rows)
+                            chunks_since_commit += 1
+                            rows_written = arrow_out.num_rows if arrow_out is not None else 0
+                            if chunks_since_commit >= commit_batch:
+                                t_w0 = time.monotonic()
+                                self._flush_iceberg_batch_arrow(
+                                    pending_arrow, pending_child, dest, dest_table,
+                                    schema=cached_transformed_schema or cached_source_schema,
+                                )
+                                INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "write").observe(time.monotonic() - t_w0)
+                                pending_arrow = []
+                                pending_child = {}
+                                chunks_since_commit = 0
+                                # v1.2.33 Bug #22 fix 1 (PRIMARY): the batched
+                                # commit just succeeded — NOW it is safe to advance
+                                # the checkpoint cursor. Advancing on every buffered
+                                # chunk (the old behavior) let a retry resume past
+                                # rows that were never committed, re-appending
+                                # already-durable rows on retry-after-conflict.
+                                last_pk = next_pk
                     else:
                         # Postgres COPY path: keep list[dict] (COPY expects
                         # Python rows, not Arrow).
@@ -1306,6 +1373,52 @@ class InitialLoadTask:
         except Exception as e:
             log.error("InitialLoad: _write_arrow_to_iceberg failed (%s) — falling back to flush.", e)
             raise
+
+    def _stage_arrow_to_pending(self, arrow_tbl, dest: dict, table_name: str,
+                                partition_id: str, chunk_seq: int,
+                                pk_range, stream_id: str, source_table: str,
+                                connection_id: str) -> str:
+        """v1.2.39 section 6: single-committer staging path. Write the
+        Arrow batch as a plain Parquet file directly to
+        ``table.location()/data/<partition>/<chunk_seq>-<uuid>.parquet``
+        (NO catalog call) and RPUSH the file path onto the pending-files
+        Redis list. Returns the file path written (empty string if the
+        table had to be bootstrapped via write_arrow, in which case the
+        chunk is already durable and the caller should treat it as such).
+
+        The caller is responsible for advancing the checkpoint to
+        ``state="staged"`` (NOT ``durable``) after this returns — the
+        committer (``iceberg_committer.py``) promotes to ``durable`` once
+        its ``add_files()`` commit confirms. ``last_pk`` advances to the
+        staged cursor (``next_pk``) so the fetch loop continues; the
+        durable promotion does not change ``last_pk``, only the state
+        label."""
+        from iceberg_writer import IcebergWriter
+        from iceberg_committer import enqueue_pending_file
+        writer = IcebergWriter(dest, redis_client=getattr(self, "redis", None),
+                               connection_id=connection_id)
+        path = writer.write_arrow_to_file(
+            arrow_tbl, table_name=table_name,
+            partition_id=partition_id, chunk_seq=chunk_seq,
+            pk_range=pk_range,
+        )
+        if not path:
+            # Table was bootstrapped via write_arrow (one commit) - the
+            # chunk is already durable; no pending entry needed.
+            return ""
+        entry = {
+            "table_name": table_name,
+            "file_path": path,
+            "row_count": int(arrow_tbl.num_rows),
+            "pk_range": list(pk_range) if pk_range else [],
+            "chunk_seq": chunk_seq,
+            "partition_id": partition_id,
+            "stream_id": stream_id,
+            "source_table": source_table,
+        }
+        enqueue_pending_file(getattr(self, "redis", None), connection_id,
+                              table_name, entry)
+        return path
 
     def _fetch_mongo_chunk(self, host, port, database, user, password,
                            cfg, collection_name, last_id, chunk_size) -> list[dict]:

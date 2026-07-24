@@ -848,6 +848,74 @@ class IcebergWriter:
             _release_commit_lock(self.redis_client, self.connection_id, table_name)
         return arrow_tbl.num_rows
 
+    # v1.2.39 section 6: single-committer staging path.
+    def write_arrow_to_file(self, arrow_tbl: "pa.Table", table_name: str,
+                            partition_id: str = "default",
+                            chunk_seq: int | None = None,
+                            pk_range: tuple | None = None,
+                            ) -> str:
+        """v1.2.39 section 6: write an Arrow batch as a plain Parquet file
+        DIRECTLY to ``table.location()/data/<partition>/<chunk_seq>-<uuid>.parquet``
+        via ``table.io.new_output(path).create()`` + ``pq.write_table()``.
+
+        NO catalog call happens here - the file is inert (not in any
+        manifest) until the committer picks it up and registers it via
+        ``table.transaction().add_files([path])``. This is the worker side
+        of the single-committer redesign: K partitions write files
+        independently with zero coordination, then ONE committer registers
+        them in a single Iceberg commit.
+
+        Returns the absolute file path written. The caller is responsible
+        for RPUSHing the path onto the pending-files list and advancing the
+        checkpoint to ``staged`` (not ``durable``) - the committer promotes
+        to ``durable`` after the commit confirms.
+
+        The table must already exist (the committer or a prior
+        ``write_arrow``/``write_batch`` call created it). If it does not,
+        this method falls back to ``write_arrow`` (one catalog commit) so
+        the very first chunk of a fresh table bootstraps the table; the
+        committer then takes over for subsequent chunks.
+        """
+        if arrow_tbl is None or arrow_tbl.num_rows == 0:
+            return ""
+        import uuid as _uuid
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as e:  # pragma: no cover - pyarrow always present
+            raise RuntimeError("pyarrow.parquet is required for write_arrow_to_file") from e
+
+        # Load the table (no lock - we're not committing). If it doesn't
+        # exist yet, bootstrap it via write_arrow (one commit) and return
+        # the empty string so the caller treats this chunk as already
+        # durable (the bootstrap commit made it so).
+        from pyiceberg.exceptions import NoSuchTableError
+        try:
+            table = self.catalog.load_table(f"{self.namespace}.{table_name}")
+        except NoSuchTableError:
+            log.info("write_arrow_to_file: table %s.%s does not exist - "
+                     "bootstrapping via write_arrow (one commit)",
+                     self.namespace, table_name)
+            self.write_arrow(arrow_tbl, table_name=table_name, pk_col=None)
+            return ""
+
+        loc = table.location().rstrip("/")
+        part_dir = f"{loc}/data/{partition_id}"
+        seq_tag = f"{chunk_seq}-" if chunk_seq is not None else ""
+        file_name = f"{seq_tag}{_uuid.uuid4()}.parquet"
+        path = f"{part_dir}/{file_name}"
+
+        # table.io.new_output(path).create() returns a writable file-like.
+        out = table.io.new_output(path)
+        f = out.create()
+        try:
+            pq.write_table(arrow_tbl, f)
+        finally:
+            try:
+                f.close()
+            except Exception:
+                pass
+        return path
+
     def upsert(self, rows: list[dict], table_name: str,
                identifier_fields: list[str],
                schema: pa.Schema | None = None) -> int:
