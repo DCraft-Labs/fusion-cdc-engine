@@ -26,7 +26,12 @@ log = logging.getLogger(__name__)
 # control chars could break the key=value parse or inject extra kv pairs
 # (connection-string injection). ``_duckdb_attach_kv`` escapes each value
 # per DuckDB's libpq/mysql connector kv rules (backslash escapes the
-# metacharacters ``\ ; = '`` and control chars) and joins with ``;``.
+# metacharacters ``\ ; = '`` and control chars) and joins with a space.
+# v1.3.1 Fix 1: the v1.3.0 helper joined with ``;`` but DuckDB's
+# mysql_scanner / postgres_scanner DSN parser expects SPACE-separated
+# key=value pairs (``;`` triggers ``Unrecognized configuration parameter
+# ""`` at parse time, silently re-breaking DuckDB bulk mode). Reverted
+# the join separator to space; the escaping logic is unchanged.
 _DUCKDB_ATTACH_ESCAPE_CHARS = {"\\": "\\\\", ";": "\\;", "=": "\\=",
                                "'": "\\'"}
 
@@ -35,10 +40,12 @@ def _duckdb_attach_kv(**kwargs) -> str:
     """Build an escaped DuckDB ATTACH key=value connection string.
 
     Each keyword argument becomes ``key=escaped_value``; pairs are joined
-    with ``;``. Values are coerced to ``str`` and escaped so that the
-    metacharacters ``\\``, ``;``, ``=``, ``'`` and ASCII control chars
-    cannot break out of their value position. ``None`` values are skipped
-    (so optional keys like ``port`` can be omitted cleanly)."""
+    with a single space (DuckDB's mysql_scanner/postgres_scanner DSN
+    parser expects space-separated key=value pairs). Values are coerced
+    to ``str`` and escaped so that the metacharacters ``\\``, ``;``,
+    ``=``, ``'`` and ASCII control chars cannot break out of their value
+    position. ``None`` values are skipped (so optional keys like ``port``
+    can be omitted cleanly)."""
     parts: list[str] = []
     for k, v in kwargs.items():
         if v is None:
@@ -55,13 +62,13 @@ def _duckdb_attach_kv(**kwargs) -> str:
             else:
                 out.append(ch)
         parts.append(f"{k}={''.join(out)}")
-    return ";".join(parts)
+    return " ".join(parts)
 
 
 def _duckdb_attach_unescape_kv(s: str) -> dict[str, str]:
     """Inverse of ``_duckdb_attach_kv`` for test round-trip verification:
-    parse a ``k=v;k=v`` string back into a dict, honouring backslash
-    escapes. Exposed for tests; not used at runtime."""
+    parse a space-separated ``k=v k=v`` string back into a dict,
+    honouring backslash escapes. Exposed for tests; not used at runtime."""
     out: dict[str, str] = {}
     i = 0
     cur_key: list[str] = []
@@ -95,7 +102,7 @@ def _duckdb_attach_unescape_kv(s: str) -> dict[str, str]:
             in_value = True
             i += 1
             continue
-        if ch == ";" and in_value:
+        if ch == " " and in_value:
             out["".join(cur_key)] = "".join(cur_val)
             cur_key = []
             cur_val = []
@@ -1511,6 +1518,13 @@ class InitialLoadTask:
             "partition_id": partition_id,
             "stream_id": stream_id,
             "source_table": source_table,
+            # v1.3.1 Fix 2: thread the current chunk's PK column into the
+            # entry so the committer's _dedup_overlapping_entries can run
+            # dedup-on-PK for partial overlaps. v1.3.0 staged entries
+            # without pk_col, so the committer always saw pk_col=None and
+            # skipped dedup (the partial-overlap case was silently broken;
+            # only the fully-contained duplicate case worked).
+            "pk_col": getattr(self, "_current_pk_col", None),
         }
         enqueue_pending_file(getattr(self, "redis", None), connection_id,
                               table_name, entry)
