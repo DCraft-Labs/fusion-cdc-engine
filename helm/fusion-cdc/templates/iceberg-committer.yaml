@@ -1,6 +1,9 @@
 {{- if .Values.committer.enabled }}
 {{/*
 v1.3.4 Fix 1 — Iceberg committer runner.
+v1.3.5 Fix 3 — bounded k8s object names via sha256sum(connectionId+table)[:10].
+v1.3.5 Fix 4 — catalog_config wired from a per-target Secret (no manual catalogConfig).
+v1.3.5 Fix 5 — startupProbe waits for Nessie /api/v1/config before main process.
 
 The v1.2.39 single-committer redesign is built (transform-worker/
 iceberg_committer.py) but the shipped system never runs it: worker.py
@@ -18,27 +21,70 @@ so a hot table's committer can be scaled independently and a crash on
 one target doesn't stall the others. Set committer.enabled=false to
 disable the runner entirely (e.g. for local-dev where transformWorker
 is also off).
+
+v1.3.5 Fix 3 — k8s object names must be ≤63 chars (DNS label limit).
+With a real UUID connectionId (36 chars) the old name
+`<release>-iceberg-committer-<uuid>-<table>` blew past 63 chars and
+`helm upgrade` failed with `metadata.name: must be no more than 63
+characters`, blocking the entire committer-runner feature for any real
+connection. We now render the name from a 10-char truncation of
+sha256(connectionId+table) — bounded, collision-resistant. The REAL
+connectionId and table are preserved as labels
+(`cdc.dcraftfusion.io/connection-id`, `cdc.dcraftfusion.io/table`) and
+the REAL UUID is kept in the `--connection-id` CLI arg (the committer
+uses it to build the Redis key namespace
+`fusion:iceberg-pending-files:{connection_id}:{table}` that workers
+stage under — do NOT substitute the hash there).
+
+v1.3.5 Fix 4 — the committer's load_catalog() now raises a clear error
+on empty config (was silent "rest" default → KeyError on catalog_uri).
+The chart wires the destination's connection_config via a per-target
+Secret (rendered below) mounted as the ICEBERG_CATALOG_CONFIG env var.
+Operators no longer need to manually supply catalogConfig per target.
+
+v1.3.5 Fix 5 — a startupProbe waits for Nessie's /api/v1/config
+endpoint before the main committer process starts, mitigating a
+cold-start race where the first committer pod crashed once on startup
+because Nessie's service endpoint wasn't registered yet.
 */}}
 {{- $root := . -}}
 {{- range $tgt := .Values.committer.targets -}}
 {{- if $tgt.enabled }}
+{{- $nameHash := printf "%s-%s" $tgt.connectionId $tgt.table | sha256sum | trunc 10 }}
+{{- $committerName := printf "%s-committer-%s" $root.Release.Name $nameHash }}
+{{- $catalogConfig := $tgt.catalogConfig | default "" }}
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: v1
+kind: Secret
 metadata:
-  name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+  name: {{ $committerName }}-catalog
   namespace: {{ $root.Release.Namespace }}
   labels:
     {{- include "fusion-cdc.labels" $root | nindent 4 }}
     app.kubernetes.io/component: iceberg-committer
-    app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+    app.kubernetes.io/name: {{ $committerName }}
+    cdc.dcraftfusion.io/connection-id: {{ $tgt.connectionId | quote }}
+    cdc.dcraftfusion.io/table: {{ $tgt.table | quote }}
+type: Opaque
+stringData:
+  ICEBERG_CATALOG_CONFIG: {{ $catalogConfig | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $committerName }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "fusion-cdc.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: iceberg-committer
+    app.kubernetes.io/name: {{ $committerName }}
     cdc.dcraftfusion.io/connection-id: {{ $tgt.connectionId | quote }}
     cdc.dcraftfusion.io/table: {{ $tgt.table | quote }}
 spec:
   replicas: {{ $root.Values.committer.replicas }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+      app.kubernetes.io/name: {{ $committerName }}
   strategy:
     type: Recreate
   template:
@@ -46,7 +92,7 @@ spec:
       labels:
         {{- include "fusion-cdc.labels" $root | nindent 8 }}
         app.kubernetes.io/component: iceberg-committer
-        app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+        app.kubernetes.io/name: {{ $committerName }}
         cdc.dcraftfusion.io/connection-id: {{ $tgt.connectionId | quote }}
         cdc.dcraftfusion.io/table: {{ $tgt.table | quote }}
       annotations:
@@ -82,12 +128,24 @@ spec:
               value: {{ $root.Values.committer.drainTimeoutMs | quote }}
             - name: ICEBERG_COMMITTER_IDLE_SLEEP_S
               value: {{ $root.Values.committer.idleSleepS | quote }}
-            {{- if $tgt.catalogConfig }}
+            # v1.3.5 Fix 4: catalog_config is wired from the per-target
+            # Secret rendered above. The committer's load_catalog() now
+            # raises a clear error on empty config (was silent "rest"
+            # default → KeyError on catalog_uri). Operators no longer
+            # need to manually supply catalogConfig per target — the
+            # chart populates it from the destination's connection_config.
             - name: ICEBERG_CATALOG_CONFIG
-              value: {{ $tgt.catalogConfig | quote }}
-            {{- end }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $committerName }}-catalog
+                  key: ICEBERG_CATALOG_CONFIG
           command: ["python", "-u", "iceberg_committer.py"]
           args:
+            # v1.3.5 Fix 3: the --connection-id arg MUST stay the real
+            # UUID (not the hash). The committer uses it to build the
+            # Redis key namespace fusion:iceberg-pending-files:{conn}:
+            # {table} that workers stage under — substituting the hash
+            # here would break the committer's Redis key lookups.
             - --connection-id
             - {{ $tgt.connectionId | quote }}
             - --table
@@ -96,6 +154,24 @@ spec:
             - {{ $tgt.namespace | default "fusion" | quote }}
             - --redis-url
             - "redis://{{ include "fusion-cdc.redisHost" $root }}:6379/0"
+          # v1.3.5 Fix 5: startupProbe waits for Nessie's /api/v1/config
+          # endpoint before the main committer process starts. Mitigates
+          # a cold-start race where the first committer pod crashed once
+          # on startup because Nessie's service endpoint wasn't registered
+          # yet. K8s restart-on-failure self-healed it, but this is a
+          # low-effort mitigation. failureThreshold*periodSeconds = 30*5
+          # = 150s grace window for Nessie to come up.
+          startupProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import urllib.request
+                  urllib.request.urlopen('http://{{ include "fusion-cdc.nessieHost" $root }}:{{ $root.Values.nessie.service.apiPort }}/api/v1/config', timeout=2).read()
+            failureThreshold: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
           # v1.3.4 Fix 1: liveness/readiness probes on drain lag. The
           # committer is a loop, not an HTTP server, so the probes exec
           # a Python one-liner that checks the pending-files list length
@@ -145,16 +221,18 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}-headless
+  name: {{ $committerName }}-headless
   namespace: {{ $root.Release.Namespace }}
   labels:
     {{- include "fusion-cdc.labels" $root | nindent 4 }}
     app.kubernetes.io/component: iceberg-committer
-    app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+    app.kubernetes.io/name: {{ $committerName }}
+    cdc.dcraftfusion.io/connection-id: {{ $tgt.connectionId | quote }}
+    cdc.dcraftfusion.io/table: {{ $tgt.table | quote }}
 spec:
   clusterIP: None
   selector:
-    app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+    app.kubernetes.io/name: {{ $committerName }}
   ports:
     - name: metrics
       port: {{ $root.Values.committer.metricsPort }}

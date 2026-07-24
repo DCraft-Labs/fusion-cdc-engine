@@ -109,3 +109,13 @@ Control-plane service URL (internal)
 {{- define "fusion-cdc.controlPlaneURL" -}}
 {{- printf "http://%s-control-plane-svc.%s.svc.cluster.local:8000" .Release.Name .Release.Namespace -}}
 {{- end }}
+
+{{/*
+v1.3.5 Fix 5: Nessie service DNS name (used by the committer's
+startupProbe to wait for Nessie /api/v1/config before the main
+process starts). Matches the Service rendered by nessie.yaml
+(<release>-nessie.<ns>.svc.cluster.local).
+*/}}
+{{- define "fusion-cdc.nessieHost" -}}
+{{- printf "%s-nessie.%s.svc.cluster.local" .Release.Name .Release.Namespace -}}
+{{- end }}

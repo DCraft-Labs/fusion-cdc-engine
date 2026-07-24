@@ -752,13 +752,32 @@ if __name__ == "__main__":  # pragma: no cover - manual sidecar entry
     ap.add_argument("--table", required=True)
     ap.add_argument("--namespace", default="fusion")
     ap.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
-    ap.add_argument("--catalog-config", default=None,
-                    help="JSON dest config for load_catalog (overrides env)")
+    # v1.3.5 Fix 4: --catalog-config is REQUIRED. Previously it defaulted
+    # to None → load_catalog({}) silently fell back to "rest" and then
+    # KeyError'd on "catalog_uri" — a confusing crash-loop. Now fail
+    # loudly up front with an actionable message. The chart template
+    # wires this from the destination's connection_config Secret.
+    ap.add_argument("--catalog-config", default=os.environ.get("ICEBERG_CATALOG_CONFIG"),
+                    help="JSON dest config for load_catalog (required; "
+                         "or set ICEBERG_CATALOG_CONFIG env var). The "
+                         "chart mounts the destination's connection_config "
+                         "Secret as this env var.")
     args = ap.parse_args()
 
+    if not args.catalog_config:
+        ap.error(
+            "--catalog-config is required (or set ICEBERG_CATALOG_CONFIG). "
+            "The committer needs the destination's connection_config to "
+            "build a PyIceberg Catalog. The chart template wires this from "
+            "the destination's connection_config Secret; for manual runs, "
+            "pass the JSON dest config (e.g. "
+            '{"catalog_type":"nessie","nessie_uri":"http://nessie:19120/api/v1",'
+            '"warehouse":"s3://...","s3_endpoint":"...","s3_access_key_id":"...",'
+            '"s3_secret_access_key":"..."}).'
+        )
+
     rc = redis_lib.from_url(args.redis_url)
-    catalog = load_catalog(json.loads(args.catalog_config)
-                            if args.catalog_config else {})
+    catalog = load_catalog(json.loads(args.catalog_config))
     committer = IcebergCommitter(catalog, rc, args.connection_id,
                                   args.table, namespace=args.namespace)
     log.info("IcebergCommitter starting for conn=%s table=%s",

@@ -149,7 +149,26 @@ def _dedup_on_pk(table, pk_col: str,
 
 # ─── Catalog factory ────────────────────────────────────────────────────────
 def load_catalog(dest_config: dict):
-    """Build a PyIceberg Catalog from destination connection_config."""
+    """Build a PyIceberg Catalog from destination connection_config.
+
+    v1.3.5 Fix 4: fail LOUDLY on empty config. Previously an empty dict
+    silently defaulted ``catalog_type`` to "rest" and then raised
+    ``KeyError: 'catalog_uri'`` deep inside the rest-branch — a confusing
+    failure mode for operators running the committer without
+    ``--catalog-config``. Now raise a clear ValueError up front so the
+    operator sees exactly what's missing.
+    """
+    if not dest_config:
+        raise ValueError(
+            "catalog_config is empty — cannot load catalog. "
+            "The Iceberg committer requires the destination's "
+            "connection_config (catalog_type + catalog_uri/nessie_uri/..."
+            ") to build a PyIceberg Catalog. Pass it via --catalog-config "
+            "(JSON) or the ICEBERG_CATALOG_CONFIG env var, or wire the "
+            "chart template to mount the destination's connection_config "
+            "Secret (see helm/fusion-cdc/templates/iceberg-committer.yaml)."
+        )
+
     from pyiceberg.catalog import load_catalog as _load
 
     catalog_type = (dest_config.get("catalog_type") or "rest").lower()
