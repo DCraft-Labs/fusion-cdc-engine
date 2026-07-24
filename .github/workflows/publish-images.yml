@@ -143,12 +143,15 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
       # v1.3.5 Fix 1: post-build provenance verification. After the push,
-      # read the published image's org.opencontainers.image.revision label
-      # back from the registry (docker buildx imagetools inspect reads the
-      # image config from the multi-platform manifest) and assert it equals
-      # the tagged commit SHA. If mismatch, fail the workflow. This catches
-      # the v1.3.3 integrity failure (image built from v1.3.1-level source)
-      # automatically before the release is considered green.
+      # pull the published image (amd64 variant on the amd64 runner) and
+      # read its org.opencontainers.image.revision label via docker inspect,
+      # then assert it equals the tagged commit SHA. If mismatch, fail the
+      # workflow. This catches the v1.3.3 integrity failure (image built
+      # from v1.3.1-level source) automatically before the release is
+      # considered green. (docker buildx imagetools inspect --format
+      # '{{ json .Image }}' returns null for multi-platform manifests, so
+      # we use docker pull + docker inspect which reliably reads the
+      # config labels from the pulled platform variant.)
       - name: Verify provenance label matches tag SHA
         shell: bash
         env:
@@ -157,10 +160,10 @@ jobs:
           EXPECTED_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          echo "==> verifying org.opencontainers.image.revision for ${IMAGE}:${SEMVER}"
-          ACTUAL_SHA="$(docker buildx imagetools inspect "${IMAGE}:${SEMVER}" \
-            --format '{{ json .Image }}' \
-            | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')"
+          echo "==> pulling ${IMAGE}:${SEMVER} to inspect provenance label"
+          docker pull "${IMAGE}:${SEMVER}" >/dev/null
+          ACTUAL_SHA="$(docker inspect "${IMAGE}:${SEMVER}" \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
           echo "    expected SHA: ${EXPECTED_SHA}"
           echo "    actual SHA:   ${ACTUAL_SHA}"
           if [[ -z "${ACTUAL_SHA}" ]]; then
