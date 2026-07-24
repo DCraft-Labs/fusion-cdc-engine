@@ -56,39 +56,98 @@ def _sql_str_literal(s: Any) -> str:
 
 # v1.2.40 Finding D (§6f): in-process LRU cache for UDF source so the HTTP
 # fetch + ``exec()`` happens at most once per worker process per
-# ``(udf_name, version)``. The cache is keyed by ``(udf_name, version)``;
-# a version bump in the control-plane registry invalidates the entry. The
-# cache is bounded to avoid unbounded growth from many UDFs.
+# ``(udf_name, version)``. v1.3.0 Fix 4: the cache key is now
+# ``(udf_name, version)`` (previously ``(udf_name, udf_registry_url)`` which
+# never invalidated when the registry served new code for the same name —
+# stale UDF code was served until worker restart). The ``version`` is taken
+# from the caller (``step["version"]``) when the pipeline config pins one,
+# else from the registry response's ``version`` field, else a sha256 hash
+# of the fetched source code (so a source change still invalidates even
+# with no explicit version). A per-name index maps ``udf_name -> last
+# known version`` so a cache hit avoids HTTP entirely when the caller does
+# not supply a version.
 _UDF_CACHE: dict[tuple[str, str], dict] = {}
+_UDF_NAME_INDEX: dict[str, str] = {}
 _UDF_CACHE_MAX = int(os.environ.get("FUSION_UDF_CACHE_MAX", "128"))
 
 
-def _fetch_udf_definition(udf_name: str, udf_registry_url: str) -> dict:
+def _udf_version_from_def(udf_def: dict) -> str:
+    """Resolve the version for a fetched UDF definition: registry ``version``
+    field if present, else a sha256 hash of the source code (first 16 hex
+    chars). Used both as the cache key suffix and the index value."""
+    v = udf_def.get("version")
+    if v is not None and v != "":
+        return str(v)
+    code = udf_def.get("code", "")
+    import hashlib
+    return "sha:" + hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
+
+
+def _fetch_udf_definition(udf_name: str, udf_registry_url: str,
+                         version: str | None = None) -> dict:
     """Fetch + cache a UDF definition from the control-plane registry.
 
     Returns the parsed JSON dict (``{"code": ..., "version": ...}``).
     Cached by ``(udf_name, version)`` so a registry version bump is picked
     up on the next chunk (the cache key includes the version, so the new
-    version is a cache miss and re-fetched)."""
-    cache_key = (udf_name, udf_registry_url)
-    cached = _UDF_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    version is a cache miss and re-fetched).
+
+    ``version`` resolution order:
+      1. the ``version`` argument if the caller (``_apply_udf``) supplied
+         one from ``step["version"]`` — known without fetching, so a cache
+         hit avoids HTTP entirely;
+      2. else the registry response's ``version`` field (requires a fetch
+         to discover, but a per-name index still lets a repeat call hit
+         the cache without HTTP);
+      3. else a sha256 hash of the fetched source code (same index path)."""
+    # Caller-supplied version: key is fully known up front.
+    if version is not None:
+        cache_key = (udf_name, str(version))
+        cached = _UDF_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        return _fetch_and_store_udf(udf_name, udf_registry_url, str(version))
+    # No caller-supplied version: use the per-name index to try a no-HTTP
+    # cache hit first, then fetch to discover the current version.
+    known_version = _UDF_NAME_INDEX.get(udf_name)
+    if known_version is not None:
+        cached = _UDF_CACHE.get((udf_name, known_version))
+        if cached is not None:
+            return cached
+    return _fetch_and_store_udf(udf_name, udf_registry_url, None)
+
+
+def _fetch_and_store_udf(udf_name: str, udf_registry_url: str,
+                         version_hint: str | None) -> dict:
+    """HTTP-fetch the UDF definition, resolve its version, store it under
+    ``(udf_name, version)`` in the cache and update the per-name index."""
     udf_code_url = f"{udf_registry_url}/api/v1/udfs/{udf_name}"
     resp = requests.get(udf_code_url, timeout=10)
     resp.raise_for_status()
     udf_def = resp.json()
-    if len(_UDF_CACHE) >= _UDF_CACHE_MAX:
+    resolved_version = version_hint if version_hint is not None else \
+        _udf_version_from_def(udf_def)
+    cache_key = (udf_name, resolved_version)
+    if len(_UDF_CACHE) >= _UDF_CACHE_MAX and cache_key not in _UDF_CACHE:
         # Evict an arbitrary entry (LRU would need ordering; the set is
         # bounded and UDFs are few, so FIFO eviction is fine here).
         _UDF_CACHE.pop(next(iter(_UDF_CACHE)))
     _UDF_CACHE[cache_key] = udf_def
+    _UDF_NAME_INDEX[udf_name] = resolved_version
     return udf_def
 
 
 def clear_udf_cache() -> None:
-    """Test hook: clear the UDF cache between tests."""
+    """Test hook: clear the UDF cache + per-name index between tests."""
     _UDF_CACHE.clear()
+    _UDF_NAME_INDEX.clear()
+
+
+def invalidate_udf(udf_name: str) -> None:
+    """Drop the per-name index entry for ``udf_name`` so the next fetch
+    re-discovers the current version from the registry. Operational hook
+    for forcing a UDF refresh without clearing the whole cache."""
+    _UDF_NAME_INDEX.pop(udf_name, None)
 
 
 # DuckDB type map
@@ -564,12 +623,18 @@ def _apply_udf(conn, step, udf_registry_url: str = "", **_):
     ``exec()``-ed on EVERY chunk — for a 10k-chunk initial load that's
     10k HTTP round-trips + 10k ``exec()`` calls to the control-plane
     registry for the same UDF. We now cache the fetched definition
-    in-process (``_fetch_udf_definition``) keyed by ``(udf_name,
-    udf_registry_url)`` so the HTTP fetch + ``exec()`` happens at most
-    once per worker process per UDF version. A registry version bump is
-    a cache miss (the cache key is the URL, which embeds the UDF name;
-    if the registry serves a new ``version`` field it's picked up on the
-    next worker restart, or on cache eviction).
+    in-process (``_fetch_udf_definition``) keyed by ``(udf_name, version)``
+    so the HTTP fetch + ``exec()`` happens at most once per worker process
+    per UDF version. A registry version bump (or a source change, which
+    changes the sha256 fallback version) is a cache miss on the next
+    fetch, so new code is picked up without a worker restart.
+
+    v1.3.0 Fix 4: previously the cache key was ``(udf_name, udf_registry_url)``
+    which never invalidated when the registry served new code for the same
+    name — stale UDF code was served until worker restart. The key is now
+    ``(udf_name, version)`` where ``version`` is taken from ``step["version"]``
+    if the pipeline config pins one, else from the registry response's
+    ``version`` field, else a sha256 hash of the source code.
     """
     fn_name = step["function"]
     args = step.get("args", [])
@@ -579,7 +644,9 @@ def _apply_udf(conn, step, udf_registry_url: str = "", **_):
     duck_type = _DUCK_TYPES.get(return_type, "VARCHAR")
 
     # Fetch UDF code from control-plane registry (cached).
-    udf_def = _fetch_udf_definition(fn_name, udf_registry_url)
+    udf_version = step.get("version")
+    udf_def = _fetch_udf_definition(fn_name, udf_registry_url,
+                                     version=udf_version)
     code = udf_def["code"]  # Python function source
 
     # Execute UDF code in isolated namespace and register with DuckDB

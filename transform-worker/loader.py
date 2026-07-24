@@ -20,6 +20,98 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# v1.3.0 Fix 1: DuckDB ATTACH connection-string escaping. The previous code
+# interpolated host/port/database/user/password into the ATTACH string via
+# raw f-strings, so a password containing ``;``, ``=``, ``'``, ``\``, or
+# control chars could break the key=value parse or inject extra kv pairs
+# (connection-string injection). ``_duckdb_attach_kv`` escapes each value
+# per DuckDB's libpq/mysql connector kv rules (backslash escapes the
+# metacharacters ``\ ; = '`` and control chars) and joins with ``;``.
+_DUCKDB_ATTACH_ESCAPE_CHARS = {"\\": "\\\\", ";": "\\;", "=": "\\=",
+                               "'": "\\'"}
+
+
+def _duckdb_attach_kv(**kwargs) -> str:
+    """Build an escaped DuckDB ATTACH key=value connection string.
+
+    Each keyword argument becomes ``key=escaped_value``; pairs are joined
+    with ``;``. Values are coerced to ``str`` and escaped so that the
+    metacharacters ``\\``, ``;``, ``=``, ``'`` and ASCII control chars
+    cannot break out of their value position. ``None`` values are skipped
+    (so optional keys like ``port`` can be omitted cleanly)."""
+    parts: list[str] = []
+    for k, v in kwargs.items():
+        if v is None:
+            continue
+        s = str(v)
+        out = []
+        for ch in s:
+            if ch in _DUCKDB_ATTACH_ESCAPE_CHARS:
+                out.append(_DUCKDB_ATTACH_ESCAPE_CHARS[ch])
+            elif ord(ch) < 0x20:
+                # Control chars -> backslash-u hex escape (rare in DSNs;
+                # ensures they can never terminate a kv pair).
+                out.append("\\u%04x" % ord(ch))
+            else:
+                out.append(ch)
+        parts.append(f"{k}={''.join(out)}")
+    return ";".join(parts)
+
+
+def _duckdb_attach_unescape_kv(s: str) -> dict[str, str]:
+    """Inverse of ``_duckdb_attach_kv`` for test round-trip verification:
+    parse a ``k=v;k=v`` string back into a dict, honouring backslash
+    escapes. Exposed for tests; not used at runtime."""
+    out: dict[str, str] = {}
+    i = 0
+    cur_key: list[str] = []
+    cur_val: list[str] = []
+    in_value = False
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt == "\\":
+                cur_val.append("\\") if in_value else cur_key.append("\\")
+            elif nxt == ";":
+                cur_val.append(";") if in_value else cur_key.append(";")
+            elif nxt == "=":
+                cur_val.append("=") if in_value else cur_key.append("=")
+            elif nxt == "'":
+                cur_val.append("'") if in_value else cur_key.append("'")
+            elif nxt == "u" and i + 5 < len(s) + 1:
+                # \uXXXX hex escape (4 hex digits follow)
+                hexpart = s[i + 2:i + 6]
+                if len(hexpart) == 4 and all(c in "0123456789abcdefABCDEF" for c in hexpart):
+                    cur_val.append(chr(int(hexpart, 16))) if in_value else cur_key.append(chr(int(hexpart, 16)))
+                    i += 6
+                    continue
+                cur_val.append(nxt) if in_value else cur_key.append(nxt)
+            else:
+                cur_val.append(nxt) if in_value else cur_key.append(nxt)
+            i += 2
+            continue
+        if ch == "=" and not in_value:
+            in_value = True
+            i += 1
+            continue
+        if ch == ";" and in_value:
+            out["".join(cur_key)] = "".join(cur_val)
+            cur_key = []
+            cur_val = []
+            in_value = False
+            i += 1
+            continue
+        if in_value:
+            cur_val.append(ch)
+        else:
+            cur_key.append(ch)
+        i += 1
+    if cur_key or in_value:
+        out["".join(cur_key)] = "".join(cur_val)
+    return out
+
+
 # v1.2.17: module-level stop event. The worker process sets this on SIGTERM /
 # SIGINT so a long-running chunked initial-load loop can drain gracefully
 # after the current chunk instead of being killed mid-table by k8s.
@@ -1298,15 +1390,19 @@ class InitialLoadTask:
             conn.execute("SET extension_directory='/opt/duckdb_extensions'")
             if ctype in ("postgres", "postgresql"):
                 conn.execute("LOAD postgres;")
+                attach_str = _duckdb_attach_kv(
+                    host=host, port=port, dbname=database,
+                    user=user, password=password)
                 conn.execute(
-                    f"ATTACH 'postgres:host={host} port={port} dbname={database} "
-                    f"user={user} password={password}' AS src (READ_ONLY)"
+                    f"ATTACH 'postgres:{attach_str}' AS src (READ_ONLY)"
                 )
             elif ctype == "mysql":
                 conn.execute("LOAD mysql;")
+                attach_str = _duckdb_attach_kv(
+                    host=host, port=port, database=database,
+                    user=user, password=password)
                 conn.execute(
-                    f"ATTACH 'mysql:host={host} port={port} database={database} "
-                    f"user={user} password={password}' AS src (READ_ONLY)"
+                    f"ATTACH 'mysql:{attach_str}' AS src (READ_ONLY)"
                 )
             else:
                 return None
