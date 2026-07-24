@@ -346,31 +346,6 @@ class DuckDBTransformEngine:
         arrow_out = conn.execute("SELECT * FROM staging").fetch_arrow_table()
         return arrow_out, child_tables, arrow_out.schema
 
-    def execute_pipeline_arrow_in_place(self, arrow_tbl, steps, schema=None):
-        """v1.3.2 Fix 3: bulk-mode transform path. Zero-copy Arrow->DuckDB register, run step handlers, fetch_arrow_table() out. NO Python row-dict round-trip."""
-        if arrow_tbl is None or arrow_tbl.num_rows == 0:
-            if schema is not None:
-                return pa.Table.from_pylist([], schema=schema)
-            return arrow_tbl if arrow_tbl is not None else pa.table({})
-        if not steps:
-            return arrow_tbl
-        conn = self._get_conn()
-        conn.register("rows_view", arrow_tbl)
-        conn.execute("CREATE OR REPLACE TABLE staging AS SELECT * FROM rows_view")
-        for step in steps:
-            step_type = step.get("type")
-            handler = self.STEP_HANDLERS.get(step_type)
-            if handler is None:
-                log.warning("Unknown transform step type: %s — skipping", step_type)
-                continue
-            try:
-                handler(conn, step, udf_registry_url=self.control_plane_url)
-            except Exception:
-                log.exception("Transform step failed (bulk mode in-place): %s", step)
-                raise
-        arrow_out = conn.execute("SELECT * FROM staging").fetch_arrow_table()
-        return arrow_out
-
 
 # ─── Transform step implementations ──────────────────────────────────────────
 
