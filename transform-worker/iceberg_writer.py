@@ -569,12 +569,47 @@ def _get_source_schema(source: dict, schema_name: str, table_name: str) -> pa.Sc
     return pa.schema([])
 
 
+def _kill_mysql_thread(host, port, user, password, thread_id) -> None:
+    """2026-07-24 fix: force-terminate a source-DB query we fired ourselves,
+    once we've given up on it (timeout/exception), instead of just dropping
+    our own client connection and hoping the server notices. Matters most
+    against a shared/multi-tenant source (e.g. a live UAT MySQL instance
+    also used by other teams) -- an abandoned client socket does not
+    promptly free server-side query resources. Opens a brand-new,
+    short-lived connection purely to issue ``KILL <thread_id>``; any
+    failure here is logged and swallowed (this is best-effort cleanup,
+    not allowed to mask the original error).
+    """
+    try:
+        import pymysql
+        killer = pymysql.connect(host=host, port=int(port), user=user,
+                                  password=password, connect_timeout=5,
+                                  read_timeout=5)
+        try:
+            with killer.cursor() as kc:
+                kc.execute(f"KILL {int(thread_id)}")
+            log.warning("KILLed orphaned source query thread_id=%s on %s:%s "
+                        "after our client gave up on it", thread_id, host, port)
+        finally:
+            killer.close()
+    except Exception as e:
+        log.warning("failed to KILL source thread_id=%s on %s:%s (%s) "
+                    "-- server will have to reclaim it on its own",
+                    thread_id, host, port, e)
+
+
 def _get_mysql_source_schema(host, port, database, user, password,
                               schema_name, table_name) -> pa.Schema:
     import pymysql
     conn = pymysql.connect(host=host, port=port, database=database,
                            user=user, password=password,
-                           connect_timeout=10)
+                           connect_timeout=10, read_timeout=30)
+    # 2026-07-24 fix: kill orphaned source queries on failure (shared UAT).
+    _thread_id = None
+    try:
+        _thread_id = conn.thread_id()
+    except Exception:
+        pass
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -585,8 +620,15 @@ def _get_mysql_source_schema(host, port, database, user, password,
                 (database, table_name),
             )
             rows = cur.fetchall()
+    except Exception:
+        if _thread_id is not None:
+            _kill_mysql_thread(host, port, user, password, _thread_id)
+        raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
     fields = [
         pa.field(name, _normalize_mysql_type(dtype))
         for (name, dtype, _pos) in rows
@@ -684,15 +726,43 @@ def _rows_to_arrow(rows: list[dict], schema: pa.Schema | None = None) -> pa.Tabl
 
 
 def _get_or_create_table(catalog, namespace: str, table_name: str,
-                         arrow_schema: pa.Schema, dest_config: dict):
-    """Idempotently load or create an Iceberg table."""
+                         arrow_schema: pa.Schema, dest_config: dict,
+                         pk_col: "str | None" = None):
+    """Idempotently load or create an Iceberg table.
+
+    v1.3.6: when creating a new table and no explicit ``partition_spec`` is
+    configured, apply ``bucket(16, <pk>)`` when a primary key is known so
+    future overlap deletes can prune to a handful of data files (see Bug #7).
+    Existing unpartitioned tables are left unchanged (skip-dedup path).
+    """
     from pyiceberg.exceptions import NoSuchTableError
 
     try:
         return catalog.load_table(f"{namespace}.{table_name}")
     except NoSuchTableError:
         log.info("Creating Iceberg table %s.%s", namespace, table_name)
-        partition_spec = _build_partition_spec_from_arrow(arrow_schema, dest_config.get("partition_spec", []))
+        partition_spec_cfg = list(dest_config.get("partition_spec") or [])
+        if not partition_spec_cfg:
+            # Prefer explicit pk_col; fall back to identifier_fields[0].
+            resolved_pk = pk_col
+            if not resolved_pk:
+                ids = dest_config.get("identifier_fields") or []
+                if isinstance(ids, (list, tuple)) and ids:
+                    resolved_pk = str(ids[0])
+            schema_names = {f.name for f in arrow_schema}
+            if resolved_pk and resolved_pk in schema_names:
+                partition_spec_cfg = [{
+                    "source_column": resolved_pk,
+                    "transform": "bucket",
+                    "width": 16,
+                    "name": f"{resolved_pk}_bucket",
+                }]
+                log.info(
+                    "Creating Iceberg table %s.%s with default bucket(16, %s) "
+                    "partition (v1.3.6)",
+                    namespace, table_name, resolved_pk,
+                )
+        partition_spec = _build_partition_spec_from_arrow(arrow_schema, partition_spec_cfg)
         props = _build_table_properties(dest_config)
         # PyIceberg 0.7.1: Catalog.create_table() does NOT accept an
         # `identifier_fields` kwarg (TypeError: unexpected keyword argument).
@@ -823,10 +893,8 @@ class IcebergWriter:
         try:
             table = _get_or_create_table(
                 self.catalog, self.namespace, table_name,
-                create_schema, self.dest_config,
+                create_schema, self.dest_config, pk_col=pk_col,
             )
-            # If the cached schema is a subset of the row keys (schema drift),
-            # evolve the Iceberg table before appending.
             if schema is not None:
                 row_keys = set(rows[0].keys()) if rows else set()
                 cached_names = {f.name for f in schema}
@@ -869,7 +937,7 @@ class IcebergWriter:
         try:
             table = _get_or_create_table(
                 self.catalog, self.namespace, table_name,
-                create_schema, self.dest_config,
+                create_schema, self.dest_config, pk_col=pk_col,
             )
             # v1.2.33 Bug #22 fix 2: dedup-on-PK before append (idempotency).
             if pk_col:
@@ -884,6 +952,7 @@ class IcebergWriter:
                             partition_id: str = "default",
                             chunk_seq: int | None = None,
                             pk_range: tuple | None = None,
+                            pk_col: "str | None" = None,
                             ) -> str:
         """v1.2.39 section 6: write an Arrow batch as a plain Parquet file
         DIRECTLY to ``table.location()/data/<partition>/<chunk_seq>-<uuid>.parquet``
@@ -926,7 +995,7 @@ class IcebergWriter:
             log.info("write_arrow_to_file: table %s.%s does not exist - "
                      "bootstrapping via write_arrow (one commit)",
                      self.namespace, table_name)
-            self.write_arrow(arrow_tbl, table_name=table_name, pk_col=None)
+            self.write_arrow(arrow_tbl, table_name=table_name, pk_col=pk_col)
             return ""
 
         loc = table.location().rstrip("/")
@@ -977,6 +1046,7 @@ class IcebergWriter:
             table = _get_or_create_table(
                 self.catalog, self.namespace, table_name,
                 create_schema, self.dest_config,
+                pk_col=(identifier_fields[0] if identifier_fields else None),
             )
             if schema is not None:
                 row_keys = set(rows[0].keys()) if rows else set()

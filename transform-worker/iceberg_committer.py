@@ -100,10 +100,26 @@ def _pk_to_score(pk) -> float:
 
 def _ranges_overlap(a_min, a_max, b_min, b_max) -> bool:
     """Return True if [a_min, a_max] overlaps [b_min, b_max]. None bounds
-    are treated as unbounded on that side."""
-    if a_min is not None and b_max is not None and a_min > b_max:
+    are treated as unbounded on that side.
+
+    2026-07-24 Bug #5: the previous second check restated the first
+    (``b_max < a_min`` == ``a_min > b_max``) and never tested "A entirely
+    before B" (``a_max`` vs ``b_min``), so disjoint lower partitions were
+    wrongly flagged as overlapping.
+
+    2026-07-24 Bug #6: the stored pk_range is a CURSOR-based half-open
+    interval (last_pk_before, last_pk_after] -- last_pk_before is the
+    EXCLUSIVE fetch cursor (``WHERE pk > last_pk``), last_pk_after is the
+    actual last row's pk (INCLUSIVE). Consecutive chunks therefore always
+    touch exactly at one boundary value (chunk N's rmax == chunk N+1's
+    rmin) by construction -- that shared value is EXCLUDED from chunk
+    N+1's own range, so it is not a real overlap. Strict ``>``/``<``
+    treated an exact boundary touch as overlapping; ``>=``/``<=`` correctly
+    treats a shared boundary as disjoint.
+    """
+    if a_min is not None and b_max is not None and a_min >= b_max:
         return False
-    if b_min is not None and a_max is not None and b_max < a_min:
+    if a_max is not None and b_min is not None and a_max <= b_min:
         return False
     return True
 
@@ -461,18 +477,32 @@ class IcebergCommitter:
         if not register_clean:
             return []
         # Open ONE transaction and add_files() each path.
+        # v1.3.6: phase timing INFO logs (load_table / add_files / commit).
         try:
+            _t0 = time.perf_counter()
             table = self.catalog.load_table(
                 f"{self.namespace}.{self.table_name}")
+            load_table_ms = (time.perf_counter() - _t0) * 1000.0
         except Exception as e:
             result["errors"].append({"phase": "load_table", "error": str(e)})
             # Re-enqueue the entries so the next cycle retries.
             self._reenqueue(register_clean)
             return []
         try:
+            _t1 = time.perf_counter()
             with table.transaction() as tx:
                 for e in register_clean:
                     tx.add_files(file_paths=[e["file_path"]])
+                add_files_ms = (time.perf_counter() - _t1) * 1000.0
+                _t2 = time.perf_counter()
+            # commit_transaction runs on context-manager exit
+            commit_ms = (time.perf_counter() - _t2) * 1000.0
+            log.info(
+                "committer: commit phase timing table=%s files_in_batch=%d "
+                "load_table_ms=%.1f add_files_ms=%.1f commit_ms=%.1f",
+                self.table_name, len(register_clean),
+                load_table_ms, add_files_ms, commit_ms,
+            )
             # Commit succeeded - record each path in the committed set
             # and each range in the committed-PK-ranges sorted set.
             committed_paths = [e["file_path"] for e in register_clean]
@@ -558,7 +588,29 @@ class IcebergCommitter:
         """Delete rows in [rmin, rmax] from the table (delete-then-register).
         Tries the discrete-key path via iceberg_writer._dedup_on_pk (reading
         the staged Parquet file's PK column) and falls back to a pyiceberg
-        range expression. All failures are logged and non-fatal."""
+        range expression. All failures are logged and non-fatal.
+
+        2026-07-24 Bug #7: BOTH delete paths are catastrophically expensive
+        on an unpartitioned table (no file pruning for an IN() over up to
+        ``chunk_size`` keys or a range predicate). Skip the expensive delete
+        when the table has no partition fields and register as-is. When the
+        table IS partitioned, keep the pruned delete path.
+        """
+        try:
+            spec = table.spec()
+            part_fields = getattr(spec, "fields", None) or ()
+            is_partitioned = len(part_fields) > 0
+        except Exception:
+            is_partitioned = False
+        if not is_partitioned:
+            log.warning(
+                "committer: overlap detected for %s (pk range [%s,%s]) — "
+                "skipping expensive delete-dedup (unpartitioned table, "
+                "checkpoint fix + correct overlap-detection make this rare); "
+                "registering as-is",
+                entry.get("file_path"), rmin, rmax,
+            )
+            return
         # Path 1: read the staged file's PK column and use the existing
         # _dedup_on_pk discrete-key delete.
         keys = self._extract_pk_values_from_staged_file(entry, pk_col)

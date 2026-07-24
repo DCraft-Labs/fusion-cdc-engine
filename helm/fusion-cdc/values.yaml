@@ -196,18 +196,20 @@ committer:
   livenessLagThreshold: 5000
   # Tunables forwarded to the committer via env vars (see iceberg_committer.py).
   lockTtlS: 30
-  drainBatch: 100
+  # v1.3.6 Bug #9: larger drain batches amortize per-commit catalog overhead
+  # when 6 producers stage faster than a single committer can register.
+  drainBatch: 300
   drainTimeoutMs: 5000
   idleSleepS: 5.0
   image:
     pullPolicy: IfNotPresent
   resources:
     requests:
-      cpu: 200m
+      cpu: 250m
       memory: 512Mi
     limits:
-      cpu: 1000m
-      memory: 2Gi
+      cpu: 2000m
+      memory: 2048Mi
   # One entry per active staged (conn, table) pair. The committer pod runs
   # `python iceberg_committer.py --connection-id <id> --table <table>
   # --namespace <ns>`. catalogConfig (optional JSON dest config) is forwarded

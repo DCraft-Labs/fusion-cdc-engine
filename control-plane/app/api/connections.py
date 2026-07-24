@@ -645,6 +645,9 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
         # disjoint PK range of the same table (true intra-table parallelism).
         k = _connection_parallelism(connection)
         chunk_size = _connection_chunk_size(connection)
+        _rl = connection.resource_limits or {}
+        task_bulk_mode = _rl.get("bulk_mode")
+        task_committer_mode = _rl.get("committer_mode")
         src_connector_type = (source.connector_definition.connector_type
                               if source.connector_definition else "postgres")
         # v1.2.30 Defect C fix: import the estimate-aware partitioner so each
@@ -714,6 +717,8 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
                     # worker loops internally within [pk_start, pk_end] and
                     # resumes from last_pk on restart.
                     "chunk_size": chunk_size,
+                    "bulk_mode": task_bulk_mode,
+                    "committer_mode": task_committer_mode,
                     "transform_steps": steps,
                     "destination": dest_block,
                     "source": source_block,

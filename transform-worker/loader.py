@@ -217,6 +217,38 @@ COMMITTER_MODE_DEFAULT = str(os.environ.get("INITIAL_LOAD_COMMITTER_MODE", "none
 PROMETHEUS_PORT = int(os.environ.get("TRANSFORM_WORKER_PROMETHEUS_PORT", "9090"))
 
 
+def _kill_mysql_thread(host, port, user, password, thread_id) -> None:
+    """2026-07-24 fix: force-terminate a source-DB query we fired ourselves,
+    once we've given up on it (timeout/exception), instead of just dropping
+    our own client connection and hoping the server notices. Matters most
+    against a shared/multi-tenant source (e.g. a live UAT MySQL instance
+    also used by other teams) -- an abandoned client socket does not
+    promptly free server-side query resources. Opens a brand-new,
+    short-lived connection purely to issue ``KILL <thread_id>``; any
+    failure here is logged and swallowed (this is best-effort cleanup,
+    not allowed to mask the original error).
+
+    Note: DuckDB bulk mode still lacks this protection — mysql_scanner
+    does not expose the underlying MySQL thread id.
+    """
+    try:
+        import pymysql
+        killer = pymysql.connect(host=host, port=int(port), user=user,
+                                  password=password, connect_timeout=5,
+                                  read_timeout=5)
+        try:
+            with killer.cursor() as kc:
+                kc.execute(f"KILL {int(thread_id)}")
+            log.warning("KILLed orphaned source query thread_id=%s on %s:%s "
+                        "after our client gave up on it", thread_id, host, port)
+        finally:
+            killer.close()
+    except Exception as e:
+        log.warning("failed to KILL source thread_id=%s on %s:%s (%s) "
+                    "-- server will have to reclaim it on its own",
+                    thread_id, host, port, e)
+
+
 # ---------------------------------------------------------------------------
 # v1.2.29 Task 2: per-chunk Prometheus metrics. Defined at import time so
 # every worker pod shares the same metric registry. prometheus_client is
@@ -1379,15 +1411,32 @@ class InitialLoadTask:
             conn = pymysql.connect(host=host, port=int(port), database=database,
                                    user=user, password=password,
                                    cursorclass=pymysql.cursors.DictCursor,
-                                   connect_timeout=10,
+                                   connect_timeout=10, read_timeout=120,
                                    autocommit=True)
+        # 2026-07-24 fix: this source may be a shared/multi-tenant DB (e.g. a
+        # UAT instance also used by other teams) -- a query we fire must
+        # never be left running server-side after our client gives up on it.
+        # Note: DuckDB bulk mode still lacks kill-on-failure (no thread-id
+        # hook from mysql_scanner).
+        _thread_id = None
+        try:
+            _thread_id = conn.thread_id()
+        except Exception:
+            pass
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params))
                 return list(cur.fetchall())
+        except Exception:
+            if _thread_id is not None:
+                _kill_mysql_thread(host, port, user, password, _thread_id)
+            raise
         finally:
             if owns_conn:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # ── v1.2.29 Task 1 + Task 5: DuckDB native scanner + pooled source conn ──
 
@@ -1474,6 +1523,23 @@ class InitialLoadTask:
             user = source.get("username") or source.get("user")
             password = source.get("password")
             conn = duckdb.connect()
+            # 2026-07-24 fix: duckdb.connect() defaults its internal execution
+            # thread pool to the HOST's hardware_concurrency() (the Docker
+            # Desktop VM's core count), not this pod's cgroup CPU limit
+            # (1000m). The community mysql_scanner extension's scan operator
+            # is not safe to run from more than one DuckDB execution thread
+            # concurrently against a single MYSQL_RES handle -- when DuckDB
+            # parallelizes even a single-relation scan across >1 internal
+            # threads, two threads call mysql_fetch_row()/mysql_next() on the
+            # same result set concurrently, producing a native C-level crash
+            # surfaced as "InternalException: MySQLResult::Next called
+            # without result". Confirmed this was NOT source-connection
+            # instability (isolated pymysql fetches against the same host/
+            # port succeed) -- it is entirely our own DuckDB connection's
+            # default parallelism. Force single-threaded execution for this
+            # connection; the ATTACHed scan is I/O-bound over the network
+            # anyway, so this costs nothing.
+            conn.execute("SET threads=1")
             # Bug #26: look for the baked extension in the fixed path, not $HOME.
             conn.execute("SET extension_directory='/opt/duckdb_extensions'")
             if ctype in ("postgres", "postgresql"):
@@ -1516,17 +1582,34 @@ class InitialLoadTask:
             qualified = (f'src.`{schema_name}`.`{table_name}`'
                          if schema_name else f'src.`{table_name}`')
             pk_q = f"`{pk_col}`"
+        # 2026-07-24 fix: DuckDB's named-parameter binder rejects a params
+        # dict containing ANY key with no matching $key placeholder in the
+        # SQL text ("Parameter argument/count mismatch, identifiers of the
+        # excess parameters: ..."). last_pk/pk_end are OPTIONAL WHERE
+        # clauses (omitted when None -- first chunk has no last_pk, last
+        # partition has no pk_end), but the previous code unconditionally
+        # included both keys in the params dict regardless of whether the
+        # SQL actually referenced them. Confirmed live: 100% failure on the
+        # first chunk of every partition (last_pk is None) and on every
+        # unbounded last partition (pk_end is None). A failed param-bind
+        # also appears to leave the DuckDB connection's pending-query state
+        # broken for the NEXT call on the same (per-partition, reused)
+        # connection, which is the likely cause of the separate
+        # "InvalidInputException: closed pending query result" seen on
+        # subsequent chunks of the same partition -- fixing the root cause
+        # here should eliminate both.
         where_parts: list[str] = []
+        params: dict[str, Any] = {"chunk_size": chunk_size}
         if last_pk is not None:
             where_parts.append(f"{pk_q} > $last_pk")
+            params["last_pk"] = last_pk
         if pk_end is not None:
             where_parts.append(f"{pk_q} <= $pk_end")
+            params["pk_end"] = pk_end
         where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
         sql = (f"SELECT * FROM {qualified} {where_clause} "
                f"ORDER BY {pk_q} ASC LIMIT $chunk_size")
-        rel = duckdb_conn.execute(
-            sql, {"last_pk": last_pk, "pk_end": pk_end, "chunk_size": chunk_size},
-        )
+        rel = duckdb_conn.execute(sql, params)
         return rel.fetch_arrow_table()
 
     def _extract_pk_from_arrow(self, arrow_tbl, pk_col: str, ctype: str) -> Any:
@@ -1597,6 +1680,7 @@ class InitialLoadTask:
             arrow_tbl, table_name=table_name,
             partition_id=partition_id, chunk_seq=chunk_seq,
             pk_range=pk_range,
+            pk_col=getattr(self, "_current_pk_col", None),
         )
         if not path:
             # Table was bootstrapped via write_arrow (one commit) - the

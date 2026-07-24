@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 
 
 # ===========================
@@ -62,8 +62,16 @@ class StreamCreate(StreamBase):
 
 
 class StreamUpdate(BaseModel):
-    """Schema for updating a stream"""
-    
+    """Schema for updating a stream.
+
+    ``source_table_name`` / ``source_schema_name`` are create-only
+    (immutable). To re-point a stream at a different source table, delete
+    and recreate it. Unknown keys are rejected with HTTP 422
+    (``extra="forbid"``) so silently-dropped fields cannot mask operator
+    intent (v1.3.6 Bug #11).
+    """
+    model_config = ConfigDict(extra="forbid")
+
     stream_name: Optional[str] = Field(None, min_length=1, max_length=255)
     stream_namespace: Optional[str] = Field(None, max_length=255)
     destination_table_name: Optional[str] = Field(None, max_length=255)
@@ -208,8 +216,15 @@ class ConnectionCreate(ConnectionBase):
 
 
 class ConnectionUpdate(BaseModel):
-    """Schema for updating a connection"""
-    
+    """Schema for updating a connection.
+
+    ``sync_type`` is create-only (immutable). To change BATCH vs REALTIME,
+    delete and recreate the connection. Unknown keys are rejected with
+    HTTP 422 (``extra="forbid"``) so silently-dropped fields cannot mask
+    operator intent (v1.3.6 Bug #11).
+    """
+    model_config = ConfigDict(extra="forbid")
+
     connection_name: Optional[str] = Field(None, min_length=1, max_length=255)
     sync_mode: Optional[str] = None
     sync_frequency: Optional[str] = None
