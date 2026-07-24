@@ -25,15 +25,25 @@ log = logging.getLogger(__name__)
 # raw f-strings, so a password containing ``;``, ``=``, ``'``, ``\``, or
 # control chars could break the key=value parse or inject extra kv pairs
 # (connection-string injection). ``_duckdb_attach_kv`` escapes each value
-# per DuckDB's libpq/mysql connector kv rules (backslash escapes the
-# metacharacters ``\ ; = '`` and control chars) and joins with a space.
+# per DuckDB's libpq/mysql connector kv rules and joins with a space.
 # v1.3.1 Fix 1: the v1.3.0 helper joined with ``;`` but DuckDB's
 # mysql_scanner / postgres_scanner DSN parser expects SPACE-separated
 # key=value pairs (``;`` triggers ``Unrecognized configuration parameter
 # ""`` at parse time, silently re-breaking DuckDB bulk mode). Reverted
 # the join separator to space; the escaping logic is unchanged.
-_DUCKDB_ATTACH_ESCAPE_CHARS = {"\\": "\\\\", ";": "\\;", "=": "\\=",
-                               "'": "\\'"}
+# v1.3.2 Fix 4 (carried from v1.3.1 follow-up): live testing confirmed
+# DuckDB's mysql_scanner DSN parser only accepts ``\\`` and ``\;`` as
+# backslash escapes. The v1.3.0/v1.3.1 helper ALSO escaped ``=`` and
+# ``'`` (``\=`` and ``\'``), but ``\=`` triggers
+# ``Unrecognized configuration parameter`` and ``\'`` breaks the outer
+# SQL string literal. Drop the ``\=`` / ``\'`` escaping; keep ``\\`` and
+# ``\;`` (those are correct and required) and control-char ``\uXXXX``.
+# IMPORTANT: this means spaces, ``=``, and ``'`` in passwords are NOT
+# supported by the DuckDB mysql_scanner DSN parser — operators with such
+# passwords must change the password or use a different mechanism (the
+# parser uses unescaped ``=`` as the key/value split and unescaped spaces
+# as the pair separator, so neither can appear inside a value).
+_DUCKDB_ATTACH_ESCAPE_CHARS = {"\\": "\\\\", ";": "\\;"}
 
 
 def _duckdb_attach_kv(**kwargs) -> str:
@@ -42,10 +52,21 @@ def _duckdb_attach_kv(**kwargs) -> str:
     Each keyword argument becomes ``key=escaped_value``; pairs are joined
     with a single space (DuckDB's mysql_scanner/postgres_scanner DSN
     parser expects space-separated key=value pairs). Values are coerced
-    to ``str`` and escaped so that the metacharacters ``\\``, ``;``,
-    ``=``, ``'`` and ASCII control chars cannot break out of their value
-    position. ``None`` values are skipped (so optional keys like ``port``
-    can be omitted cleanly)."""
+    to ``str`` and escaped so that the metacharacters ``\\`` and ``;``
+    and ASCII control chars cannot break out of their value position.
+    ``None`` values are skipped (so optional keys like ``port`` can be
+    omitted cleanly).
+
+    v1.3.2 Fix 4: ``=`` and ``'`` are NO LONGER escaped — DuckDB's
+    mysql_scanner DSN parser only honours ``\\`` and ``\\;`` as backslash
+    escapes; ``\\=`` triggers ``Unrecognized configuration parameter`` and
+    ``\\'`` breaks the outer SQL string literal. As a consequence,
+    spaces, ``=``, and ``'`` in passwords are NOT supported by the
+    DuckDB mysql_scanner DSN parser — operators with such passwords
+    must change the password or use a different mechanism. The caller
+    is expected to reject such passwords upstream (see
+    ``test_v130_attach_escape.py`` for the documented unsupported-char
+    behaviour)."""
     parts: list[str] = []
     for k, v in kwargs.items():
         if v is None:
@@ -68,7 +89,13 @@ def _duckdb_attach_kv(**kwargs) -> str:
 def _duckdb_attach_unescape_kv(s: str) -> dict[str, str]:
     """Inverse of ``_duckdb_attach_kv`` for test round-trip verification:
     parse a space-separated ``k=v k=v`` string back into a dict,
-    honouring backslash escapes. Exposed for tests; not used at runtime."""
+    honouring backslash escapes. Exposed for tests; not used at runtime.
+
+    v1.3.2 Fix 4: only ``\\`` and ``\\;`` are unescaped (matching the
+    reduced escape set in ``_duckdb_attach_kv``). ``\\=`` and ``\\'`` are
+    no longer produced by the encoder, so the decoder passes them
+    through literally (the ``\\uXXXX`` control-char escape is still
+    honoured)."""
     out: dict[str, str] = {}
     i = 0
     cur_key: list[str] = []
@@ -82,10 +109,6 @@ def _duckdb_attach_unescape_kv(s: str) -> dict[str, str]:
                 cur_val.append("\\") if in_value else cur_key.append("\\")
             elif nxt == ";":
                 cur_val.append(";") if in_value else cur_key.append(";")
-            elif nxt == "=":
-                cur_val.append("=") if in_value else cur_key.append("=")
-            elif nxt == "'":
-                cur_val.append("'") if in_value else cur_key.append("'")
             elif nxt == "u" and i + 5 < len(s) + 1:
                 # \uXXXX hex escape (4 hex digits follow)
                 hexpart = s[i + 2:i + 6]
@@ -393,6 +416,40 @@ class InitialLoadTask:
     def __init__(self, engine: "DuckDBTransformEngine", redis_client: redis.Redis):
         self.engine = engine
         self.redis = redis_client
+        # v1.3.2 Fix 3: per-worker-process set tracking which (stream_id,
+        # table_name) pairs have already emitted the "bulk mode bypasses
+        # configured transform steps" warning. The warning fires once per
+        # stream per worker, not per chunk (a 100-chunk load would otherwise
+        # spam the log 100x). Lives on the InitialLoadTask instance; a new
+        # instance is created per task (worker.py), so this is per-worker.
+        self._bulk_transform_warned: set[str] = set()
+
+    def _maybe_warn_bulk_transform_bypass(self, stream_id, dest_table, steps) -> None:
+        """v1.3.2 Fix 3: emit a one-time-per-stream warning when bulk mode
+        (``kind == "arrow"`` + iceberg destination) is engaged AND the
+        stream has configured transform ``steps``. Bulk mode skips
+        ``execute_pipeline_arrow`` / ``execute_pipeline`` entirely, so
+        the transforms are silently dropped - the connection appears to
+        succeed and produces untransformed data. The warning fires once
+        per ``(stream_id, dest_table)`` per worker process (keyed on
+        ``self._bulk_transform_warned``), not per chunk, so a 100-chunk
+        load doesn't spam the log 100x.
+
+        Callers: the per-chunk ``if kind == "arrow" and connector_type
+        == "iceberg":`` branch in ``run()``. Gated on ``if steps:``."""
+        if not steps:
+            return
+        _warn_key = f"{stream_id}:{dest_table}"
+        if _warn_key in self._bulk_transform_warned:
+            return
+        self._bulk_transform_warned.add(_warn_key)
+        log.warning(
+            "InitialLoad: bulk mode (kind=arrow) bypasses configured "
+            "transform_steps for stream=%s table=%s - transforms will "
+            "NOT be applied. Either disable DuckDB bulk mode for this "
+            "stream or remove the transform_steps config to silence "
+            "this warning.",
+            stream_id, dest_table)
 
     def run(self, task: dict):
         connection_id = task["connection_id"]
@@ -745,7 +802,13 @@ class InitialLoadTask:
                 # typed Arrow table; skip Python convert and write Arrow directly
                 # to Iceberg (the fast path). Transform steps are NOT applied in
                 # bulk mode (bulk = raw 1:1 snapshot for speed).
+                # v1.3.2 Fix 3: observability — if transform ``steps`` are
+                # configured for this stream, bulk mode silently drops them.
+                # Emit a one-time-per-stream WARNING so operators can detect the
+                # misconfiguration (either disable bulk mode or remove the
+                # transform config). The warning helper is gated on ``if steps``.
                 if kind == "arrow" and connector_type == "iceberg":
+                    self._maybe_warn_bulk_transform_bypass(stream_id, dest_table, steps)
                     INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(0.0)
                     t_w0 = time.monotonic()
                     if use_committer:
@@ -1463,7 +1526,15 @@ class InitialLoadTask:
         row-dict intermediate). Delegates to IcebergWriter.write_arrow."""
         from iceberg_writer import IcebergWriter  # local import; module already imported at top in prod
         try:
-            writer = IcebergWriter(dest, redis_client=getattr(self, "redis", None),
+            # v1.3.2 Bug A fix: unwrap the dest wrapper dict the same way the
+            # sibling _write_to_iceberg does. The control-plane producer emits
+            # dest as {"connector_type": "iceberg", "connection_config": {...}}
+            # — passing the raw wrapper to IcebergWriter causes load_catalog()
+            # to miss ``catalog_type`` (defaults to "rest") and crash with
+            # KeyError: 'catalog_uri' on 100% of iceberg writes. This path is
+            # the default for every iceberg write since v1.2.38.
+            _dest_cfg = dest.get("connection_config") or dest.get("config") or dest
+            writer = IcebergWriter(_dest_cfg, redis_client=getattr(self, "redis", None),
                                    connection_id=getattr(self, "_current_connection_id", None))
             # v1.2.33 Bug #22 fix 2: pass pk_col so IcebergWriter dedup-on-PK
             # (delete-then-append) before each batch — idempotency safeguard.
@@ -1498,7 +1569,11 @@ class InitialLoadTask:
         label."""
         from iceberg_writer import IcebergWriter
         from iceberg_committer import enqueue_pending_file
-        writer = IcebergWriter(dest, redis_client=getattr(self, "redis", None),
+        # v1.3.2 Bug B fix: same unwrap as _write_arrow_to_iceberg /
+        # _write_to_iceberg. Without this, 100% of staged-committer iceberg
+        # writes crash with KeyError: 'catalog_uri' once load_catalog() runs.
+        _dest_cfg = dest.get("connection_config") or dest.get("config") or dest
+        writer = IcebergWriter(_dest_cfg, redis_client=getattr(self, "redis", None),
                                connection_id=connection_id)
         path = writer.write_arrow_to_file(
             arrow_tbl, table_name=table_name,

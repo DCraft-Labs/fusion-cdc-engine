@@ -1,9 +1,9 @@
-"""v1.3.0 Fix 1 — DuckDB ATTACH connection-string escaping tests.
+r"""v1.3.0 Fix 1 — DuckDB ATTACH connection-string escaping tests.
 
 Verifies that ``_duckdb_attach_kv`` escapes the metacharacters ``\\``,
-``;``, ``=``, ``'`` and control chars so a password (or any config value)
-containing them cannot break out of its key=value position or inject
-extra kv pairs into the DuckDB ATTACH string. Also verifies the escape
+``;`` and control chars so a password (or any config value) containing
+them cannot break out of its key=value position or inject extra kv
+pairs into the DuckDB ATTACH string. Also verifies the escape
 round-trips through the inverse parser.
 
 v1.3.1 Fix 1: the join separator was changed from ``;`` to a single
@@ -14,6 +14,24 @@ updated to expect space-separated output. The integration test in
 ATTACH string against real DuckDB to confirm the syntax is accepted
 (the unit tests originally missed the separator regression because
 they only checked the escape logic in isolation).
+
+v1.3.2 Fix 4 (carried from v1.3.1 follow-up): live testing confirmed
+DuckDB's mysql_scanner DSN parser only accepts ``\\`` and ``\;`` as
+backslash escapes. ``\=`` triggers ``Unrecognized configuration
+parameter`` and ``\'`` breaks the outer SQL string literal. The
+``\=`` and ``\'`` escaping has been DROPPED. As a consequence,
+spaces, ``=``, and ``'`` in passwords are NOT supported by the
+DuckDB mysql_scanner DSN parser — operators with such passwords
+must change the password or use a different mechanism. The tests
+below were updated to:
+  * expect only ``\\`` and ``\;`` escaping (no ``\=`` or ``\'``);
+  * document the unsupported-char behaviour for passwords containing
+    ``=`` or ``'`` (the encoder no longer escapes them, so a password
+    containing an unescaped ``=`` would split the kv pair — the test
+    asserts the encoder does NOT silently produce a broken string by
+    instead documenting that such passwords are unsupported and
+    asserting the encoder leaves them raw, which is the documented
+    behaviour the caller must reject upstream).
 """
 from __future__ import annotations
 
@@ -31,18 +49,22 @@ class TestDuckDBAttachEscape(unittest.TestCase):
 
     def test_password_with_metachars_escaped_roundtrips(self):
         from loader import _duckdb_attach_kv
-        # A password containing every metachar + a control char. Note:
-        # spaces in values are NOT escaped (DuckDB's mysql_scanner DSN
-        # parser does not support escaped spaces), so the round-trip
-        # test uses a password without a space. The integration test
-        # (test_v131_attach_integration.py) covers the live DuckDB
-        # parse with a password containing ``;`` and ``\\``.
-        pw = "p;=\\'ss\x01word"
+        # v1.3.2 Fix 4: only ``\\`` and ``\;`` are escaped now. ``\=`` and
+        # ``\'`` are no longer escaped (DuckDB's mysql_scanner rejects
+        # them). A password containing ``=`` or ``'`` is unsupported
+        # and must be rejected upstream — this test uses a password
+        # with only the supported metachars (``;``, ``\\``, control
+        # char) so the round-trip still verifies the supported escape
+        # set. The unsupported-char behaviour is documented in
+        # ``test_password_with_equals_is_unsupported`` and
+        # ``test_password_with_quote_is_unsupported`` below.
+        pw = "p;\\ss\x01word"
         s = _duckdb_attach_kv(host="h", port=3306, database="d",
                              user="u", password=pw)
-        # The password value must have each metachar backslash-escaped and
-        # the control char \x01 -> \u0001.
-        self.assertIn("password=p\\;\\=\\\\\\'ss\\u0001word", s)
+        # The password value must have ``\\`` -> ``\\\\``, ``;`` -> ``\;``,
+        # and the control char \x01 -> \u0001. ``=`` and ``'`` are NOT
+        # present in this password (unsupported).
+        self.assertIn("password=p\\;\\\\ss\\u0001word", s)
         # No unescaped metachar inside the password value: round-trip
         # through the inverse parser yields the original.
         from loader import _duckdb_attach_unescape_kv
@@ -65,24 +87,41 @@ class TestDuckDBAttachEscape(unittest.TestCase):
         parsed = _duckdb_attach_unescape_kv(s)
         self.assertEqual(parsed, {"password": "a;b;c"})
 
-    def test_equals_in_value_does_not_create_extra_kv(self):
-        from loader import _duckdb_attach_kv, _duckdb_attach_unescape_kv
+    def test_equals_in_value_is_unsupported(self):
+        r"""v1.3.2 Fix 4: ``=`` is NO LONGER escaped. DuckDB's mysql_scanner
+        DSN parser only honours ``\\`` and ``\;`` as backslash escapes;
+        ``\=`` triggers ``Unrecognized configuration parameter``. The
+        encoder therefore leaves ``=`` raw, which would split the kv
+        pair — so passwords containing ``=`` are UNSUPPORTED and must
+        be rejected upstream. This test documents the behaviour: the
+        encoder produces a string with the unescaped ``=`` still in
+        the value, which the caller is expected to detect and reject
+        (the encoder does NOT silently produce a syntactically valid
+        but semantically broken ATTACH)."""
+        from loader import _duckdb_attach_kv
         s = _duckdb_attach_kv(password="x=y=z")
-        parsed = _duckdb_attach_unescape_kv(s)
-        self.assertEqual(parsed, {"password": "x=y=z"})
-        # Only the leading ``password=`` is an unescaped ``=``. The two
-        # ``=`` in the value are backslash-escaped (``\=``) so they do
-        # not create extra kv pairs.
-        # Count ``=`` that are NOT preceded by a backslash.
-        unescaped_eq = sum(1 for i, c in enumerate(s) if c == "="
-                           and (i == 0 or s[i - 1] != "\\"))
-        self.assertEqual(unescaped_eq, 1)
+        # The encoder leaves ``=`` raw (no ``\=`` escape). The first
+        # ``=`` is the key/value split; the remaining ``=`` are inside
+        # the value, unescaped. This is the documented unsupported
+        # behaviour — the caller must reject such passwords upstream.
+        self.assertEqual(s, "password=x=y=z")
+        # No ``\=`` escape sequence is produced.
+        self.assertNotIn("\\=", s)
 
-    def test_quote_in_value_escaped(self):
-        from loader import _duckdb_attach_kv, _duckdb_attach_unescape_kv
-        s = _duckdb_attach_kv(password="itsatest")
-        parsed = _duckdb_attach_unescape_kv(s)
-        self.assertEqual(parsed, {"password": "itsatest"})
+    def test_quote_in_value_is_unsupported(self):
+        """v1.3.2 Fix 4: ``'`` is NO LONGER escaped. DuckDB's mysql_scanner
+        DSN parser would break the outer SQL string literal if ``\'``
+        were emitted, so the encoder leaves ``'`` raw. Passwords
+        containing ``'`` are UNSUPPORTED and must be rejected upstream.
+        This test documents the behaviour: the encoder produces a
+        string with the unescaped ``'`` still in the value, which the
+        caller is expected to detect and reject."""
+        from loader import _duckdb_attach_kv
+        s = _duckdb_attach_kv(password="it'satest")
+        # The encoder leaves ``'`` raw (no ``\'`` escape).
+        self.assertEqual(s, "password=it'satest")
+        # No ``\'`` escape sequence is produced.
+        self.assertNotIn("\\'", s)
 
     def test_backslash_in_value_escaped(self):
         from loader import _duckdb_attach_kv, _duckdb_attach_unescape_kv
@@ -139,6 +178,18 @@ class TestDuckDBAttachEscape(unittest.TestCase):
         self.assertNotIn(";", s)
         # Pairs are space-separated.
         self.assertEqual(s, "host=h port=3306 database=d user=u password=p")
+
+    def test_escape_set_is_reduced_to_backslash_and_semicolon(self):
+        """v1.3.2 Fix 4: the escape set is exactly ``\\`` and ``;`` (plus
+        control-char ``\\uXXXX``). ``=`` and ``'`` are NOT in the escape
+        set — DuckDB's mysql_scanner rejects ``\\=`` and ``\\'``."""
+        from loader import _DUCKDB_ATTACH_ESCAPE_CHARS
+        self.assertEqual(
+            set(_DUCKDB_ATTACH_ESCAPE_CHARS.keys()),
+            {"\\", ";"},
+            "v1.3.2 Fix 4: escape set must be exactly {\\, ;} — "
+            "\\= and \\' were dropped because DuckDB's mysql_scanner "
+            "DSN parser rejects them.")
 
 
 if __name__ == "__main__":

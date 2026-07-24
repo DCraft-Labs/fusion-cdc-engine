@@ -144,6 +144,23 @@ class TestAttachIntegrationRealDuckDB(unittest.TestCase):
         self.assertNotIn("InvalidInput", exc_type,
                          f"invalid-input parse error: {msg}")
 
+    def test_attach_with_backslash_equals_escape_is_rejected_at_parse_time(self):
+        """v1.3.2 Fix 4: DuckDB's mysql_scanner DSN parser only accepts
+        ``\\`` and ``\\;`` as backslash escapes. ``\\=`` triggers
+        ``Unrecognized configuration parameter`` at parse time. This
+        test pins that signature so a future re-introduction of the
+        ``\\=`` escape (which the v1.3.0/v1.3.1 helper emitted) is
+        caught immediately. The encoder no longer produces ``\\=``
+        (see ``test_v130_attach_escape.py``::test_escape_set_is_reduced_*),
+        so we hand-build the bad string here to pin the parser's
+        rejection signature."""
+        bad_attach = ("host=nonexistent.invalid.example port=3306 "
+                      "database=d user=u password=p\\=injected")
+        exc_type, msg = self._run_attach(bad_attach)
+        self.assertIn("Unrecognized configuration parameter", msg,
+                      f"Expected the mysql_scanner to reject \\= at parse "
+                      f"time (v1.3.2 Fix 4 signature); got {exc_type}: {msg}")
+
 
 class TestAttachFormatGuarantees(unittest.TestCase):
     """Format-level guarantees that don't require DuckDB to be loadable.
