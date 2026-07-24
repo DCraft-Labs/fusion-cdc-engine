@@ -175,6 +175,50 @@ transformWorker:
     tag: latest
     pullPolicy: IfNotPresent
 
+# ── Iceberg Committer (v1.3.4 Fix 1) ───────────────────────────────────────────
+# The v1.2.39 single-committer redesign ships in the transform-worker image
+# (iceberg_committer.py) but nothing in the shipped system runs it. This
+# Deployment renders one committer pod per (connection, table) target listed
+# below; each pod runs `python iceberg_committer.py --connection-id <id>
+# --table <table> --namespace <ns>` which drains the pending-files Redis list
+# and registers staged Parquet files in a single Iceberg commit via
+# table.transaction().add_files(). Set committer.enabled=true to render the
+# runner; add one target per active staged (conn, table) pair. Liveness and
+# readiness probes exec a Python one-liner that checks the pending-list
+# length (drain lag) in Redis against the thresholds below. A headless
+# Service is created per target for metrics scraping.
+committer:
+  enabled: false
+  replicas: 1
+  metricsPort: 8081
+  # Drain-lag thresholds (pending-files list length) for the exec probes.
+  readinessLagThreshold: 1000
+  livenessLagThreshold: 5000
+  # Tunables forwarded to the committer via env vars (see iceberg_committer.py).
+  lockTtlS: 30
+  drainBatch: 100
+  drainTimeoutMs: 5000
+  idleSleepS: 5.0
+  image:
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+  # One entry per active staged (conn, table) pair. The committer pod runs
+  # `python iceberg_committer.py --connection-id <id> --table <table>
+  # --namespace <ns>`. catalogConfig (optional JSON dest config) is forwarded
+  # to load_catalog when the catalog needs explicit credentials.
+  targets: []
+    # - enabled: true
+    #   connectionId: "conn-postgres-prod"
+    #   table: "customer_partner_relation"
+    #   namespace: "fusion"
+    #   catalogConfig: ""
+
 # ── Nessie (Iceberg REST catalog) ─────────────────────────────────────────────
 # v1.2.37 §1 + §8 item 1: Nessie persistence. The default in-memory version
 # store wipes the entire Iceberg catalog on every pod restart — a Priority-0

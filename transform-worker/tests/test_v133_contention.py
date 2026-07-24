@@ -262,10 +262,15 @@ def test_commit_mutex_no_redis_is_degraded_noop():
 
 
 def test_commit_lock_key_format():
-    """The lock key must match the documented format:
-    ``fusion:iceberg-commit-lock:<connection_id>:<table_name>``."""
+    """The lock key must match the unified committer namespace:
+    ``fusion:iceberg-committer-lock:<connection_id>:<table_name>``.
+
+    v1.3.4 Fix 2: the writer's commit-lock key was unified with the
+    committer's lock key (previously ``fusion:iceberg-commit-lock:``)
+    so the bootstrap path and the committer provide mutual exclusion
+    against each other for the same (conn, table)."""
     from iceberg_writer import _commit_lock_key
-    assert _commit_lock_key("conn-7", "orders") == "fusion:iceberg-commit-lock:conn-7:orders"
+    assert _commit_lock_key("conn-7", "orders") == "fusion:iceberg-committer-lock:conn-7:orders"
 
 
 # ─── Bug #22 fix 1: checkpoint advances only after commit success ────────────

@@ -38,7 +38,19 @@ COMMIT_LOCK_POLL_S = float(os.environ.get("ICEBERG_COMMIT_LOCK_POLL_S", "1.0"))
 
 
 def _commit_lock_key(connection_id: str, table_name: str) -> str:
-    return f"fusion:iceberg-commit-lock:{connection_id}:{table_name}"
+    # v1.3.4 Fix 2: unify with the committer's lock namespace. Previously
+    # this used ``fusion:iceberg-commit-lock:...`` while iceberg_committer.py
+    # used ``fusion:iceberg-committer-lock:...`` — two non-coordinating locks
+    # for the same (connection_id, table_name) pair. The bootstrap path
+    # (write_arrow/write_batch) and the committer (add_files) provided ZERO
+    # mutual exclusion against each other, which reproduced
+    # ``FileNotFoundError: ...snap-...avro`` inside commit() during
+    # _existing_manifests() (the previous snapshot's manifest-list was
+    # deleted by the winner's delete-after-commit.enabled=true) and was the
+    # primary cause of the 110.6% duplicate overage (both commit paths
+    # succeeding independently). Both code paths now SET NX EX the SAME key
+    # so only one commit can run against a given (conn, table) at a time.
+    return f"fusion:iceberg-committer-lock:{connection_id}:{table_name}"
 
 
 def _acquire_commit_lock(redis_client, connection_id: str, table_name: str,

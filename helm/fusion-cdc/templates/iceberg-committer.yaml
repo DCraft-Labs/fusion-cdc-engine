@@ -1,0 +1,164 @@
+{{- if .Values.committer.enabled }}
+{{/*
+v1.3.4 Fix 1 — Iceberg committer runner.
+
+The v1.2.39 single-committer redesign is built (transform-worker/
+iceberg_committer.py) but the shipped system never runs it: worker.py
+has zero references to IcebergCommitter, so workers stage Parquet files
+and RPUSH pending-list entries forever and nothing drains the list or
+calls add_files(). This template renders one Deployment per
+(connection, table) target listed in .Values.committer.targets, each
+running `python iceberg_committer.py --connection-id <id> --table
+<table> --namespace <ns>`. The committer's run_loop() drains the
+pending list and registers staged files in a single Iceberg commit.
+
+One committer process per active (conn, table) is the cleanest model
+(the brief's recommended option): each target gets its own Deployment
+so a hot table's committer can be scaled independently and a crash on
+one target doesn't stall the others. Set committer.enabled=false to
+disable the runner entirely (e.g. for local-dev where transformWorker
+is also off).
+*/}}
+{{- $root := . -}}
+{{- range $tgt := .Values.committer.targets -}}
+{{- if $tgt.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "fusion-cdc.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: iceberg-committer
+    app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+    cdc.dcraftfusion.io/connection-id: {{ $tgt.connectionId | quote }}
+    cdc.dcraftfusion.io/table: {{ $tgt.table | quote }}
+spec:
+  replicas: {{ $root.Values.committer.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "fusion-cdc.labels" $root | nindent 8 }}
+        app.kubernetes.io/component: iceberg-committer
+        app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+        cdc.dcraftfusion.io/connection-id: {{ $tgt.connectionId | quote }}
+        cdc.dcraftfusion.io/table: {{ $tgt.table | quote }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ $root.Values.committer.metricsPort }}"
+        prometheus.io/path: "/metrics"
+    spec:
+      {{- with $root.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ $root.Release.Name }}-cdc-worker-sa
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: iceberg-committer
+          image: {{ include "fusion-cdc.transformWorkerImage" $root }}
+          imagePullPolicy: {{ $root.Values.committer.image.pullPolicy | default "IfNotPresent" }}
+          env:
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REDIS_URL
+              value: "redis://{{ include "fusion-cdc.redisHost" $root }}:6379/0"
+            - name: ICEBERG_COMMITTER_LOCK_TTL_S
+              value: {{ $root.Values.committer.lockTtlS | quote }}
+            - name: ICEBERG_COMMITTER_DRAIN_BATCH
+              value: {{ $root.Values.committer.drainBatch | quote }}
+            - name: ICEBERG_COMMITTER_DRAIN_TIMEOUT_MS
+              value: {{ $root.Values.committer.drainTimeoutMs | quote }}
+            - name: ICEBERG_COMMITTER_IDLE_SLEEP_S
+              value: {{ $root.Values.committer.idleSleepS | quote }}
+            {{- if $tgt.catalogConfig }}
+            - name: ICEBERG_CATALOG_CONFIG
+              value: {{ $tgt.catalogConfig | quote }}
+            {{- end }}
+          command: ["python", "-u", "iceberg_committer.py"]
+          args:
+            - --connection-id
+            - {{ $tgt.connectionId | quote }}
+            - --table
+            - {{ $tgt.table | quote }}
+            - --namespace
+            - {{ $tgt.namespace | default "fusion" | quote }}
+            - --redis-url
+            - "redis://{{ include "fusion-cdc.redisHost" $root }}:6379/0"
+          # v1.3.4 Fix 1: liveness/readiness probes on drain lag. The
+          # committer is a loop, not an HTTP server, so the probes exec
+          # a Python one-liner that checks the pending-files list length
+          # (drain lag) in Redis. Ready when lag is below the threshold;
+          # alive when the committer is making progress (lag bounded).
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import os, sys, redis
+                  r = redis.from_url(os.environ["REDIS_URL"])
+                  k = "fusion:iceberg-pending-files:{{ $tgt.connectionId }}:{{ $tgt.table }}"
+                  lag = r.llen(k) if r.exists(k) else 0
+                  sys.exit(0 if lag < {{ $root.Values.committer.livenessLagThreshold }} else 1)
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+            timeoutSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import os, sys, redis
+                  r = redis.from_url(os.environ["REDIS_URL"])
+                  k = "fusion:iceberg-pending-files:{{ $tgt.connectionId }}:{{ $tgt.table }}"
+                  lag = r.llen(k) if r.exists(k) else 0
+                  sys.exit(0 if lag < {{ $root.Values.committer.readinessLagThreshold }} else 1)
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 10
+          resources:
+            {{- toYaml $root.Values.committer.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml $root.Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}-headless
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "fusion-cdc.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: iceberg-committer
+    app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: {{ $root.Release.Name }}-iceberg-committer-{{ $tgt.connectionId }}-{{ $tgt.table }}
+  ports:
+    - name: metrics
+      port: {{ $root.Values.committer.metricsPort }}
+      targetPort: {{ $root.Values.committer.metricsPort }}
+{{- end }}
+{{- end }}
+{{- end }}

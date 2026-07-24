@@ -82,6 +82,21 @@ CDC Worker image
 {{- end }}
 
 {{/*
+Transform Worker image — also used by the v1.3.4 iceberg committer
+runner (iceberg_committer.py ships in the transform-worker image).
+*/}}
+{{- define "fusion-cdc.transformWorkerImage" -}}
+{{- $registry := .Values.global.imageRegistry -}}
+{{- $repo := .Values.transformWorker.image.repository -}}
+{{- $tag := .Values.transformWorker.image.tag | default .Chart.AppVersion -}}
+{{- if $registry -}}
+{{- printf "%s/%s:%s" $registry $repo $tag -}}
+{{- else -}}
+{{- printf "%s:%s" $repo $tag -}}
+{{- end }}
+{{- end }}
+
+{{/*
 Redis service name (from Bitnami subchart)
 */}}
 {{- define "fusion-cdc.redisHost" -}}

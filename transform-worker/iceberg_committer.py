@@ -49,6 +49,13 @@ _COMMITTED_KEY = "fusion:iceberg-committed-files:{conn}:{table}"
 # a new UUID path) would otherwise produce genuine row-level duplicates
 # because the path-based committed set wouldn't match the new path.
 _COMMITTED_PK_RANGES_KEY = "fusion:iceberg-committed-pk-ranges:{conn}:{table}"
+# v1.3.4 Fix 2: this is the ONE shared lock namespace used by BOTH the
+# bootstrap path (iceberg_writer._commit_lock_key) and the committer
+# (_acquire_lock below). Previously the writer used a different namespace
+# (``fusion:iceberg-commit-lock:``) and the two commit paths provided zero
+# mutual exclusion against each other — root cause of the
+# ``FileNotFoundError: ...snap-...avro`` in commit() and the 110.6%
+# duplicate overage. Do NOT rename without updating iceberg_writer.py.
 _LOCK_KEY = "fusion:iceberg-committer-lock:{conn}:{table}"
 
 # Defaults (overridable via env vars for operators).
@@ -97,6 +104,18 @@ def _ranges_overlap(a_min, a_max, b_min, b_max) -> bool:
     if a_min is not None and b_max is not None and a_min > b_max:
         return False
     if b_min is not None and a_max is not None and b_max < a_min:
+        return False
+    return True
+
+
+def _is_contained(c_min, c_max, outer_min, outer_max) -> bool:
+    """Return True if [c_min, c_max] is fully contained in [outer_min, outer_max].
+    None bounds are treated as unbounded on that side (so an unbounded candidate
+    is never contained by a bounded outer range, and a bounded candidate is
+    contained by an unbounded outer range)."""
+    if outer_min is not None and (c_min is None or c_min < outer_min):
+        return False
+    if outer_max is not None and (c_max is None or c_max > outer_max):
         return False
     return True
 
@@ -320,20 +339,93 @@ class IcebergCommitter:
             to_commit.append(e)
         if not to_commit:
             return []
-        # v1.3.0 Fix 3: PK-range overlap detection. Partition entries into
+        # v1.3.0 Fix 3 + v1.3.4 Fix 3: partition entries into
         # (a) those that need dedup-on-PK before registration (overlap but
-        # not fully contained), (b) those that are pure duplicates (fully
-        # contained in a committed range -> skip + delete), and (c) those
-        # with no overlap (register normally).
+        # not fully contained — against committed ranges OR same-batch
+        # entries), (b) those that are pure duplicates (fully contained in
+        # a committed range OR a same-batch entry -> skip + delete), and
+        # (c) those with no overlap (register normally).
         dedup_before_commit: list[dict] = []
         register_clean: list[dict] = []
         skipped_pk_dup: list[dict] = []
+        # v1.3.4 Fix 3: same-batch PK-range overlap check. A retry can
+        # re-stage a chunk (new UUID, same PK range) before the original's
+        # file is committed; both land in the same drain cycle and the
+        # committed-ranges check (which only sees already-committed
+        # ranges) would let both register → row-level duplicates. Compare
+        # each candidate against every other entry already accepted into
+        # this batch (in-memory, ≤10k comparisons for drain_batch=100,
+        # trivial cost vs the multi-second commit). On overlap:
+        #   - candidate fully contained in an accepted entry → pure dup,
+        #     skip + delete the candidate (the retry's file is inert);
+        #   - accepted entry fully contained in candidate → evict the
+        #     accepted entry (pure dup of the candidate), skip + delete it;
+        #   - partial overlap → route the candidate to dedup-on-PK (same
+        #     best-effort path as the committed-range partial-overlap case).
+        accepted: list[dict] = []
+        for e in to_commit:
+            pk_range = e.get("pk_range")
+            try:
+                rmin, rmax = (pk_range or (None, None))[0], (pk_range or (None, None))[1]
+            except Exception:
+                rmin = rmax = None
+            # Entries with no pk_range (None bounds) are not comparable —
+            # treat them as non-overlapping with everything (the
+            # committed-set path-dedup still applies).
+            if rmin is None and rmax is None:
+                accepted.append(e)
+                continue
+            candidate_contained = False
+            evicted: list[dict] = []
+            partial_overlap = False
+            for a in accepted:
+                arange = a.get("pk_range")
+                try:
+                    amin, amax = (arange or (None, None))[0], (arange or (None, None))[1]
+                except Exception:
+                    amin = amax = None
+                if amin is None and amax is None:
+                    continue
+                if not _ranges_overlap(rmin, rmax, amin, amax):
+                    continue
+                if _is_contained(rmin, rmax, amin, amax):
+                    candidate_contained = True
+                    break
+                if _is_contained(amin, amax, rmin, rmax):
+                    evicted.append(a)
+                else:
+                    partial_overlap = True
+            if candidate_contained:
+                skipped_pk_dup.append(e)
+                continue
+            for a in evicted:
+                if a in accepted:
+                    accepted.remove(a)
+                skipped_pk_dup.append(a)
+            if partial_overlap:
+                # Mark so the committed-ranges loop routes this entry to
+                # dedup-on-PK (not register_clean) even when there's no
+                # committed-range overlap. Keeps dedup_before_commit and
+                # register_clean disjoint (avoids double-registration).
+                e["_same_batch_partial_overlap"] = True
+            accepted.append(e)
+        to_commit = accepted
+        # v1.3.0 Fix 3: PK-range overlap detection against committed ranges.
         for e in to_commit:
             pk_range = e.get("pk_range")
             overlaps = _find_overlapping_committed_ranges(
                 self.redis, self.connection_id, self.table_name, pk_range)
             if not overlaps:
-                register_clean.append(e)
+                # v1.3.4 Fix 3: a same-batch partial-overlap entry that has
+                # no committed-range overlap still needs dedup-on-PK before
+                # registration (the other same-batch entry it overlaps is
+                # being registered in the same transaction). Route to
+                # dedup_before_commit instead of register_clean so the
+                # downstream dedup pass runs and the lists stay disjoint.
+                if e.get("_same_batch_partial_overlap"):
+                    dedup_before_commit.append(e)
+                else:
+                    register_clean.append(e)
                 continue
             # Check if the incoming range is fully contained in any one
             # committed range -> pure duplicate, skip + delete.
