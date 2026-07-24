@@ -422,34 +422,21 @@ class InitialLoadTask:
         # stream per worker, not per chunk (a 100-chunk load would otherwise
         # spam the log 100x). Lives on the InitialLoadTask instance; a new
         # instance is created per task (worker.py), so this is per-worker.
-        self._bulk_transform_warned: set[str] = set()
+        self._bulk_transform_logged: set[str] = set()
 
-    def _maybe_warn_bulk_transform_bypass(self, stream_id, dest_table, steps) -> None:
-        """v1.3.2 Fix 3: emit a one-time-per-stream warning when bulk mode
-        (``kind == "arrow"`` + iceberg destination) is engaged AND the
-        stream has configured transform ``steps``. Bulk mode skips
-        ``execute_pipeline_arrow`` / ``execute_pipeline`` entirely, so
-        the transforms are silently dropped - the connection appears to
-        succeed and produces untransformed data. The warning fires once
-        per ``(stream_id, dest_table)`` per worker process (keyed on
-        ``self._bulk_transform_warned``), not per chunk, so a 100-chunk
-        load doesn't spam the log 100x.
-
-        Callers: the per-chunk ``if kind == "arrow" and connector_type
-        == "iceberg":`` branch in ``run()``. Gated on ``if steps:``."""
+    def _maybe_log_bulk_transform_run(self, stream_id, dest_table, steps) -> None:
+        """v1.3.2 Fix 3b: one-time-per-stream INFO log when bulk mode runs transforms."""
         if not steps:
             return
-        _warn_key = f"{stream_id}:{dest_table}"
-        if _warn_key in self._bulk_transform_warned:
+        _key = f"{stream_id}:{dest_table}"
+        if _key in self._bulk_transform_logged:
             return
-        self._bulk_transform_warned.add(_warn_key)
-        log.warning(
-            "InitialLoad: bulk mode (kind=arrow) bypasses configured "
-            "transform_steps for stream=%s table=%s - transforms will "
-            "NOT be applied. Either disable DuckDB bulk mode for this "
-            "stream or remove the transform_steps config to silence "
-            "this warning.",
-            stream_id, dest_table)
+        self._bulk_transform_logged.add(_key)
+        log.info(
+            "InitialLoad: bulk mode (kind=arrow) running %d transform "
+            "step(s) on stream=%s table=%s (DuckDB in-place, no Python "
+            "row-dict round-trip).",
+            len(steps), stream_id, dest_table)
 
     def run(self, task: dict):
         connection_id = task["connection_id"]
@@ -808,8 +795,39 @@ class InitialLoadTask:
                 # misconfiguration (either disable bulk mode or remove the
                 # transform config). The warning helper is gated on ``if steps``.
                 if kind == "arrow" and connector_type == "iceberg":
-                    self._maybe_warn_bulk_transform_bypass(stream_id, dest_table, steps)
-                    INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(0.0)
+                    if steps:
+                        self._maybe_log_bulk_transform_run(stream_id, dest_table, steps)
+                        t_c0 = time.monotonic()
+                        try:
+                            arrow_tbl = self.engine.execute_pipeline_arrow_in_place(
+                                arrow_tbl, steps, schema=cached_transformed_schema)
+                            if cached_transformed_schema is None and arrow_tbl is not None:
+                                cached_transformed_schema = arrow_tbl.schema
+                        except Exception as bulk_xf_exc:
+                            log.warning(
+                                "InitialLoad: bulk-mode transform failed for "
+                                "stream=%s table=%s chunk_seq=%d (%s); falling "
+                                "back to Python-mode transform path for this "
+                                "chunk.",
+                                stream_id, dest_table, chunk_seq, bulk_xf_exc)
+                            try:
+                                rows_pylist = arrow_tbl.to_pylist()
+                                arrow_tbl, _child_fb, _sch_fb = \
+                                    self.engine.execute_pipeline_arrow(
+                                        rows_pylist, steps,
+                                        schema=cached_source_schema)
+                                if cached_transformed_schema is None and _sch_fb is not None:
+                                    cached_transformed_schema = _sch_fb
+                            except Exception:
+                                log.exception(
+                                    "InitialLoad: Python-mode fallback also "
+                                    "failed for stream=%s table=%s chunk_seq=%d; "
+                                    "re-raising original bulk exception.",
+                                    stream_id, dest_table, chunk_seq)
+                                raise bulk_xf_exc
+                        INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
+                    else:
+                        INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(0.0)
                     t_w0 = time.monotonic()
                     if use_committer:
                         # v1.2.39 section 6: stage Parquet file + RPUSH to
