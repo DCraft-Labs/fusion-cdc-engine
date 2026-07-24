@@ -104,17 +104,22 @@ class TestBug26DuckDBExtensionDirectory(unittest.TestCase):
         mock_conn.execute.side_effect = lambda *a, **k: executed.append(a[0] if a else "")
         with patch("duckdb.connect", return_value=mock_conn):
             task._open_duckdb_scanner(source, "mysql")
-        # The FIRST execute call MUST be the SET extension_directory line.
+        # v1.3.6 Bug #1: SET threads=1 is immediately after connect; Bug #26
+        # still requires extension_directory before LOAD mysql.
         self.assertGreater(len(executed), 0, "scanner must execute SQL")
         self.assertTrue(
-            executed[0].startswith("SET extension_directory"),
-            f"first execute must be SET extension_directory, got: {executed[0]!r}",
+            any(isinstance(s, str) and s.startswith("SET threads=1") for s in executed),
+            f"expected SET threads=1, got: {executed!r}",
         )
-        self.assertIn("/opt/duckdb_extensions", executed[0])
-        # And LOAD mysql must come AFTER the SET (so the extension is found).
-        load_idx = next(i for i, s in enumerate(executed) if s.startswith("LOAD mysql"))
-        set_idx = 0  # by construction above
-        self.assertLess(set_idx, load_idx,
+        ext_idx = next(
+            (i for i, s in enumerate(executed)
+             if isinstance(s, str) and s.startswith("SET extension_directory")),
+            None,
+        )
+        self.assertIsNotNone(ext_idx, f"SET extension_directory missing: {executed!r}")
+        self.assertIn("/opt/duckdb_extensions", executed[ext_idx])
+        load_idx = next(i for i, s in enumerate(executed) if isinstance(s, str) and s.startswith("LOAD mysql"))
+        self.assertLess(ext_idx, load_idx,
                         "SET extension_directory must come before LOAD mysql")
 
 

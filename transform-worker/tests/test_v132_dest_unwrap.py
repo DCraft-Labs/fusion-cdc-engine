@@ -22,7 +22,7 @@ class _CapturingWriter:
         _CapturingWriter.captured = dest_config
     def write_arrow(self, arrow_tbl, table_name=None, pk_col=None):
         return int(arrow_tbl.num_rows)
-    def write_arrow_to_file(self, arrow_tbl, table_name=None, partition_id=None, chunk_seq=None, pk_range=None):
+    def write_arrow_to_file(self, arrow_tbl, table_name=None, partition_id=None, chunk_seq=None, pk_range=None, pk_col=None, **kwargs):
         return "/tmp/fake-0-uuid.parquet"
 class TestWriteArrowToIcebergDestUnwrap(unittest.TestCase):
     def setUp(self): _CapturingWriter.captured = None

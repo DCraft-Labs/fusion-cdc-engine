@@ -138,7 +138,7 @@ def _stub_writer_module(path_to_return: str):
             pass
         def write_arrow_to_file(self, arrow_tbl, table_name=None,
                                 partition_id=None, chunk_seq=None,
-                                pk_range=None):
+                                pk_range=None, pk_col=None, **kwargs):
             return path_to_return
     return _StubWriter
 
