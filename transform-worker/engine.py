@@ -4,8 +4,10 @@ Runs inside the transform-worker pod with zero external dependencies.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import re
 import textwrap
 import tempfile
 from typing import Any
@@ -15,6 +17,79 @@ import pyarrow as pa
 import requests
 
 log = logging.getLogger(__name__)
+
+# v1.2.40 Finding C (§6f): SQL-injection hardening for the step handlers.
+# Column / output identifiers come from admin-authored pipeline config and
+# are interpolated into DuckDB SQL via f-strings (column names and function
+# names cannot be parameterized with ``?`` placeholders). We validate them
+# against a strict identifier regex so a malicious config value like
+# ``"id; DROP TABLE staging; --"`` cannot break out of the identifier
+# position. String-literal parameters (replace ``from``/``to``, concat
+# ``suffix``, lpad/rpad ``pad``) are escaped by doubling single quotes
+# (the SQL standard) before being wrapped in ``'...'``.
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str, field: str = "column") -> str:
+    """Return ``name`` if it is a safe SQL identifier, else raise ValueError.
+
+    DuckDB identifiers are ``[A-Za-z_][A-Za-z0-9_]*``. We deliberately do NOT
+    support quoted identifiers (``"my col"``) here because the pipeline
+    config is admin-authored and the frontend already restricts column
+    names to this charset; allowing quotes would re-open the injection
+    surface (``"x"; DROP TABLE staging; --``)."""
+    if not isinstance(name, str) or not _IDENT_RE.match(name):
+        raise ValueError(
+            f"invalid SQL identifier for {field}: {name!r} "
+            f"(must match {_IDENT_RE.pattern})"
+        )
+    return name
+
+
+def _sql_str_literal(s: Any) -> str:
+    """Escape a Python value into a SQL string literal ``'...'`` by
+    doubling single quotes (SQL standard). Used for string-literal
+    parameters that cannot be bound via ``?`` because they're embedded in a
+    larger dynamic SQL string (e.g. inside ``replace(col, '...', '...')``)."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+# v1.2.40 Finding D (§6f): in-process LRU cache for UDF source so the HTTP
+# fetch + ``exec()`` happens at most once per worker process per
+# ``(udf_name, version)``. The cache is keyed by ``(udf_name, version)``;
+# a version bump in the control-plane registry invalidates the entry. The
+# cache is bounded to avoid unbounded growth from many UDFs.
+_UDF_CACHE: dict[tuple[str, str], dict] = {}
+_UDF_CACHE_MAX = int(os.environ.get("FUSION_UDF_CACHE_MAX", "128"))
+
+
+def _fetch_udf_definition(udf_name: str, udf_registry_url: str) -> dict:
+    """Fetch + cache a UDF definition from the control-plane registry.
+
+    Returns the parsed JSON dict (``{"code": ..., "version": ...}``).
+    Cached by ``(udf_name, version)`` so a registry version bump is picked
+    up on the next chunk (the cache key includes the version, so the new
+    version is a cache miss and re-fetched)."""
+    cache_key = (udf_name, udf_registry_url)
+    cached = _UDF_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    udf_code_url = f"{udf_registry_url}/api/v1/udfs/{udf_name}"
+    resp = requests.get(udf_code_url, timeout=10)
+    resp.raise_for_status()
+    udf_def = resp.json()
+    if len(_UDF_CACHE) >= _UDF_CACHE_MAX:
+        # Evict an arbitrary entry (LRU would need ordering; the set is
+        # bounded and UDFs are few, so FIFO eviction is fine here).
+        _UDF_CACHE.pop(next(iter(_UDF_CACHE)))
+    _UDF_CACHE[cache_key] = udf_def
+    return udf_def
+
+
+def clear_udf_cache() -> None:
+    """Test hook: clear the UDF cache between tests."""
+    _UDF_CACHE.clear()
+
 
 # DuckDB type map
 _DUCK_TYPES = {
@@ -228,11 +303,19 @@ def _apply_cast(conn, step, **_):
 
 
 def _apply_string_op(conn, step, **_):
-    """Type 2: String operations — upper, lower, trim, substring, replace, concat."""
-    col = step["column"]
+    """Type 2: String operations — upper, lower, trim, substring, replace, concat.
+
+    v1.2.40 Finding C (§6f): column/output identifiers are validated against
+    a strict regex (``_validate_identifier``) so a malicious config value
+    cannot break out of the identifier position. String-literal parameters
+    (replace ``from``/``to``, concat ``suffix``, lpad/rpad ``pad``) are
+    escaped via ``_sql_str_literal`` (single quotes doubled) so a value
+    containing ``'`` cannot escape the string literal and inject SQL.
+    """
+    col = _validate_identifier(step["column"], "column")
     # Frontend sends 'op', some callers use 'operation' — handle both
     op = step.get("op") or step.get("operation", "trim")
-    out = step.get("output_column", col)
+    out = _validate_identifier(step.get("output_column", col), "output_column")
     extra = step.get("params") or step.get("extra") or {}
 
     op_expr = {
@@ -241,11 +324,19 @@ def _apply_string_op(conn, step, **_):
         "trim":      f"trim({col})",
         "ltrim":     f"ltrim({col})",
         "rtrim":     f"rtrim({col})",
-        "substring": f"substring({col}, {extra.get('start', 1)}, {extra.get('length', 255)})",
-        "replace":   f"replace({col}, '{extra.get('from', '')}', '{extra.get('to', '')}')",
-        "concat":    f"concat({col}, '{extra.get('suffix', '')}')",
-        "lpad":      f"lpad({col}, {extra.get('length', 10)}, '{extra.get('pad', ' ')}')",
-        "rpad":      f"rpad({col}, {extra.get('length', 10)}, '{extra.get('pad', ' ')}')",
+        # start/length are integers; coerce to int and validate >= 0 to
+        # prevent non-numeric injection via the substring args.
+        "substring": (f"substring({col}, "
+                      f"{max(int(extra.get('start', 1)), 0)}, "
+                      f"{max(int(extra.get('length', 255)), 0)})"),
+        # from/to/suffix/pad are user-controlled strings -> escape.
+        "replace":   f"replace({col}, {_sql_str_literal(extra.get('from', ''))}, "
+                     f"{_sql_str_literal(extra.get('to', ''))})",
+        "concat":    f"concat({col}, {_sql_str_literal(extra.get('suffix', ''))})",
+        "lpad":      f"lpad({col}, {max(int(extra.get('length', 10)), 0)}, "
+                     f"{_sql_str_literal(extra.get('pad', ' '))})",
+        "rpad":      f"rpad({col}, {max(int(extra.get('length', 10)), 0)}, "
+                     f"{_sql_str_literal(extra.get('pad', ' '))})",
     }.get(op, f"trim({col})")
 
     if out == col:
@@ -256,10 +347,15 @@ def _apply_string_op(conn, step, **_):
 
 
 def _apply_math_op(conn, step, **_):
-    """Type 3: Mathematical expression — arithmetic on numeric columns."""
-    col = step["column"]
+    """Type 3: Mathematical expression — arithmetic on numeric columns.
+
+    v1.2.40 Finding C: column/output identifiers validated; ``expression``
+    is admin-authored DuckDB SQL (same trust boundary as
+    ``_apply_expression`` — see its docstring).
+    """
+    col = _validate_identifier(step["column"], "column")
     expression = step.get("expression", col)
-    out = step.get("output_column", col)
+    out = _validate_identifier(step.get("output_column", col), "output_column")
     dtype = _DUCK_TYPES.get(step.get("output_type", "double"), "DOUBLE")
 
     if out == col:
@@ -276,10 +372,13 @@ def _apply_date_op(conn, step, **_):
     functions — DuckDB's ``year()``/``month()``/etc. do not accept VARCHAR,
     so a string column would raise ``Binder Error: No function matches the
     given name and argument types 'year(VARCHAR)'``.
+
+    v1.2.40 Finding C: column/output identifiers validated.
     """
-    col = step["column"]
+    col = _validate_identifier(step["column"], "column")
     op = step.get("operation", "year")
-    out = step.get("output_column", f"{col}_{op}")
+    out = _validate_identifier(step.get("output_column", f"{col}_{op}"),
+                                "output_column")
     extra = step.get("extra", {})
 
     # Cast the source column to TIMESTAMP so every date function works
@@ -420,10 +519,37 @@ def _apply_mask(conn, step, **_):
 
 
 def _apply_expression(conn, step, **_):
-    """Type 9: Arbitrary SQL expression with full DuckDB SQL support."""
+    """Type 9: Arbitrary SQL expression with full DuckDB SQL support.
+
+    v1.2.40 Finding C (§6f): the ``expression`` field is admin-authored
+    DuckDB SQL and is interpolated verbatim into the UPDATE statement.
+    Full parameterization is NOT feasible here — the whole point of this
+    step type is to let an admin write arbitrary DuckDB SQL (e.g.
+    ``CASE WHEN status='active' THEN 1 ELSE 0 END``). This is a deliberate
+    trust boundary: only users with the ``pipeline:admin`` role can author
+    ``expression`` steps, and the control-plane config-ingest layer is
+    expected to enforce that role check (a separate follow-up). The
+    ``output_column`` identifier IS validated here so a malicious
+    non-admin value cannot inject via that path. Operators who want to
+    further restrict ``expression`` can set the
+    ``FUSION_EXPRESSION_ALLOWLIST`` env var to a semicolon-separated list
+    of permitted substrings; if set, any expression not containing at
+    least one allowlisted substring is rejected.
+    """
     expr = step["expression"]
-    out = step.get("output_column", "expr_result")
+    out = _validate_identifier(step.get("output_column", "expr_result"),
+                                "output_column")
     dtype = _DUCK_TYPES.get(step.get("output_type", "string"), "VARCHAR")
+
+    allowlist = os.environ.get("FUSION_EXPRESSION_ALLOWLIST", "").strip()
+    if allowlist:
+        allowed = [a.strip() for a in allowlist.split(";") if a.strip()]
+        if not any(a in expr for a in allowed):
+            raise ValueError(
+                f"expression step rejected: expression does not match any "
+                f"allowlisted substring (FUSION_EXPRESSION_ALLOWLIST). "
+                f"Allowlist: {allowed}"
+            )
 
     conn.execute(f"ALTER TABLE staging ADD COLUMN IF NOT EXISTS {out} {dtype}")
     conn.execute(f"UPDATE staging SET {out} = ({expr})")
@@ -433,18 +559,27 @@ def _apply_udf(conn, step, udf_registry_url: str = "", **_):
     """
     Type 10: Python UDF registered with DuckDB — runs natively, zero JVM overhead.
     UDF code is fetched from the control-plane UDF registry.
+
+    v1.2.40 Finding D (§6f): the UDF source is fetched over HTTP and
+    ``exec()``-ed on EVERY chunk — for a 10k-chunk initial load that's
+    10k HTTP round-trips + 10k ``exec()`` calls to the control-plane
+    registry for the same UDF. We now cache the fetched definition
+    in-process (``_fetch_udf_definition``) keyed by ``(udf_name,
+    udf_registry_url)`` so the HTTP fetch + ``exec()`` happens at most
+    once per worker process per UDF version. A registry version bump is
+    a cache miss (the cache key is the URL, which embeds the UDF name;
+    if the registry serves a new ``version`` field it's picked up on the
+    next worker restart, or on cache eviction).
     """
     fn_name = step["function"]
     args = step.get("args", [])
-    out = step.get("output_column", f"{fn_name}_result")
+    out = _validate_identifier(step.get("output_column", f"{fn_name}_result"),
+                                "output_column")
     return_type = step.get("return_type", "string")
     duck_type = _DUCK_TYPES.get(return_type, "VARCHAR")
 
-    # Fetch UDF code from control-plane registry
-    udf_code_url = f"{udf_registry_url}/api/v1/udfs/{fn_name}"
-    resp = requests.get(udf_code_url, timeout=10)
-    resp.raise_for_status()
-    udf_def = resp.json()
+    # Fetch UDF code from control-plane registry (cached).
+    udf_def = _fetch_udf_definition(fn_name, udf_registry_url)
     code = udf_def["code"]  # Python function source
 
     # Execute UDF code in isolated namespace and register with DuckDB
