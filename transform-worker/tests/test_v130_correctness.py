@@ -424,7 +424,6 @@ class TestNoDuplicateDequeue:
         import worker as w_mod
         from worker import _atomic_dequeue, _ack
         with patch.object(w_mod, "HIGH_QUEUE", high), \
-             patch.object(w_mod, "NORMAL_QUEUE", "fusion:transforms:normal"), \
              patch.object(w_mod, "IN_FLIGHT_QUEUE", inflight):
             # First worker dequeues the only task.
             d1 = _atomic_dequeue(r, timeout=1)
@@ -501,7 +500,6 @@ class TestNoDuplicateDequeue:
             import worker as w_mod
             from worker import _atomic_dequeue, _ack
             with patch.object(w_mod, "HIGH_QUEUE", high), \
-                 patch.object(w_mod, "NORMAL_QUEUE", "fusion:transforms:normal"), \
                  patch.object(w_mod, "IN_FLIGHT_QUEUE", inflight):
                 for _ in range(N):  # bounded loop, no blocking on empty
                     d = _atomic_dequeue(r, timeout=1)

@@ -19,14 +19,11 @@ def test_blmove_signature_high_queue_call_binds():
     sig.bind(None, HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1, src="RIGHT", dest="LEFT")
 
 
-def test_blmove_signature_normal_queue_call_binds():
-    """The NORMAL_QUEUE blmove call in _atomic_dequeue must bind to the real
-    redis.Redis.blmove signature without raising TypeError."""
-    sig = inspect.signature(redis.Redis.blmove)
-    NORMAL_QUEUE = "fusion:transforms:normal"
-    IN_FLIGHT_QUEUE = "fusion:transforms:in-flight"
-    timeout = 5
-    sig.bind(None, NORMAL_QUEUE, IN_FLIGHT_QUEUE, timeout=max(1, timeout - 1), src="RIGHT", dest="LEFT")
+# v1.3.9: the former test_blmove_signature_normal_queue_call_binds test is
+# removed — _atomic_dequeue's NORMAL_QUEUE branch no longer exists (CDC
+# events moved to per-connection Redis Streams via cdc_stream_consumer.py;
+# _atomic_dequeue now only ever serves HIGH_QUEUE/initial_load). The
+# HIGH_QUEUE call shape below is unchanged and still covers the real code.
 
 
 def test_blmove_timeout_is_third_positional_param():

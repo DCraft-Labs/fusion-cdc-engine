@@ -1961,16 +1961,56 @@ class InitialLoadTask:
             raise
 
 
+def _compact_events_by_pk(events: list, pk_col: str) -> list:
+    """Last-event-wins compaction per primary key, same pattern as Kafka log
+    compaction — collapses multiple events for the same row within one
+    batch into just the final one (preserving each surviving key's original
+    relative order). Only matters once ``cdc_batch_mode="per_batch"``
+    accumulates more than one event per task (see
+    transform-worker/cdc_stream_consumer.py); a no-op for a single-event
+    batch.
+
+    Without this, a batch containing e.g. an INSERT followed later by a
+    DELETE for the same PK would incorrectly appear in BOTH ``to_upsert``
+    and ``to_delete_pks`` below — whichever op happens to be present isn't
+    what should win, the LAST one is authoritative. Events with no
+    extractable PK (a row missing ``pk_col`` entirely) are kept as-is,
+    uncompacted, rather than silently dropped.
+    """
+    if len(events) <= 1:
+        return events
+    compacted: dict = {}
+    order: list = []
+    unkeyed: list = []
+    for evt in events:
+        row = evt.get("after") or evt.get("before") or {}
+        pk_val = row.get(pk_col)
+        if pk_val is None:
+            unkeyed.append(evt)
+            continue
+        if pk_val not in compacted:
+            order.append(pk_val)
+        compacted[pk_val] = evt
+    return [compacted[k] for k in order] + unkeyed
+
+
 class CDCTransformTask:
     """
     Handles a batch of CDC events that have a transform pipeline:
       1. Receive event batch from Redis Streams
-      2. Apply transform pipeline via DuckDB
-      3. Upsert to destination Postgres
+      2. PK-compact (last-event-wins) so each row only appears once
+      3. Apply transform pipeline via DuckDB
+      4. Upsert/delete to the destination (Postgres or Iceberg)
     """
 
-    def __init__(self, engine: "DuckDBTransformEngine"):
+    def __init__(self, engine: "DuckDBTransformEngine", redis_client=None):
         self.engine = engine
+        # v1.3.9: optional shared Redis client, threaded into
+        # iceberg_writer.get_cached_writer() so the per-table commit mutex
+        # (v1.2.33 Bug #21 fix 3) is available for CDC writes too, not just
+        # initial loads. None (the pre-v1.3.9 default) means no mutex —
+        # unchanged legacy behavior.
+        self.redis_client = redis_client
 
     def run(self, task: dict):
         connection_id = task["connection_id"]
@@ -2017,6 +2057,11 @@ class CDCTransformTask:
                               connection_id)
                 cached_source_schema = None
 
+        # v1.3.9: PK-based last-event-wins compaction before splitting into
+        # upsert/delete buckets — see _compact_events_by_pk's docstring for
+        # why this must happen BEFORE the split, not after.
+        events = _compact_events_by_pk(events, pk_col)
+
         # Separate INSERT/UPDATE rows from DELETEs
         to_upsert = [e["after"] for e in events if e.get("op") in ("INSERT", "UPDATE") and e.get("after")]
         to_delete_pks = [e["before"][pk_col] for e in events if e.get("op") == "DELETE" and e.get("before")]
@@ -2029,6 +2074,7 @@ class CDCTransformTask:
 
         if connector_type == "iceberg":
             self._apply_to_iceberg(to_upsert, to_delete_pks, dest, table, pk_col,
+                                   connection_id=connection_id,
                                    schema=cached_transformed_schema or cached_source_schema)
         elif dest_dsn:
             self._upsert(to_upsert, to_delete_pks, dest_dsn, schema, table, pk_col)
@@ -2042,11 +2088,15 @@ class CDCTransformTask:
 
     def _apply_to_iceberg(self, rows: list[dict], delete_pks: list,
                           dest: dict, table: str, pk_col: str,
+                          connection_id: "str | None" = None,
                           schema: "pa.Schema | None" = None):
-        from iceberg_writer import IcebergWriter
+        # v1.3.9: reuse one IcebergWriter per connection_id instead of
+        # reconstructing it (full catalog handshake + namespace round-trip)
+        # on every task — see get_cached_writer's docstring.
+        from iceberg_writer import get_cached_writer
         dest_config = dest.get("connection_config") or dest.get("config") or dest
         identifier_fields = dest_config.get("identifier_fields") or [pk_col]
-        writer = IcebergWriter(dest_config)
+        writer = get_cached_writer(connection_id, dest_config, redis_client=self.redis_client)
         if rows:
             writer.upsert(rows, table_name=table, identifier_fields=identifier_fields,
                           schema=schema)

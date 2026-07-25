@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
 Transform Worker — DuckDB-based transform engine (replaces Spark).
-Pulls tasks from Redis queues, executes all 10 transform types, writes to Postgres/Iceberg.
 
-Queue priority:
-  fusion:transforms:high   → initial loads (100M rows, chunked PK ranges)
-  fusion:transforms:normal → CDC events with column transforms
+Two independent paths, run concurrently:
+  fusion:transforms:high             → initial loads (100M rows, chunked PK
+                                        ranges), a Redis List, unchanged —
+                                        see _atomic_dequeue below.
+  fusion:transforms:stream:{conn_id} → CDC events with column transforms,
+                                        a per-connection Redis STREAM (v1.3.9
+                                        — replaces the old shared
+                                        fusion:transforms:normal List). Run
+                                        on its own background thread via
+                                        cdc_stream_consumer.CDCStreamConsumer,
+                                        which fans out across connections
+                                        concurrently (see that module's
+                                        docstring for why this is safe).
 
 Scale-to-zero: KEDA starts this pod only when queue depth > 0.
 """
@@ -17,10 +26,12 @@ import os
 import random
 import signal
 import sys
+import threading
 import time
 
 import redis
 
+from cdc_stream_consumer import CDCStreamConsumer
 from engine import DuckDBTransformEngine
 from loader import InitialLoadTask, CDCTransformTask, STOP_EVENT
 
@@ -33,7 +44,11 @@ log = logging.getLogger("transform-worker")
 
 REDIS_URL = os.environ["REDIS_URL"]
 HIGH_QUEUE = os.environ.get("HIGH_PRIORITY_QUEUE", "fusion:transforms:high")
-NORMAL_QUEUE = os.environ.get("NORMAL_PRIORITY_QUEUE", "fusion:transforms:normal")
+# v1.3.9: fusion:transforms:normal (a single shared Redis List all CDC tasks
+# funneled through, regardless of connection) is retired — CDC now flows
+# through per-connection Redis Streams via cdc_stream_consumer.py, run on
+# its own background thread from main() below. NORMAL_PRIORITY_QUEUE is no
+# longer read anywhere in this file.
 # v1.2.25 Task 6: dead-letter list for tasks that exhausted their retry budget.
 # Surfaced in /api/v1/monitoring/health and requeueable via
 # POST /api/v1/tasks/dead-letter/{task_id}/requeue.
@@ -141,32 +156,28 @@ def _dead_letter(r: redis.Redis, task: dict, raw_task: str, reason: str) -> None
 
 
 def _atomic_dequeue(r: redis.Redis, timeout: int = 5):
-    """v1.2.30 Defect D fix: atomically move one task from the main queue to
-    this worker's in-flight list, so two pods can never dequeue the same
-    task_id concurrently. Tries HIGH first (short 1s block), then NORMAL
-    (remaining timeout). Returns ``(queue_name, raw_task)`` or ``None`` when
-    no task arrives within ``timeout`` seconds.
+    """v1.2.30 Defect D fix: atomically move one task from the high-priority
+    queue to this worker's in-flight list, so two pods can never dequeue the
+    same task_id concurrently. Returns ``(queue_name, raw_task)`` or
+    ``None`` when no task arrives within ``timeout`` seconds.
 
     Uses BLMOVE (Redis 6.2+) with a BRPOPLPUSH fallback for older Redis. Both
     pop from the RIGHT of the source and push to the LEFT of the in-flight
     list, matching the legacy BRPOP semantics (oldest LPUSHed task first).
+
+    v1.3.9: this List-based path now only ever serves ``initial_load``
+    tasks — CDC moved to per-connection Redis Streams, handled entirely by
+    cdc_stream_consumer.CDCStreamConsumer on its own background thread (see
+    main() below), so there is no second (NORMAL) list to fall back to here
+    anymore.
     """
-    # Try the high-priority queue first (1s block so a pending high task is
-    # picked up immediately, but we don't block the whole timeout on it).
     try:
-        raw = r.blmove(HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1, src="RIGHT", dest="LEFT")
+        raw = r.blmove(HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=timeout, src="RIGHT", dest="LEFT")
     except redis.ResponseError:
         # Older Redis (<6.2) has no BLMOVE — fall back to BRPOPLPUSH.
-        raw = r.brpoplpush(HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=1)
+        raw = r.brpoplpush(HIGH_QUEUE, IN_FLIGHT_QUEUE, timeout=timeout)
     if raw is not None:
         return HIGH_QUEUE, raw
-    # Then the normal-priority queue for the remainder of the window.
-    try:
-        raw = r.blmove(NORMAL_QUEUE, IN_FLIGHT_QUEUE, timeout=max(1, timeout - 1), src="RIGHT", dest="LEFT")
-    except redis.ResponseError:
-        raw = r.brpoplpush(NORMAL_QUEUE, IN_FLIGHT_QUEUE, timeout=max(1, timeout - 1))
-    if raw is not None:
-        return NORMAL_QUEUE, raw
     return None
 
 
@@ -213,8 +224,38 @@ def main():
         worker_id=WORKER_ID,
     )
 
-    log.info("Transform worker %s started — watching queues %s | %s (max_retries=%d dead_letter=%s)",
-             WORKER_ID, HIGH_QUEUE, NORMAL_QUEUE, MAX_TASK_RETRIES, DEAD_LETTER_QUEUE)
+    # v1.3.9: CDC events (per-connection Redis Streams) are handled entirely
+    # on their own background thread, independent of the initial-load loop
+    # below. CDCStreamConsumer fans out across connections concurrently
+    # (its own thread pool, sized by CDC_CONSUMER_CONCURRENCY) — see that
+    # module's docstring for why running different connections' batches in
+    # parallel is safe.
+    cdc_consumer = CDCStreamConsumer(
+        redis_client=r,
+        control_plane_url=CONTROL_PLANE_URL,
+        worker_token=os.environ.get("WORKER_TOKEN", ""),
+        worker_id=WORKER_ID,
+    )
+
+    def _process_cdc_task(task: dict) -> None:
+        # Fresh CDCTransformTask per batch — cheap (the only real per-task
+        # cost, IcebergWriter construction, is cached by connection_id
+        # inside loader.py/iceberg_writer.py, not per CDCTransformTask
+        # instance).
+        CDCTransformTask(engine=engine, redis_client=r).run(task)
+
+    cdc_thread = threading.Thread(
+        target=cdc_consumer.run_forever,
+        args=(_process_cdc_task, lambda: _shutdown),
+        name="cdc-stream-dispatch",
+        daemon=True,
+    )
+    cdc_thread.start()
+
+    log.info("Transform worker %s started — initial-load queue=%s (max_retries=%d dead_letter=%s); "
+             "CDC events via per-connection Redis Streams (concurrency=%s)",
+             WORKER_ID, HIGH_QUEUE, MAX_TASK_RETRIES, DEAD_LETTER_QUEUE,
+             os.environ.get("CDC_CONSUMER_CONCURRENCY", "4"))
 
     while not _shutdown:
         # v1.2.30 Defect D fix: atomic dequeue (BLMOVE) from the main queue to
@@ -222,6 +263,8 @@ def main():
         # queue atomically — two pods can never dequeue the same task_id
         # concurrently. It is removed from the in-flight list on ack (success
         # or dead-letter) or moved back to the main queue after backoff.
+        # v1.3.9: this loop now only ever sees initial_load tasks (see
+        # _atomic_dequeue's docstring) — CDC is handled on cdc_thread above.
         dequeued = _atomic_dequeue(r, timeout=5)
         if dequeued is None:
             # No tasks — KEDA will scale us down soon
@@ -230,18 +273,16 @@ def main():
         queue_name, raw_task = dequeued
         try:
             task = json.loads(raw_task)
-            task_type = task.get("type", "cdc_transform")
+            task_type = task.get("type", "initial_load")
             log.info("Processing task type=%s id=%s from %s (retry=%s)",
                      task_type, task.get("task_id"), queue_name, task.get("_retry_count", 0))
 
             if task_type == "initial_load":
                 loader = InitialLoadTask(engine=engine, redis_client=r)
                 loader.run(task)
-            elif task_type == "cdc_transform":
-                cdc_task = CDCTransformTask(engine=engine)
-                cdc_task.run(task)
             else:
-                log.warning("Unknown task type: %s — skipping", task_type)
+                log.warning("Unexpected task type on the initial-load queue: %s — skipping "
+                            "(CDC tasks should never reach this path post-v1.3.9)", task_type)
 
             # v1.2.30 Defect D fix: ack — remove the task from this worker's
             # in-flight list on successful completion.

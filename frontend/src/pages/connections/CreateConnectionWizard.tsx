@@ -429,6 +429,15 @@ export function CreateConnectionWizard() {
     // Committer's per-cycle Redis drain batch size (pending file-commit
     // entries committed together). Blank uses the cluster default.
     drain_batch: "",
+    // v1.3.9: CDC events (post-initial-load, ongoing binlog changes) can be
+    // applied one at a time ("per_event", the default/legacy behavior) or
+    // accumulated by the transform-worker's consumer-side read-loop into a
+    // single upsert-commit + single delete-commit per batch ("per_batch") —
+    // whichever of max_events/max_wait_minutes is hit first. See
+    // control-plane/app/api/connections.py's _resolve_cdc_batch_config.
+    cdc_batch_mode: "per_event",
+    cdc_batch_max_events: "",
+    cdc_batch_max_wait_minutes: "",
   });
 
   const { data: sources = [] } = useQuery({ queryKey: ["sources"], queryFn: () => fetchList("/sources", "sources") });
@@ -574,6 +583,8 @@ export function CreateConnectionWizard() {
         resource_limits:
           config.max_events_sec || config.max_memory_mb || config.parallelism
           || config.bulk_mode || config.committer_mode || config.drain_batch
+          || config.cdc_batch_mode !== "per_event" || config.cdc_batch_max_events
+          || config.cdc_batch_max_wait_minutes
             ? {
                 max_events_sec: config.max_events_sec ? Number(config.max_events_sec) : undefined,
                 max_memory_mb: config.max_memory_mb ? Number(config.max_memory_mb) : undefined,
@@ -590,6 +601,12 @@ export function CreateConnectionWizard() {
                 // it up (committer processes aren't dynamically provisioned
                 // per connection today — see resource_limits notes).
                 drain_batch: config.drain_batch ? Number(config.drain_batch) : undefined,
+                // v1.3.9: ongoing CDC batching (post-initial-load). See
+                // _resolve_cdc_batch_config server-side for the defaults
+                // applied when these are left blank.
+                cdc_batch_mode: config.cdc_batch_mode || undefined,
+                cdc_batch_max_events: config.cdc_batch_max_events ? Number(config.cdc_batch_max_events) : undefined,
+                cdc_batch_max_wait_minutes: config.cdc_batch_max_wait_minutes ? Number(config.cdc_batch_max_wait_minutes) : undefined,
               }
             : {},
         status: activateImmediately ? "active" : "draft",
@@ -956,6 +973,31 @@ export function CreateConnectionWizard() {
                     </SelectContent>
                   </Select>
                 </div>
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">CDC event processing</label>
+                  <Select value={config.cdc_batch_mode} onValueChange={(v) => setConfig({ ...config, cdc_batch_mode: v })}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="per_event">Per event (apply each change immediately — recommended for low-latency)</SelectItem>
+                      <SelectItem value="per_batch">Per batch (accumulate changes, commit together — higher throughput)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {config.cdc_batch_mode === "per_batch" && (
+                  <>
+                    <div className="space-y-1">
+                      <label className="text-xs text-muted-foreground">Max events per batch</label>
+                      <Input type="number" min={1} value={config.cdc_batch_max_events} onChange={(e) => setConfig({ ...config, cdc_batch_max_events: e.target.value })} placeholder="500" />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs text-muted-foreground">Max wait before committing (minutes)</label>
+                      <Input type="number" min={0.1} step={0.1} value={config.cdc_batch_max_wait_minutes} onChange={(e) => setConfig({ ...config, cdc_batch_max_wait_minutes: e.target.value })} placeholder="1" />
+                    </div>
+                    <p className="text-[11px] text-muted-foreground col-span-2">
+                      A batch commits as soon as EITHER threshold is reached, whichever comes first. Multiple changes to the same row within one batch are compacted to the latest value before committing.
+                    </p>
+                  </>
+                )}
                 {isIcebergDestination && (
                   <>
                     <div className="space-y-1">

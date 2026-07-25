@@ -145,12 +145,18 @@ class FallbackQueue:
     # ------------------------------------------------------------------
     # Bridge-task fallback (Bug #21) — independent of the event/routing
     # methods above. TransformBridge.publish_event() enqueues here when its
-    # LPUSH into fusion:transforms:* fails; drain_bridge_tasks() replays
-    # directly via LPUSH once Redis is reachable again.
+    # XADD into a per-connection ``fusion:transforms:stream:{connection_id}``
+    # fails; drain_bridge_tasks() replays directly via XADD once Redis is
+    # reachable again.
+    #
+    # v1.3.9: the column is still named ``queue_name`` (schema-compat with
+    # existing rows from before the Streams migration) but now holds a
+    # Stream key rather than a List key — drain replays via XADD, not
+    # LPUSH, to match transform_bridge.py's producer-side change.
     # ------------------------------------------------------------------
 
     def enqueue_bridge_task(self, queue_name: str, task: dict) -> None:
-        """Persist one transform-worker task that failed to LPUSH."""
+        """Persist one transform-worker task that failed to XADD."""
         self._conn.execute(
             "INSERT INTO fallback_bridge_tasks (queue_name, task_json, queued_at) VALUES (?,?,?)",
             (queue_name, json.dumps(task), int(time.time() * 1000)),
@@ -158,9 +164,14 @@ class FallbackQueue:
         self._conn.commit()
 
     def drain_bridge_tasks(self, redis_client) -> int:
-        """Attempt to re-LPUSH all pending bridge tasks in original order.
+        """Attempt to re-XADD all pending bridge tasks in original order.
 
-        Stops on the first LPUSH failure to preserve ordering (same
+        Also re-registers each task's connection_id in the active-connections
+        set (fusion:transforms:active_connections) so the transform-worker's
+        stream consumer discovers the stream even if this is the very first
+        successful publish for that connection since Redis recovered.
+
+        Stops on the first XADD failure to preserve ordering (same
         contract as drain()). Returns the number successfully flushed.
         """
         rows = self._conn.execute(
@@ -171,9 +182,15 @@ class FallbackQueue:
         flushed = 0
         for row_id, queue_name, task_json in rows:
             try:
-                redis_client.lpush(queue_name, task_json)
+                redis_client.xadd(queue_name, {"task": task_json})
+                try:
+                    connection_id = json.loads(task_json).get("connection_id")
+                    if connection_id:
+                        redis_client.sadd("fusion:transforms:active_connections", connection_id)
+                except Exception:
+                    pass
             except Exception as exc:
-                log.warning("bridge fallback drain: LPUSH failed for task %d, will retry later: %s",
+                log.warning("bridge fallback drain: XADD failed for task %d, will retry later: %s",
                             row_id, exc)
                 break
             self._conn.execute(

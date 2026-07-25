@@ -5,6 +5,37 @@ This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
 
+## [1.3.9] - 2026-07-26
+
+### Bug #22 - TransformRoute missing `source` field (100% CDC to Iceberg write failure)
+
+`GET /transform-route/...` omitted the `source` payload that
+`CDCTransformTask` needs to project columns. CDC events incremented
+metrics but Iceberg writes failed with "must have at least one column".
+`TransformRoute` now includes `source: Dict[str, Any] = {}` and the
+route builder fills it from the connection's source config.
+
+### CDC pipeline redesign - Redis Streams + batching + compaction
+
+- **Producer** (`transform_bridge.py`, `fallback_queue.py`): per-connection
+  Redis Streams (`fusion:transforms:stream:{connection_id}`, XADD) instead of
+  a shared List; active connections registered in
+  `fusion:transforms:active_connections`. Bug #21 fallback drain now XADDs.
+- **Consumer** (new `cdc_stream_consumer.py`, wired in `worker.py`):
+  XREADGROUP consumer group with per-connection `cdc_batch_mode`
+  (per_event|per_batch), native PEL/XAUTOCLAIM recovery, cross-connection
+  concurrency via `CDC_CONSUMER_CONCURRENCY` + per-connection SET NX lock.
+- **Control-plane**: `resource_limits.cdc_batch_*` +
+  `GET /connections/{id}/cdc-batch-config` (`_resolve_cdc_batch_config`).
+- **Frontend**: Create Connection wizard CDC event processing fields.
+- **Correctness/perf**: PK last-event-wins compaction
+  (`_compact_events_by_pk`); `IcebergWriter` cache keyed by connection_id.
+- **Tests**: `test_blmove_signature.py` / `test_v130_correctness.py` updated
+  for the Streams path (NORMAL_QUEUE list branch removed).
+
+### Chart
+- helm/fusion-cdc bumped to 1.3.9.
+
 ## [1.3.8] — 2026-07-25
 
 ### Bug #21 — CDC events permanently dropped on Redis outage (bridge path had no fallback)

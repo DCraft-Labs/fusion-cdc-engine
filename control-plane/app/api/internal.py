@@ -806,6 +806,13 @@ class TransformRoute(PydanticModel):
     dest_table: str
     primary_key: str
     transform_steps: List[Dict[str, Any]] = []
+    # Bug #22 fix: without the source connector/schema info, the
+    # transform-worker's _get_source_schema() received an empty dict and
+    # defaulted connector_type="", producing a zero-column Arrow schema —
+    # every CDC-driven Iceberg write failed with "Provided table/dataframe
+    # must have at least one column". Mirrors the source block already
+    # built for get_worker_sources()/SourceAssignment above.
+    source: Dict[str, Any] = {}
 
 
 @router.get(
@@ -839,6 +846,31 @@ def get_transform_route(
         src_uuid = UUID(source_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid source_id")
+
+    # Bug #22 fix: resolve the source row once so every route in this
+    # response carries connector_type/host/port/creds — same shape as
+    # SourceAssignment in get_worker_sources() above.
+    source_row = (
+        db.query(Source)
+        .options(joinedload(Source.connector_definition))
+        .filter(Source.source_id == src_uuid)
+        .first()
+    )
+    source_block: Dict[str, Any] = {}
+    if source_row is not None:
+        source_block = {
+            "connector_type": (
+                source_row.connector_definition.connector_type
+                if source_row.connector_definition else "unknown"
+            ),
+            "host": source_row.host,
+            "port": source_row.port,
+            "database_name": source_row.database_name,
+            "username": source_row.username,
+            "password": _decrypt_password(source_row.password_encrypted or ""),
+            "config": source_row.config or {},
+            "ssh_config": source_row.ssh_config or {},
+        }
 
     # Active connections for this source, with their enabled streams matching
     # the requested (schema, table). A wildcard schema ("") matches any.
@@ -919,8 +951,49 @@ def get_transform_route(
             dest_table=stream.destination_table_name or table_name,
             primary_key=pk_str,
             transform_steps=steps,
+            source=source_block,
         ))
     return routes
+
+
+# ---------------------------------------------------------------------------
+# v1.3.9 — CDC batching config resolver. The transform-worker's CDC stream
+# consumer (cdc_stream_consumer.py) is keyed by connection_id, independent
+# of the transform-route resolution above (which is keyed by source/schema/
+# table) — this endpoint gives the consumer's per-connection read-loop the
+# effective cdc_batch_mode/max_events/max_wait_minutes without duplicating
+# the resolution logic (see _resolve_cdc_batch_config in app/api/connections.py).
+# ---------------------------------------------------------------------------
+
+class CDCBatchConfig(PydanticModel):
+    mode: str
+    max_events: int
+    max_wait_minutes: float
+
+
+@router.get(
+    "/connections/{connection_id}/cdc-batch-config",
+    response_model=CDCBatchConfig,
+    summary="Resolve a connection's CDC batching config for the transform-worker's stream consumer",
+)
+def get_cdc_batch_config(
+    connection_id: str,
+    db: Session = Depends(get_db),
+    _token: str = Depends(_verify_worker_token),
+) -> CDCBatchConfig:
+    from app.api.connections import _resolve_cdc_batch_config
+
+    try:
+        conn_uuid = UUID(connection_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid connection_id")
+
+    conn = db.query(Connection).filter(Connection.connection_id == conn_uuid).first()
+    if conn is None:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    cfg = _resolve_cdc_batch_config(conn.resource_limits or {})
+    return CDCBatchConfig(**cfg)
 
 
 # ---------------------------------------------------------------------------

@@ -99,6 +99,46 @@ def _resolve_bulk_mode(resource_limits: dict, rows_estimated, src_connector_type
     except (TypeError, ValueError):
         return None
 
+
+# v1.3.9: CDC batching config (Redis Streams migration — see
+# transform-worker/cdc_stream_consumer.py). A connection's CDC events can be
+# applied to the destination one at a time ("per_event", the old behavior)
+# or accumulated by the transform-worker's consumer-side read-loop into a
+# single upsert-commit + single delete-commit per batch ("per_batch") —
+# whichever of max_events/max_wait_minutes is hit first. Deliberately ONE
+# combined threshold (not separate insert/update/delete thresholds): after
+# PK-based compaction every batch only ever has 2 real buckets (upsert,
+# delete), since INSERT/UPDATE both collapse to "upsert" for Iceberg.
+DEFAULT_CDC_BATCH_MAX_EVENTS = int(os.environ.get("DEFAULT_CDC_BATCH_MAX_EVENTS", "500"))
+DEFAULT_CDC_BATCH_MAX_WAIT_MINUTES = float(os.environ.get("DEFAULT_CDC_BATCH_MAX_WAIT_MINUTES", "1"))
+
+
+def _resolve_cdc_batch_config(resource_limits: dict) -> dict:
+    """Resolve ``resource_limits.cdc_batch_mode``/``cdc_batch_max_events``/
+    ``cdc_batch_max_wait_minutes`` into the effective config the
+    transform-worker's CDC stream consumer applies for this connection.
+    ``"per_event"`` (unset default — matches the pre-v1.3.9 behavior) means
+    no batching at all; ``"per_batch"`` accumulates via a read-loop up to
+    ``max_events`` OR ``max_wait_minutes``, whichever comes first.
+    """
+    rl = resource_limits or {}
+    mode = str(rl.get("cdc_batch_mode") or "per_event").lower()
+    if mode not in ("per_event", "per_batch"):
+        mode = "per_event"
+    try:
+        max_events = int(rl.get("cdc_batch_max_events") or DEFAULT_CDC_BATCH_MAX_EVENTS)
+    except (TypeError, ValueError):
+        max_events = DEFAULT_CDC_BATCH_MAX_EVENTS
+    try:
+        max_wait_minutes = float(rl.get("cdc_batch_max_wait_minutes") or DEFAULT_CDC_BATCH_MAX_WAIT_MINUTES)
+    except (TypeError, ValueError):
+        max_wait_minutes = DEFAULT_CDC_BATCH_MAX_WAIT_MINUTES
+    return {
+        "mode": mode,
+        "max_events": max(1, max_events),
+        "max_wait_minutes": max(0.05, max_wait_minutes),
+    }
+
 # v1.2.27: in-process initial-load partitioning state tracker. Used by the
 # async ``retry-initial-load`` endpoint (returns 202 immediately) and the
 # ``GET /connections/{id}/initial-load/status`` endpoint. With

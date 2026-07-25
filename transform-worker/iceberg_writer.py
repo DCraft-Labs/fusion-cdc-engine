@@ -1444,6 +1444,36 @@ class IcebergWriter:
         return result
 
 
+# v1.3.9: cache one IcebergWriter per connection_id, reused across CDC task
+# dequeues instead of reconstructing it from scratch on every task (see
+# V1.3.9_PENDING_FIXES_AND_TASKS.md §7 — identified as the likely dominant
+# CDC-write-side bottleneck). IcebergWriter.__init__ does a full Nessie/REST
+# catalog handshake (load_catalog) plus a namespace round-trip
+# (_ensure_namespace) — for CDC, where a task can be a single event, that
+# per-task setup cost dwarfs the actual write. self.catalog/self.namespace
+# depend only on dest_config, not on which table is written (table_name is
+# passed per-call to upsert()/delete()), so ONE writer safely serves every
+# table for a given connection — no per-table cache entry needed.
+_WRITER_CACHE: "dict[str, IcebergWriter]" = {}
+
+
+def get_cached_writer(connection_id: "str | None", dest_config: dict,
+                       redis_client: "Any | None" = None) -> "IcebergWriter":
+    """Return a cached IcebergWriter for ``connection_id``, constructing
+    (and caching) one on first use. Falls back to an uncached, one-off
+    writer when ``connection_id`` is missing (defensive — every
+    CDCTransformTask call site has one; kept safe for any other caller that
+    might not)."""
+    if not connection_id:
+        return IcebergWriter(dest_config, redis_client=redis_client)
+    cached = _WRITER_CACHE.get(connection_id)
+    if cached is not None:
+        return cached
+    writer = IcebergWriter(dest_config, redis_client=redis_client, connection_id=connection_id)
+    _WRITER_CACHE[connection_id] = writer
+    return writer
+
+
 def test_connection(dest_config: dict) -> dict:
     """Connection test: resolve catalog, list namespace, HeadBucket/list warehouse."""
     result = {"catalog_ok": False, "namespace_ok": False, "s3_ok": False, "checks": []}
