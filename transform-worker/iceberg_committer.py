@@ -61,15 +61,27 @@ _ADD_FILES_MAX_WORKERS = int(os.environ.get("ICEBERG_COMMITTER_ADD_FILES_WORKERS
 def _add_files_fast(table, tx, file_paths: list, max_workers: int = _ADD_FILES_MAX_WORKERS) -> None:
     """Register ``file_paths`` into ``tx`` via ONE fast_append(), building
     each file's DataFile object concurrently first. Drop-in replacement for
-    ``for p in file_paths: tx.add_files(file_paths=[p])``."""
+    ``for p in file_paths: tx.add_files(file_paths=[p])``.
+
+    Falls back to sequential ``tx.add_files`` only when the PyIceberg fast
+    path isn't importable (unit-test stubs that mock ``pyiceberg`` as a
+    non-package). Real import/runtime failures from a live pyiceberg still
+    propagate.
+    """
     if not file_paths:
         return
-    if tx.table_metadata.name_mapping() is None:
+    try:
+        from pyiceberg.io.pyarrow import parquet_files_to_data_files
         from pyiceberg.table import TableProperties
+    except ImportError:
+        for path in file_paths:
+            tx.add_files(file_paths=[path])
+        return
+
+    if tx.table_metadata.name_mapping() is None:
         tx.set_properties(**{
             TableProperties.DEFAULT_NAME_MAPPING: tx.table_metadata.schema().name_mapping.model_dump_json()
         })
-    from pyiceberg.io.pyarrow import parquet_files_to_data_files
 
     def _build_one(path):
         return next(iter(parquet_files_to_data_files(
