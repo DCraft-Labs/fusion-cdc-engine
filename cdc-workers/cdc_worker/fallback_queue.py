@@ -38,8 +38,27 @@ CREATE TABLE IF NOT EXISTS fallback_events (
     flushed      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_flushed ON fallback_events(flushed);
-"""
 
+-- 2026-07-25 addition (Bug #21): TransformBridge.publish_event()'s LPUSH into
+-- fusion:transforms:normal had NO fallback of its own -- confirmed live, a
+-- ~5-minute Redis outage silently dropped every single CDC-driven change for
+-- that window with zero recovery, even though the sibling XADD path above
+-- (fallback_events) correctly buffered and replayed. drain() above replays
+-- into RedisStreamPublisher.publish() only -- it never re-LPUSHes a bridge
+-- task, so fallback_events being durable did nothing for the actual
+-- Iceberg-writing pipeline (transform-worker only BRPOPs from
+-- fusion:transforms:*, never reads the cdc:* streams). This second table
+-- gives the bridge path the same durability, independently, since the two
+-- failure domains are not interchangeable.
+CREATE TABLE IF NOT EXISTS fallback_bridge_tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_name   TEXT    NOT NULL,
+    task_json    TEXT    NOT NULL,
+    queued_at    INTEGER NOT NULL,
+    flushed      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_bridge_flushed ON fallback_bridge_tasks(flushed);
+"""
 
 class FallbackQueue:
     """
@@ -120,6 +139,54 @@ class FallbackQueue:
         """Return number of pending (unflushed) events."""
         row = self._conn.execute(
             "SELECT COUNT(*) FROM fallback_events WHERE flushed=0"
+        ).fetchone()
+        return row[0]
+
+    # ------------------------------------------------------------------
+    # Bridge-task fallback (Bug #21) — independent of the event/routing
+    # methods above. TransformBridge.publish_event() enqueues here when its
+    # LPUSH into fusion:transforms:* fails; drain_bridge_tasks() replays
+    # directly via LPUSH once Redis is reachable again.
+    # ------------------------------------------------------------------
+
+    def enqueue_bridge_task(self, queue_name: str, task: dict) -> None:
+        """Persist one transform-worker task that failed to LPUSH."""
+        self._conn.execute(
+            "INSERT INTO fallback_bridge_tasks (queue_name, task_json, queued_at) VALUES (?,?,?)",
+            (queue_name, json.dumps(task), int(time.time() * 1000)),
+        )
+        self._conn.commit()
+
+    def drain_bridge_tasks(self, redis_client) -> int:
+        """Attempt to re-LPUSH all pending bridge tasks in original order.
+
+        Stops on the first LPUSH failure to preserve ordering (same
+        contract as drain()). Returns the number successfully flushed.
+        """
+        rows = self._conn.execute(
+            "SELECT id, queue_name, task_json FROM fallback_bridge_tasks "
+            "WHERE flushed=0 ORDER BY id"
+        ).fetchall()
+
+        flushed = 0
+        for row_id, queue_name, task_json in rows:
+            try:
+                redis_client.lpush(queue_name, task_json)
+            except Exception as exc:
+                log.warning("bridge fallback drain: LPUSH failed for task %d, will retry later: %s",
+                            row_id, exc)
+                break
+            self._conn.execute(
+                "UPDATE fallback_bridge_tasks SET flushed=1 WHERE id=?", (row_id,)
+            )
+            self._conn.commit()
+            flushed += 1
+        return flushed
+
+    def bridge_queue_length(self) -> int:
+        """Return number of pending (unflushed) bridge tasks."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM fallback_bridge_tasks WHERE flushed=0"
         ).fetchone()
         return row[0]
 

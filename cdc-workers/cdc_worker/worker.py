@@ -33,7 +33,6 @@ log = logging.getLogger(__name__)
 # Redis pub/sub channel for control-plane → worker commands
 COMMAND_CHANNEL = "fusion:commands"
 
-
 class Worker:
     """
     Main CDC Worker.
@@ -91,6 +90,9 @@ class Worker:
             worker_token=self._cfg.WORKER_TOKEN,
             worker_id=self._cfg.WORKER_ID,
             redis_client=self._publisher._client,
+            # Bug #21 fix: share the same durable fallback the publisher uses
+            # so a Redis outage no longer silently drops bridge tasks.
+            fallback=self._fallback,
         )
         self._running = False
         self._source_tasks: Dict[str, asyncio.Task] = {}
@@ -244,6 +246,16 @@ class Worker:
                     log.info("Fallback drained %d event(s)", flushed)
             except Exception as exc:
                 log.warning("fallback drain error: %s", exc)
+            # Bug #21 fix: also drain any transform-bridge tasks that
+            # couldn't be LPUSHed during a Redis outage -- independent of the
+            # event drain above, since they target fusion:transforms:* not
+            # the cdc:* streams.
+            try:
+                bridge_flushed = self._fallback.drain_bridge_tasks(self._publisher._client)
+                if bridge_flushed:
+                    log.info("Fallback drained %d bridge task(s)", bridge_flushed)
+            except Exception as exc:
+                log.warning("bridge fallback drain error: %s", exc)
 
     # ------------------------------------------------------------------
     # Redis pub/sub command listener
@@ -422,7 +434,6 @@ class Worker:
             return PollingConnector(source, self._local_ckpt)
         else:
             raise ValueError(f"Unknown connector_type: {connector_type!r}")
-
 
 # ---------------------------------------------------------------------------
 # CLI entry point — `python -m cdc_worker.worker`

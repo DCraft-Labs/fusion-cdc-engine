@@ -41,7 +41,6 @@ log = logging.getLogger(__name__)
 DEFAULT_TRANSFORM_QUEUE = "fusion:transforms:normal"
 ROUTE_CACHE_TTL = 60  # seconds
 
-
 class TransformBridge:
     """Bridges CDCEvent → transform-worker ``cdc_transform`` tasks.
 
@@ -59,6 +58,7 @@ class TransformBridge:
         redis_client: redis.Redis,
         queue_name: str = DEFAULT_TRANSFORM_QUEUE,
         cache_ttl: int = ROUTE_CACHE_TTL,
+        fallback=None,
     ) -> None:
         self._base = control_plane_url.rstrip("/")
         self._headers = {
@@ -71,6 +71,12 @@ class TransformBridge:
         self._cache_ttl = cache_ttl
         # (source_id, schema, table) -> (expires_at, routes)
         self._route_cache: Dict[tuple, tuple[float, List[dict]]] = {}
+        # 2026-07-25 fix (Bug #21): a FallbackQueue instance (the same one
+        # the worker already builds for RedisStreamPublisher) so an LPUSH
+        # failure here durably persists the task instead of just logging and
+        # dropping it -- see fallback_queue.py's enqueue_bridge_task/
+        # drain_bridge_tasks for the full rationale.
+        self._fallback = fallback
 
     # ------------------------------------------------------------------
     def _resolve_routes(self, source_id: str, schema: str, table: str) -> List[dict]:
@@ -126,22 +132,43 @@ class TransformBridge:
         }
         pushed = 0
         for route in routes:
+            task = {
+                "type": "cdc_transform",
+                "connection_id": route.get("connection_id"),
+                "events": [evt],
+                "transform_steps": route.get("transform_steps") or [],
+                "dest_schema": route.get("dest_schema") or "dw",
+                "dest_table": route.get("dest_table") or event.table_name,
+                "primary_key": route.get("primary_key") or "id",
+                "destination": route.get("destination") or {},
+                "dest_connector_type": (route.get("destination") or {}).get("connector_type", "postgres"),
+            }
             try:
-                task = {
-                    "type": "cdc_transform",
-                    "connection_id": route.get("connection_id"),
-                    "events": [evt],
-                    "transform_steps": route.get("transform_steps") or [],
-                    "dest_schema": route.get("dest_schema") or "dw",
-                    "dest_table": route.get("dest_table") or event.table_name,
-                    "primary_key": route.get("primary_key") or "id",
-                    "destination": route.get("destination") or {},
-                    "dest_connector_type": (route.get("destination") or {}).get("connector_type", "postgres"),
-                }
                 self._redis.lpush(self._queue, json.dumps(task))
                 pushed += 1
             except Exception as exc:
-                log.warning("transform bridge LPUSH failed: %s", exc)
+                # 2026-07-25 fix (Bug #21): this used to just log and move on,
+                # permanently dropping the task. Confirmed live: a ~5-minute
+                # Redis outage (OOMKilled pod, no PVC) silently lost every
+                # single CDC-driven change for that window with zero
+                # recovery -- the sibling XADD path's fallback_events table
+                # only replays into the cdc:* stream, never back into
+                # fusion:transforms:*, so it did nothing for the actual
+                # Iceberg-writing pipeline. Persist to the SAME durable
+                # SQLite fallback the worker already has (independent table,
+                # see fallback_queue.py) so periodic drain can safely LPUSH
+                # it once Redis is reachable again, instead of losing it.
+                if self._fallback is not None:
+                    try:
+                        self._fallback.enqueue_bridge_task(self._queue, task)
+                        log.warning("transform bridge LPUSH failed, queued to durable "
+                                    "fallback instead of dropping: %s", exc)
+                    except Exception:
+                        log.exception("transform bridge LPUSH failed AND fallback "
+                                      "enqueue failed -- task genuinely lost")
+                else:
+                    log.warning("transform bridge LPUSH failed (no fallback configured "
+                                "-- task lost): %s", exc)
         return pushed
 
     def flush_cache(self) -> None:

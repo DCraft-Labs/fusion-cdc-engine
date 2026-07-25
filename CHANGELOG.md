@@ -1,8 +1,32 @@
 # Changelog
 
-All notable changes to Fusion CDC Engine (private repo) are documented here.
+All notable changes to Fusion CDC Engine are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
+
+
+## [1.3.8] — 2026-07-25
+
+### Bug #21 — CDC events permanently dropped on Redis outage (bridge path had no fallback)
+
+RedisStreamPublisher's XADD path already persisted failures via FallbackQueue
+and replayed them on drain. TransformBridge's LPUSH into
+`fusion:transforms:normal` (the queue transform-worker actually BRPOPs) only
+logged and dropped the task. During a Redis OOMKill outage, every CDC-driven
+Iceberg write for that window was permanently lost even though the stream
+fallback correctly buffered XADD failures.
+
+- `fallback_queue.py`: added independent `fallback_bridge_tasks` SQLite table
+  plus `enqueue_bridge_task` / `drain_bridge_tasks` / `bridge_queue_length`.
+- `transform_bridge.py`: optional `fallback=`; LPUSH failures call
+  `enqueue_bridge_task` instead of dropping.
+- `worker.py`: passes the same FallbackQueue into TransformBridge; drain loop
+  also calls `drain_bridge_tasks`.
+- Helm twin + Bitnami Redis request memory bumped toward 512Mi (limit already
+  3Gi) so chart-managed Redis carries the sizing forward.
+
+### Chart
+- helm/fusion-cdc bumped to 1.3.8.
 
 
 ## [1.3.7] — 2026-07-25
