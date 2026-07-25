@@ -21,6 +21,7 @@ instead of crashing the app).
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -66,6 +67,12 @@ def load_catalog(dest_config: dict):
         settings["uri"] = dest_config["sql_catalog_uri"]
     elif catalog_type == "dynamodb":
         settings["dynamodb.table-name"] = dest_config["dynamodb_table"]
+        settings["dynamodb.region"] = dest_config.get("dynamodb_region") or creds.get("region", "us-east-1")
+        if creds.get("access_key_id"):
+            settings["dynamodb.access-key-id"] = creds["access_key_id"]
+            settings["dynamodb.secret-access-key"] = creds["secret_access_key"]
+            if creds.get("session_token"):
+                settings["dynamodb.session-token"] = creds["session_token"]
     else:
         raise ValueError(f"Unsupported catalog_type: {catalog_type}")
 
@@ -103,7 +110,13 @@ def _resolve_credentials(dest_config: dict) -> dict:
         out["session_token"] = dest_config.get("aws_session_token")
         out["role_arn"] = dest_config.get("target_role_arn")
     elif mode == "irsa":
-        out["role_arn"] = dest_config.get("service_account_role_arn")
+        # See transform-worker/iceberg_writer.py::_resolve_credentials — only
+        # set an explicit role-arn for a cross-role assumption; the ambient
+        # IRSA identity already IS the requested role in the common case.
+        requested_role = dest_config.get("service_account_role_arn")
+        ambient_role = os.environ.get("AWS_ROLE_ARN")
+        if requested_role and requested_role != ambient_role:
+            out["role_arn"] = requested_role
     else:
         raise ValueError(f"Unsupported auth_mode: {mode}")
 

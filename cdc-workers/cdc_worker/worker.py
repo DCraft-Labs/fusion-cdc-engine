@@ -148,15 +148,53 @@ class Worker:
     # ------------------------------------------------------------------
 
     async def _run_source(self, source: dict) -> None:
+        """Run one source's stream_events() loop, self-healing from crashes.
+
+        Previously a single exception here (e.g. one malformed row) was
+        caught, logged, and the coroutine returned — leaving a *finished*
+        task sitting in self._source_tasks forever. _handle_start_streaming
+        only checks `source_id in self._source_tasks`, so every later
+        start-streaming poll reported "already running" for a source that
+        was actually dead, with no retry and nothing visible beyond one log
+        line (confirmed live: cdc_events_total stopped incrementing and the
+        binlog checkpoint froze, while the poll loop kept insisting the
+        source was fine). Now we retry with backoff, and always drop the
+        task from self._source_tasks on exit so a later start-streaming
+        poll (or the loop above) can bring the source back.
+        """
         source_id = source.get("source_id", "unknown")
+        attempt = 0
         try:
-            async with self._semaphore:
-                connector = self._build_connector(source)
-                await self._stream_source(source_id, connector)
-        except asyncio.CancelledError:
-            log.info("Source %s cancelled", source_id)
-        except Exception as exc:
-            log.error("Source %s crashed (isolated): %s", source_id, exc, exc_info=True)
+            while self._running:
+                attempt += 1
+                try:
+                    async with self._semaphore:
+                        connector = self._build_connector(source)
+                        await self._stream_source(source_id, connector)
+                    return  # stream_events() ended on its own — not an error
+                except asyncio.CancelledError:
+                    log.info("Source %s cancelled", source_id)
+                    return
+                except Exception as exc:
+                    if attempt >= self._cfg.SOURCE_MAX_RETRIES:
+                        log.error(
+                            "Source %s crashed %d times in a row, giving up for now "
+                            "(will retry on the next start-streaming poll): %s",
+                            source_id, attempt, exc, exc_info=True,
+                        )
+                        return
+                    delay = min(
+                        self._cfg.SOURCE_RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)),
+                        self._cfg.SOURCE_RETRY_BACKOFF_MAX_SECONDS,
+                    )
+                    log.error(
+                        "Source %s crashed (attempt %d/%d), restarting in %.0fs: %s",
+                        source_id, attempt, self._cfg.SOURCE_MAX_RETRIES, delay, exc,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(delay)
+        finally:
+            self._source_tasks.pop(source_id, None)
 
     async def _stream_source(self, source_id: str, connector) -> None:
         """Iterate connector events, publish them, and update checkpoints."""

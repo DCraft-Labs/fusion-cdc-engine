@@ -35,6 +35,13 @@ log = logging.getLogger(__name__)
 COMMIT_LOCK_TTL_S = int(os.environ.get("ICEBERG_COMMIT_LOCK_TTL_S", "30"))
 COMMIT_LOCK_WAIT_S = int(os.environ.get("ICEBERG_COMMIT_LOCK_WAIT_S", "60"))
 COMMIT_LOCK_POLL_S = float(os.environ.get("ICEBERG_COMMIT_LOCK_POLL_S", "1.0"))
+# 2026-07-24 addition (Bug #17): separate, short-lived lock so exactly one
+# of K concurrent partitions bootstraps a not-yet-existing table, instead
+# of all K racing into a direct commit simultaneously (see
+# write_arrow_to_file). BOOTSTRAP_WAIT_S bounds how long a losing partition
+# waits for the winner before falling back to committing itself.
+BOOTSTRAP_WAIT_S = int(os.environ.get("ICEBERG_BOOTSTRAP_WAIT_S", "30"))
+BOOTSTRAP_POLL_S = float(os.environ.get("ICEBERG_BOOTSTRAP_POLL_S", "0.5"))
 
 
 def _commit_lock_key(connection_id: str, table_name: str) -> str:
@@ -208,6 +215,15 @@ def load_catalog(dest_config: dict):
         settings["uri"] = dest_config["sql_catalog_uri"]
     elif catalog_type == "dynamodb":
         settings["dynamodb.table-name"] = dest_config["dynamodb_table"]
+        # v1.3.7 Bug #1: forward region + credentials the same way the Glue
+        # branch does. Previously only table-name was set, so access_key /
+        # sts_assume connections silently used the ambient boto3 chain.
+        settings["dynamodb.region"] = dest_config.get("dynamodb_region") or creds.get("region", "us-east-1")
+        if creds.get("access_key_id"):
+            settings["dynamodb.access-key-id"] = creds["access_key_id"]
+            settings["dynamodb.secret-access-key"] = creds["secret_access_key"]
+            if creds.get("session_token"):
+                settings["dynamodb.session-token"] = creds["session_token"]
     else:
         raise ValueError(f"Unsupported catalog_type: {catalog_type}")
 
@@ -254,9 +270,14 @@ def _resolve_credentials(dest_config: dict) -> dict:
         out["session_token"] = dest_config.get("aws_session_token")
         out["role_arn"] = dest_config.get("target_role_arn")
     elif mode == "irsa":
-        # IRSA / workload identity — boto default chain picks up the SA token.
-        # PyIceberg supports `client.role-arn` for direct role assumption.
-        out["role_arn"] = dest_config.get("service_account_role_arn")
+        # v1.3.7 Bug #2: only set role_arn when the requested role differs
+        # from the pod's ambient IRSA identity (AWS_ROLE_ARN). Setting the
+        # same role triggers a self-AssumeRole that standard IRSA trust
+        # policies reject with AccessDenied.
+        requested_role = dest_config.get("service_account_role_arn")
+        ambient_role = os.environ.get("AWS_ROLE_ARN")
+        if requested_role and requested_role != ambient_role:
+            out["role_arn"] = requested_role
     else:
         raise ValueError(f"Unsupported auth_mode: {mode}")
 
@@ -370,9 +391,13 @@ def _build_table_properties(dest_config: dict) -> dict:
     # in the destination config — the explicit value always wins.
     wmdac_explicit = "write_metadata_delete_after_commit" in dest_config
     wmdac_value = bool(dest_config.get("write_metadata_delete_after_commit"))
-    if wmdac_value:
-        props["write.metadata.delete-after-commit.enabled"] = "true"
-    elif dest_config.get("initial_load_destination", True) and not wmdac_explicit:
+    if wmdac_explicit:
+        # 2026-07-25 fix: an explicit False used to fall through to neither
+        # branch, silently OMITTING the property (leaving Iceberg's own
+        # spec default in effect) instead of actually setting "false" -- no
+        # way to deterministically force it off for an A/B comparison.
+        props["write.metadata.delete-after-commit.enabled"] = "true" if wmdac_value else "false"
+    elif dest_config.get("initial_load_destination", True):
         props["write.metadata.delete-after-commit.enabled"] = "true"
     # v1.2.25 Task 5: auto-merge manifests on every commit so a long initial
     # load (one snapshot per 10k-row chunk) does not accumulate hundreds of
@@ -725,6 +750,101 @@ def _rows_to_arrow(rows: list[dict], schema: pa.Schema | None = None) -> pa.Tabl
     return pa.Table.from_pylist(rows)
 
 
+def _arrow_schema_to_iceberg_schema_with_ids(arrow_schema: pa.Schema):
+    """2026-07-24 fix (post-v1.3.6): return (iceberg_schema, name_to_id) where
+    ``iceberg_schema`` is a REAL ``pyiceberg.schema.Schema`` whose field ids
+    exactly match ``name_to_id`` (sequential, 1-based, in arrow column order).
+
+    Why this is needed: ``Catalog.create_table()`` only accepts either an
+    already-real ``Schema`` object (used as-is) or a raw ``pa.Schema`` --
+    for the latter it converts via ``_ConvertToIcebergWithoutIDs``, which
+    assigns ``field_id=-1`` to *every* field (verified directly against the
+    installed pyiceberg==0.7.1: "Converts PyArrowSchema to Iceberg Schema
+    with all -1 ids. ... should always be used in conjunction with
+    `new_table_metadata` [to] assign new field ids in order."). When a
+    ``partition_spec`` is ALSO supplied, table creation internally calls
+    ``assign_fresh_partition_spec_ids(spec, old_schema, fresh_schema)``,
+    which resolves each partition field's ``source_id`` by looking up
+    ``old_schema.find_column_name(source_id)`` -- but every field in that
+    "old_schema" is id=-1, so a partition field built assuming real
+    sequential ids (as ``_build_partition_spec_from_arrow`` below does) can
+    never be found there. Confirmed live: 100% reproducible
+    ``ValueError: Could not find in old schema: 1000: pkey_bucket:
+    bucket[16](1)`` on every single bootstrap-create attempt, for every
+    partition, the moment v1.3.6's new default bucket(16, pk) partitioning
+    (Bug #7 fix) was exercised end-to-end for the first time outside its
+    own unit tests. Building a real, correctly-ID'd Schema object here and
+    passing IT (not the raw arrow schema) to create_table() sidesteps the
+    WithoutIDs path entirely -- create_table()'s own
+    ``_convert_schema_if_needed`` returns an already-``Schema`` instance
+    unchanged, so "old_schema" in the partition-spec-id-reconciliation step
+    ends up being THIS schema, whose ids genuinely match what
+    ``_build_partition_spec_from_arrow`` assumes.
+    """
+    from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import NestedField
+
+    raw = _pyarrow_to_schema_without_ids(arrow_schema)  # types correct, every field_id=-1
+    name_to_id = {field.name: i + 1 for i, field in enumerate(arrow_schema)}
+    fields = [
+        NestedField(field_id=name_to_id[f.name], name=f.name,
+                    field_type=f.field_type, required=f.required)
+        for f in raw.fields
+    ]
+    return Schema(*fields), name_to_id
+
+
+# 2026-07-25 fix (Fix C, found while investigating why per-chunk "write"
+# phase latency dominated at ~1s/20,000-row-chunk even after Fix B made
+# convert fast): PyIceberg's REST catalog re-selects FsspecFileIO on every
+# single load_table() call for this deployment's s3:// table location,
+# regardless of a client-side `py-io-impl` catalog override -- confirmed by
+# reading RestCatalog._response_to_table / Catalog._load_file_io: the merge
+# is `{**self.properties, **table_response.config}`, and the REST server's
+# own `config` response field (not the client's init properties) is what
+# actually determines the FileIO class here, so a client-side override is
+# silently discarded. Measured live (20,000-row Parquet write): FsspecFileIO's
+# `new_output().create()` costs ~510-530ms and `.close()` (upload) another
+# ~90-390ms PER FILE -- ~92% of total per-chunk time -- while the actual
+# `pq.write_table()` call is only ~15ms. A warm (post-cold-start)
+# `PyArrowFileIO` instance does the same create+write+close in ~100-490ms,
+# roughly 1.5-4x faster on the dominant cost, with an identical
+# `new_output`/`new_input`/`delete` interface. Since the server always wins
+# the FileIO-selection merge, the fix is applied client-side instead: swap
+# `table.io` for a POOLED (built once per worker process — PyArrowFileIO's
+# own cold start costs ~5s, so this must never run per-chunk) PyArrowFileIO
+# right after each load_table() call, rather than fighting the server's
+# config. Reuses the existing `_resolve_credentials`/`_resolve_s3_settings`
+# helpers so auth/region/path-style stay correct for whatever this
+# deployment's actual destination config is (not hardcoded).
+_POOLED_PYARROW_IO: dict[tuple, Any] = {}
+
+
+def _fast_file_io_for(dest_config: dict):
+    from pyiceberg.io.pyarrow import PyArrowFileIO
+    creds = _resolve_credentials(dest_config)
+    s3_settings = _resolve_s3_settings(dest_config, creds)
+    key = tuple(sorted(s3_settings.items()))
+    io = _POOLED_PYARROW_IO.get(key)
+    if io is None:
+        io = PyArrowFileIO(s3_settings)
+        _POOLED_PYARROW_IO[key] = io
+    return io
+
+
+def _use_fast_io(table, dest_config: dict):
+    """Best-effort: swap table.io for the pooled PyArrowFileIO. On any
+    failure, leave table.io untouched (falls back to the slower-but-correct
+    server-selected default) rather than risk breaking a write."""
+    try:
+        table.io = _fast_file_io_for(dest_config)
+    except Exception:
+        log.exception("_use_fast_io: failed to patch table.io to PyArrowFileIO "
+                      "— continuing with the default FileIO")
+    return table
+
+
 def _get_or_create_table(catalog, namespace: str, table_name: str,
                          arrow_schema: pa.Schema, dest_config: dict,
                          pk_col: "str | None" = None):
@@ -738,11 +858,36 @@ def _get_or_create_table(catalog, namespace: str, table_name: str,
     from pyiceberg.exceptions import NoSuchTableError
 
     try:
-        return catalog.load_table(f"{namespace}.{table_name}")
+        return _use_fast_io(catalog.load_table(f"{namespace}.{table_name}"), dest_config)
     except NoSuchTableError:
         log.info("Creating Iceberg table %s.%s", namespace, table_name)
         partition_spec_cfg = list(dest_config.get("partition_spec") or [])
-        if not partition_spec_cfg:
+        # 2026-07-24 fix (post-v1.3.6): the auto bucket(16, pk) default below
+        # is DISABLED. `add_files()` -- the whole basis of the staged
+        # committer path this table is used with -- can only register a
+        # pre-written Parquet file into a partition whose value it can
+        # INFER from that file's own column min/max statistics ("linear"
+        # transforms: identity/truncate/year/month/day/hour). `bucket()` is
+        # not linear (hash(pk) % 16 isn't derivable from min/max stats), so
+        # every add_files() call against a bucket-partitioned table fails
+        # unconditionally. Confirmed live: 100% of commit attempts hit
+        # ``ValueError: Cannot infer partition value from parquet metadata
+        # for a non-linear Partition Field: pkey_bucket with transform
+        # bucket[16]`` (raised from pyiceberg/io/pyarrow.py's
+        # `_partition_value`), meaning v1.3.6's own Bug #7 recommendation
+        # (auto-partition on create, to make future overlap-deletes cheap)
+        # is fundamentally incompatible with `committer_mode: staged`,
+        # which is the mode this whole investigation's throughput numbers
+        # were measured under. Since the checkpoint-constraint fix (Bug #4)
+        # already makes genuine duplicate re-staging rare, and the
+        # dedup-on-overlap path is already skip-only (see
+        # `_dedup_one_range`), the cheap-delete benefit this partitioning
+        # was meant to provide is low-value right now versus actually
+        # landing rows. Leaving `dest_config["partition_spec"]` as an
+        # explicit escape hatch: an operator who deliberately configures a
+        # LINEAR transform (identity/truncate/day/etc, not bucket) still
+        # gets it applied via `_build_partition_spec_from_arrow` below.
+        if False and not partition_spec_cfg:
             # Prefer explicit pk_col; fall back to identifier_fields[0].
             resolved_pk = pk_col
             if not resolved_pk:
@@ -762,6 +907,18 @@ def _get_or_create_table(catalog, namespace: str, table_name: str,
                     "partition (v1.3.6)",
                     namespace, table_name, resolved_pk,
                 )
+        # 2026-07-24 fix: build a real, correctly-ID'd Schema (see
+        # _arrow_schema_to_iceberg_schema_with_ids docstring) whenever a
+        # partition spec is actually being created, so its field ids match
+        # what _build_partition_spec_from_arrow assumes. For the plain
+        # unpartitioned case (no pk known / not creating a spec) keep
+        # passing the raw arrow_schema -- create_table()'s own WithoutIDs +
+        # fresh-id-assignment path works fine when there's no partition
+        # spec to reconcile ids against.
+        if partition_spec_cfg:
+            create_schema, _ = _arrow_schema_to_iceberg_schema_with_ids(arrow_schema)
+        else:
+            create_schema = arrow_schema
         partition_spec = _build_partition_spec_from_arrow(arrow_schema, partition_spec_cfg)
         props = _build_table_properties(dest_config)
         # PyIceberg 0.7.1: Catalog.create_table() does NOT accept an
@@ -777,12 +934,32 @@ def _get_or_create_table(catalog, namespace: str, table_name: str,
         # does not depend on schema-level identifier fields. When the project
         # upgrades to PyIceberg >= 0.11, switch to `table.upsert(join_cols=...)`
         # and re-enable schema-level identifier fields here.
-        return catalog.create_table(
-            identifier=f"{namespace}.{table_name}",
-            schema=arrow_schema,
-            partition_spec=partition_spec,
-            properties=props,
-        )
+        try:
+            return catalog.create_table(
+                identifier=f"{namespace}.{table_name}",
+                schema=create_schema,
+                partition_spec=partition_spec,
+                properties=props,
+            )
+        except Exception as exc:
+            # Confirmed live (v1.3.8, on top of the Bug #17 bootstrap lock
+            # below): when the bootstrap-lock winner's create_table() is
+            # itself slow (tenacity retries against Nessie), BOOTSTRAP_WAIT_S
+            # can elapse for every losing partition at once, and the
+            # write_arrow_to_file timeout fallback used to send them all
+            # straight into a direct commit simultaneously -- reproducing
+            # the exact "K writers race to create the same table" storm the
+            # bootstrap lock exists to prevent. Nessie's REST catalog returns
+            # a plain 400 Bad Request for a losing concurrent /tables POST
+            # (not the 409 TableAlreadyExistsError PyIceberg's own retry path
+            # expects), so it propagated as a hard failure and permanently
+            # dead-lettered 3 of 6 partitions (rows_written=0) on a
+            # brand-new table. Regardless of which writer actually won, the
+            # table now exists -- load it instead of failing the partition.
+            try:
+                return _use_fast_io(catalog.load_table(f"{namespace}.{table_name}"), dest_config)
+            except Exception:
+                raise exc
 
 
 def _build_partition_spec_from_arrow(arrow_schema, partition_spec_cfg):
@@ -990,13 +1167,120 @@ class IcebergWriter:
         # durable (the bootstrap commit made it so).
         from pyiceberg.exceptions import NoSuchTableError
         try:
-            table = self.catalog.load_table(f"{self.namespace}.{table_name}")
+            table = _use_fast_io(
+                self.catalog.load_table(f"{self.namespace}.{table_name}"),
+                self.dest_config,
+            )
         except NoSuchTableError:
-            log.info("write_arrow_to_file: table %s.%s does not exist - "
-                     "bootstrapping via write_arrow (one commit)",
+            # 2026-07-24 fix (Bug #17): every one of the K parallel
+            # partitions hits this NoSuchTableError on its own first chunk
+            # SIMULTANEOUSLY at the start of a fresh load, and every one of
+            # them used to fall straight into write_arrow() -- a DIRECT,
+            # lock-protected commit -- at the same instant. That is exactly
+            # the "workers fighting to create the table" / "commit lock:
+            # could not acquire ... proceeding without lock (degraded)"
+            # storm observed live: with K=6, 5 of the 6 lose the race for
+            # _acquire_commit_lock's 60s wait budget, log a WARNING, and
+            # then proceed to commit ANYWAY in degraded mode (by design --
+            # "commit anyway rather than dead-letter"), producing repeated
+            # CommitFailedException/"snapshot id changed" conflicts that
+            # only resolve via loader.py's retry-with-backoff. This is
+            # wasted work, not a capacity problem: only ONE commit is ever
+            # needed to create the table; the other K-1 gain nothing by
+            # racing for it.
+            #
+            # Fix: serialize BOOTSTRAP OWNERSHIP with its own short-lived
+            # SETNX lock, separate from the commit-serialization lock.
+            # Exactly one partition wins and performs the one real
+            # bootstrap commit; every other partition just polls
+            # catalog.load_table() (a read, never a commit, so it cannot
+            # conflict with anything) until the table appears, then falls
+            # through to the normal lock-free staged write below -- so at
+            # most 1 commit happens for the whole table's bootstrap,
+            # regardless of K.
+            bootstrap_key = f"fusion:iceberg-bootstrap-lock:{self.connection_id}:{table_name}"
+            won_bootstrap = True
+            if self.redis_client is not None:
+                try:
+                    won_bootstrap = bool(
+                        self.redis_client.set(bootstrap_key, "1", nx=True, ex=120)
+                    )
+                except Exception:
+                    log.exception("write_arrow_to_file: bootstrap-lock SET NX failed for "
+                                  "key=%s — proceeding as if bootstrap owner (degraded)",
+                                  bootstrap_key)
+                    won_bootstrap = True
+            if won_bootstrap:
+                log.info("write_arrow_to_file: table %s.%s does not exist - "
+                         "this partition won the bootstrap lock, creating via "
+                         "write_arrow (one commit)", self.namespace, table_name)
+                self.write_arrow(arrow_tbl, table_name=table_name, pk_col=pk_col)
+                return ""
+            log.info("write_arrow_to_file: table %s.%s does not exist yet and "
+                     "another partition holds the bootstrap lock - waiting for "
+                     "it to appear instead of racing a competing commit",
                      self.namespace, table_name)
-            self.write_arrow(arrow_tbl, table_name=table_name, pk_col=pk_col)
-            return ""
+            deadline = time.monotonic() + BOOTSTRAP_WAIT_S
+            while time.monotonic() < deadline:
+                time.sleep(BOOTSTRAP_POLL_S)
+                try:
+                    table = _use_fast_io(
+                        self.catalog.load_table(f"{self.namespace}.{table_name}"),
+                        self.dest_config,
+                    )
+                    break
+                except NoSuchTableError:
+                    continue
+            else:
+                # 2026-07-25 fix: previously every losing partition that
+                # timed out here fell straight into its OWN direct
+                # write_arrow() commit. When the original bootstrap winner
+                # was itself slow (e.g. its create_table() hit internal
+                # tenacity retries against Nessie), ALL K-1 losers can hit
+                # this same timeout within moments of each other and would
+                # ALL commit at once -- reproducing the exact "K writers
+                # race to create the table" storm the bootstrap lock exists
+                # to prevent (confirmed live: 3 of 6 partitions permanently
+                # dead-lettered on one brand-new table's first sync). Try to
+                # take over bootstrap ownership via the same SETNX before
+                # committing directly: if the original winner is still
+                # working, this fails harmlessly and we re-poll instead of
+                # racing; if it died without ever creating the table (the
+                # only case this fallback is actually for), we become the
+                # sole new owner.
+                won_bootstrap_retry = True
+                if self.redis_client is not None:
+                    try:
+                        won_bootstrap_retry = bool(
+                            self.redis_client.set(bootstrap_key, "1", nx=True, ex=120)
+                        )
+                    except Exception:
+                        log.exception("write_arrow_to_file: bootstrap-lock retry SET NX "
+                                      "failed for key=%s — proceeding as owner (degraded)",
+                                      bootstrap_key)
+                        won_bootstrap_retry = True
+                if not won_bootstrap_retry:
+                    try:
+                        table = _use_fast_io(
+                            self.catalog.load_table(f"{self.namespace}.{table_name}"),
+                            self.dest_config,
+                        )
+                    except NoSuchTableError:
+                        log.warning("write_arrow_to_file: table %s.%s still missing "
+                                    "after %ds and another partition just took over "
+                                    "bootstrap ownership - deferring to write_arrow's "
+                                    "own idempotent create-or-load instead of racing",
+                                    self.namespace, table_name, BOOTSTRAP_WAIT_S)
+                        self.write_arrow(arrow_tbl, table_name=table_name, pk_col=pk_col)
+                        return ""
+                else:
+                    log.warning("write_arrow_to_file: table %s.%s still missing after "
+                                "waiting %ds - no other partition holds the bootstrap "
+                                "lock (original owner likely died) - taking over and "
+                                "committing directly", self.namespace, table_name,
+                                BOOTSTRAP_WAIT_S)
+                    self.write_arrow(arrow_tbl, table_name=table_name, pk_col=pk_col)
+                    return ""
 
         loc = table.location().rstrip("/")
         part_dir = f"{loc}/data/{partition_id}"

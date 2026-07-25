@@ -770,7 +770,17 @@ class InitialLoadTask:
 
             if kind == "arrow":
                 row_count = arrow_tbl.num_rows
-                next_pk = self._extract_pk_from_arrow(arrow_tbl, pk_col)
+                # Bug #15 fix (2026-07-24): call site was missing the
+                # required `ctype` arg added when _extract_pk_from_arrow()
+                # picked up per-source-type PK extraction -- 100% failure on
+                # every arrow-path chunk (i.e. every DuckDB-bulk-mode
+                # chunk), retried up to max_retries then dead-lettered.
+                # Never previously observed because DuckDB bulk mode always
+                # crashed earlier in the pipeline (Bug #13 ParserException,
+                # then Bug #14 full-table-scan OOM) before reaching this
+                # line. `ctype` is already in scope here (used one line
+                # below for the non-arrow path).
+                next_pk = self._extract_pk_from_arrow(arrow_tbl, pk_col, ctype)
             else:
                 row_count = len(rows)
                 next_pk = self._extract_pk(rows[-1], pk_col, ctype)
@@ -1128,11 +1138,29 @@ class InitialLoadTask:
             #       chunk ends exactly at the boundary), or
             #   (b) pk_end is None (unbounded last partition) AND a short
             #       chunk (legacy end-of-table heuristic).
-            # The empty-payload case (row_count == 0) is handled above by
-            # breaking out of the loop before reaching here. The prefetch
-            # thread is primed above only when ``not reached_end``, so a
-            # short chunk in a bounded partition still has a next fetch in
-            # flight and the loop continues.
+            # 2026-07-25 fix: the comment above claims "the empty-payload
+            # case (row_count == 0) is handled above by breaking out of the
+            # loop before reaching here" -- it is NOT. ``reached_end`` (set
+            # above) only controls whether a new prefetch thread gets
+            # started; nothing here ever reads it. When row_count == 0 on a
+            # BOUNDED partition's chunk and no prior checkpoint had advanced
+            # ``last_pk`` yet (e.g. the partition's PK range is a genuine gap
+            # with zero rows, or this is the partition's very first chunk),
+            # ``last_pk`` stays None, so ``last_pk is not None and last_pk >=
+            # pk_end`` below is False and the loop does NOT break -- it goes
+            # back to ``prefetch_q.get()`` (top of the while loop), but since
+            # ``reached_end`` correctly skipped starting a new prefetch
+            # thread, NOTHING will ever put another item on that queue.
+            # Confirmed live: a chunk_seq whose partition happened to cover a
+            # sparse region of a real table's PK space logged exactly one
+            # "0 rows" chunk and then hung forever (process state
+            # "sleeping", blocked in queue.get(), no crash, no timeout, no
+            # further checkpoint activity for 10+ minutes) -- the partition
+            # never completes and the connection's initial_load_completed
+            # never flips to true. Checking reached_end here, before the
+            # pre-existing pk_end heuristic, closes the deadlock outright.
+            if reached_end:
+                break
             if pk_end is not None:
                 if last_pk is not None and last_pk >= pk_end:
                     break
@@ -1569,16 +1597,92 @@ class InitialLoadTask:
                 pass
             return None
 
+    @staticmethod
+    def _mysql_sql_literal(value) -> str:
+        """Render a Python value as a safely-escaped MySQL SQL literal for
+        embedding into a raw pass-through query string (see Bug #14 below —
+        mysql_query() takes the query text as a single opaque string, so
+        WHERE-bound values must be embedded as literals here rather than
+        passed through DuckDB's own $-parameter binder)."""
+        if value is None:
+            return "NULL"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, (int, float)):
+            return repr(value)
+        escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+        return f"'{escaped}'"
+
     def _fetch_chunk_duckdb(self, duckdb_conn, source: dict, schema_name: str,
                             table_name: str, pk_col: str, last_pk, chunk_size: int,
                             ctype: str, pk_end=None):
         """v1.2.29 Task 1: run a range-bounded SELECT against the ATTACHed
         source via DuckDB and return the result as a pyarrow Table."""
+        # 2026-07-24 fix (Bug #13, found during DuckDB bulk-mode re-test on
+        # v1.3.6): the mysql branch used MySQL's own backtick identifier
+        # quoting, but this query string is parsed and executed by
+        # DuckDB's OWN SQL engine (duckdb_conn.execute(...)) via the
+        # ATTACHed mysql_scanner -- DuckDB's parser only accepts
+        # double-quoted identifiers, the same as the postgres branch
+        # right above it. Confirmed live: 100% reproducible
+        # `duckdb.duckdb.ParserException: Parser Error: syntax error at
+        # or near "`"` on every single chunk attempt as soon as bulk_mode
+        # actually reached a MySQL source. This exact bug (and this exact
+        # fix) was found and hotfixed earlier in this investigation's
+        # history, before this file's bug-numbering existed as a formal
+        # document -- it was never written up as its own catalogued bug,
+        # so it did not make it into the v1.3.6 release.
+        #
+        # 2026-07-24 fix (Bug #14, found immediately after fixing Bug #13):
+        # fixing the parser error exposed a much more serious problem --
+        # DuckDB's `mysql_scanner` ATTACH does NOT push WHERE/ORDER
+        # BY/LIMIT down to MySQL for a plain `SELECT ... FROM
+        # src."schema"."table" WHERE ... ORDER BY ... LIMIT ...` query.
+        # Confirmed directly on the MySQL server itself via
+        # `SHOW FULL PROCESSLIST`: the query MySQL actually received was a
+        # bare `SELECT <cols> FROM \`schema\`.\`table\`` -- no WHERE, no
+        # ORDER BY, no LIMIT at all. DuckDB was pulling the ENTIRE ~30M-row
+        # table across the wire on every single chunk fetch (x6 parallel
+        # workers), then filtering/sorting/limiting client-side, which is
+        # exactly why every partition OOMKilled within ~2.5 minutes
+        # regardless of chunk_size or partition width.
+        #
+        # Fix: for mysql sources, bypass the ATTACH-based table scan
+        # entirely and route through `mysql_query(attached_name, sql)` --
+        # a raw pass-through table function the DuckDB mysql extension
+        # exposes (confirmed present: `mysql_query`/`mysql_execute`/
+        # `mysql_clear_cache` via `duckdb_functions()`). This sends the
+        # literal SQL text straight to MySQL for execution, so MySQL's own
+        # planner uses the pkey index for the range scan + LIMIT, and only
+        # the requested rows cross the wire. Verified live in an isolated
+        # debug pod: 5,000-row bounded-range fetch completed in 1.09s,
+        # returned exactly 5,000 rows with a tight, correct pkey range
+        # (min/max exactly 5,000 apart), and peak memory stayed at ~98MB
+        # (vs. >3.2GB and climbing, still incomplete, under the old
+        # ATTACH-scan path for the same query). The postgres branch is
+        # left as-is -- DuckDB's postgres_scanner is documented to support
+        # filter/limit pushdown, and this investigation only found evidence
+        # of the missing-pushdown behavior for mysql_scanner.
+        if ctype == "mysql":
+            pk_q = f"`{pk_col}`"
+            qualified_raw = (f"`{schema_name}`.`{table_name}`"
+                              if schema_name else f"`{table_name}`")
+            where_parts: list[str] = []
+            if last_pk is not None:
+                where_parts.append(f"{pk_q} > {self._mysql_sql_literal(last_pk)}")
+            if pk_end is not None:
+                where_parts.append(f"{pk_q} <= {self._mysql_sql_literal(pk_end)}")
+            where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+            raw_sql = (f"SELECT * FROM {qualified_raw} {where_clause} "
+                       f"ORDER BY {pk_q} ASC LIMIT {int(chunk_size)}")
+            rel = duckdb_conn.execute("SELECT * FROM mysql_query('src', $1)", [raw_sql])
+            return rel.fetch_arrow_table()
+
         if ctype in ("postgres", "postgresql"):
             qualified = (f'src."{schema_name}"."{table_name}"'
                          if schema_name else f'src."{table_name}"')
             pk_q = f'"{pk_col}"'
-        else:  # mysql
+        else:
             qualified = (f'src.`{schema_name}`.`{table_name}`'
                          if schema_name else f'src.`{table_name}`')
             pk_q = f"`{pk_col}`"

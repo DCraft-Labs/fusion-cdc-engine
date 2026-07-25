@@ -4,6 +4,52 @@ All notable changes to Fusion CDC Engine (private repo) are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+
+## [1.3.7] — 2026-07-25
+
+### Post-rollout bugfixes (Bugs #1–#20 from v1.3.6 live investigation)
+
+Engine + control-plane + frontend + chart fixes that landed after the v1.3.6
+rollout. Maps 1:1 to V1.3.6_POST_ROLLOUT_BUGFIXES_REFERENCE.md.
+
+- **#1 DynamoDB catalog creds** — iceberg_writer.py / iceberg_tester.py
+  forward dynamodb.region + access-key / secret / session-token (Glue parity).
+- **#2 IRSA self-assume** — only set 
+ole_arn when requested role differs
+  from ambient AWS_ROLE_ARN.
+- **#3 auto bulk_mode** — _resolve_bulk_mode (auto/duckdb/python; Mongo→python)
+  + wizard UI fields for bulk_mode / committer_mode / drain_batch.
+- **#4 per-connection drain_batch** — --drain-batch CLI + per-target Helm
+  override of ICEBERG_COMMITTER_DRAIN_BATCH.
+- **#5 dynamic committer provisioning** — new committer_provisioner.py
+  (ensure_committer / 	eardown_committer), kubernetes==29.0.0, RBAC +
+  RELEASE_NAME / TRANSFORM_WORKER_IMAGE / COMMITTER_SERVICE_ACCOUNT env,
+  control-plane SA token automount.
+- **#6 IRSA UI copy** — optional cross-role ARN help text (not K8s SA annotation).
+- **#7/#8** — no new migration; redundant colliding Alembic head was never
+  shipped (upstream g1a2b3c4d5e6 already correct).
+- **#9 Nessie readiness** — probe URL derived from destination catalog URI.
+- **#10 _add_files_fast** — concurrent footer read + single ast_append.
+- **#11 PK coercion** — _coerce_pk / numeric-first _pk_to_score.
+- **#12 MySQL CDC** — BinLogStreamReader(blocking=True).
+- **#13** — cdc_worker/ package present (checkout hygiene; already on main).
+- **#14** — not a product bug (test key mismatch); documented only.
+- **#15 bytes JSON** — _sanitize_row / _sanitize_scalar in MySQL connector.
+- **#16 dead source recovery** — retry/backoff + inally: pop in worker.py.
+- **#17 bootstrap race** — create_table→load_table fallback + SETNX re-acquire
+  on bootstrap timeout.
+- **#18** — operational (recreate MinIO bucket after PVC wipe); no code change.
+- **#19 zero-row deadlock** — if reached_end: break in loader.py.
+- **#20** — cluster ConfigMap hotfix shadowing; ops-only, no source change.
+
+### Tests
+- 	ests/unit/test_v137_post_rollout_bugfixes.py (new)
+- 	ests/unit/test_v136_task_bulk_committer_modes.py updated for _resolve_bulk_mode
+
+### Chart
+- helm/fusion-cdc bumped to 1.3.7 (private twin; public OCI chart published
+  from dcraft-fusion).
+
 ## [1.2.38] — 2026-07-24
 
 ### Engine perf — Findings A + B (master report §6f)

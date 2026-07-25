@@ -61,6 +61,44 @@ PARTITION_SAMPLE_THRESHOLD = 1_000_000
 # Default chunk size (rows per chunk within a single partition's PK range).
 DEFAULT_CHUNK_SIZE = int(os.environ.get("INITIAL_LOAD_CHUNK_SIZE", "10000"))
 
+# When ``resource_limits.bulk_mode`` is ``"auto"`` (or unset — auto is the
+# default so users aren't forced to guess), a partition whose estimated row
+# count is at or above this threshold gets ``"duckdb"`` (the native-scanner
+# bulk path — higher throughput, more scratch-disk/CPU overhead); smaller
+# partitions get ``"python"`` (lower overhead, no DuckDB attach needed).
+# Load-tested on a 35.86M-row MySQL table: duckdb ~97k rows/sec vs python
+# ~55k rows/sec on the same table, so the crossover favors duckdb well below
+# that scale — 1M rows is a conservative default. Override globally via
+# AUTO_BULK_MODE_ROW_THRESHOLD; a connection can still force "duckdb" /
+# "python" explicitly via resource_limits.bulk_mode to bypass this entirely.
+AUTO_BULK_MODE_ROW_THRESHOLD = int(os.environ.get("AUTO_BULK_MODE_ROW_THRESHOLD", "1000000"))
+
+
+def _resolve_bulk_mode(resource_limits: dict, rows_estimated, src_connector_type: str = "") -> str | None:
+    """Resolve ``resource_limits.bulk_mode`` into the effective per-partition
+    value sent to the worker. ``"duckdb"``/``"python"`` pass through as an
+    explicit operator override. ``"auto"`` (or unset — auto is the default)
+    picks based on ``rows_estimated`` for THIS partition against
+    ``AUTO_BULK_MODE_ROW_THRESHOLD``. Returns ``None`` only when there's no
+    estimate to decide on (falls back to the worker's own env-var default).
+
+    MongoDB has no DuckDB scanner (the worker forces ``bulk_mode="none"``
+    for it regardless — see loader.py), so auto-resolution never suggests
+    "duckdb" for a mongo source; an explicit override still passes through
+    unchanged (the worker's own guard is the final authority either way).
+    """
+    mode = str((resource_limits or {}).get("bulk_mode") or "auto").lower()
+    if mode in ("duckdb", "python"):
+        return mode
+    if (src_connector_type or "").lower() in ("mongodb", "mongo"):
+        return "python"
+    if rows_estimated is None:
+        return None
+    try:
+        return "duckdb" if int(rows_estimated) >= AUTO_BULK_MODE_ROW_THRESHOLD else "python"
+    except (TypeError, ValueError):
+        return None
+
 # v1.2.27: in-process initial-load partitioning state tracker. Used by the
 # async ``retry-initial-load`` endpoint (returns 202 immediately) and the
 # ``GET /connections/{id}/initial-load/status`` endpoint. With
@@ -646,7 +684,6 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
         k = _connection_parallelism(connection)
         chunk_size = _connection_chunk_size(connection)
         _rl = connection.resource_limits or {}
-        task_bulk_mode = _rl.get("bulk_mode")
         task_committer_mode = _rl.get("committer_mode")
         src_connector_type = (source.connector_definition.connector_type
                               if source.connector_definition else "postgres")
@@ -687,10 +724,45 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
                 source_block, stream.source_schema_name or "",
                 stream.source_table_name, pk_col, src_connector_type, k,
             )
+
+            # Dynamic committer provisioning: an Iceberg destination needs a
+            # committer process draining staged files for THIS (connection,
+            # table) pair. Ensure it exists (create-or-update, idempotent)
+            # BEFORE enqueueing tasks that will stage files for it — no
+            # manual helm values.committer.targets edit + `helm upgrade`
+            # required. Never blocks/raises on failure (see
+            # committer_provisioner.ensure_committer docstring); tasks still
+            # enqueue even if provisioning couldn't run, matching the
+            # existing "producer never raises" contract for this function.
+            if dest_connector_type == "iceberg":
+                dest_table_name = stream.destination_table_name or stream.source_table_name
+                stream_rows_estimated = sum(
+                    (p.get("rows_estimated") or 0) for p in parts
+                ) or None
+                try:
+                    from app.services.committer_provisioner import ensure_committer
+                    ensure_committer(
+                        connection_id=str(connection.connection_id),
+                        table=dest_table_name,
+                        catalog_config=dest_config,
+                        resource_limits=_rl,
+                        k=k,
+                        rows_estimated_total=stream_rows_estimated,
+                        dest_namespace=stream.stream_namespace or dest_config.get("namespace") or "fusion",
+                    )
+                except Exception:
+                    log.exception(
+                        "initial_load producer: committer auto-provisioning "
+                        "failed for connection=%s table=%s — continuing to "
+                        "enqueue tasks regardless",
+                        connection.connection_id, dest_table_name,
+                    )
+
             for seq, part in enumerate(parts):
                 pk_start = part.get("pk_start")
                 pk_end = part.get("pk_end")
                 rows_estimated = part.get("rows_estimated")
+                task_bulk_mode = _resolve_bulk_mode(_rl, rows_estimated, src_connector_type)
                 task = {
                     "type": "initial_load",
                     "task_id": f"il-{connection.connection_id}-{stream.stream_id}-{seq}",
@@ -1080,9 +1152,30 @@ async def delete_connection(
     _stop_worker_streaming(connection)
     _delete_redis_cdc_keys(str(connection.source_id))
 
-    # Disable all streams for this connection
+    # Disable all streams for this connection, tearing down each stream's
+    # dynamically-provisioned Iceberg committer (see
+    # app/services/committer_provisioner.py / _enqueue_initial_load_tasks's
+    # ensure_committer call at creation/activation time). Never blocks the
+    # delete on a teardown failure — an orphaned committer Deployment is a
+    # cleanup nuisance, not a reason to fail the connection delete.
+    dest_connector_type = ""
+    if connection.destination and connection.destination.connector_definition:
+        dest_connector_type = (connection.destination.connector_definition.connector_type or "").lower()
     for stream in db.query(Stream).filter(Stream.connection_id == connection_id).all():
         stream.is_enabled = False
+        if dest_connector_type == "iceberg":
+            try:
+                from app.services.committer_provisioner import teardown_committer
+                teardown_committer(
+                    connection_id=str(connection_id),
+                    table=stream.destination_table_name or stream.source_table_name,
+                )
+            except Exception:
+                import logging as _logging
+                _logging.getLogger(__name__).exception(
+                    "delete_connection: committer teardown failed for connection=%s table=%s",
+                    connection_id, stream.destination_table_name,
+                )
 
     # Cancel any running jobs
     from app.models.monitoring import ConnectionRun

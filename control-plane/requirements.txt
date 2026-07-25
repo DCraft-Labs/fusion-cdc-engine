@@ -36,6 +36,15 @@ httpx==0.26.0
 python-dotenv==1.0.1
 requests==2.31.0
 
+# Kubernetes API client — dynamic per-connection Iceberg committer
+# provisioning (control-plane creates/updates the committer Deployment
+# directly instead of an operator hand-editing helm values.committer.targets
+# and running `helm upgrade`). Used lazily by
+# app/services/committer_provisioner.py so control-plane still boots if
+# absent (auto-provisioning is skipped with a clear log message, matching
+# the same defensive pattern as app/services/tenant_registry.py).
+kubernetes==29.0.0
+
 # GraphQL — spec §1 (P1-5)
 strawberry-graphql[fastapi]==0.219.2
 

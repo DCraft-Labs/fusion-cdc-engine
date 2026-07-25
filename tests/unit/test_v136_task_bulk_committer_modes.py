@@ -1,4 +1,8 @@
-"""v1.3.6 Bug #3 — control-plane forwards bulk_mode / committer_mode on tasks."""
+"""v1.3.6 Bug #3 / v1.3.7 Bug #3 — control-plane forwards bulk_mode / committer_mode on tasks.
+
+v1.3.7 replaced the passthrough ``_rl.get("bulk_mode")`` with
+``_resolve_bulk_mode(...)`` (auto / duckdb / python / MongoDB force-python).
+"""
 from __future__ import annotations
 
 import ast
@@ -13,7 +17,8 @@ CONNECTIONS = (
 
 def test_enqueue_reads_resource_limits_modes():
     src = CONNECTIONS.read_text(encoding="utf-8")
-    assert 'task_bulk_mode = _rl.get("bulk_mode")' in src
+    assert "def _resolve_bulk_mode" in src
+    assert 'task_bulk_mode = _resolve_bulk_mode(' in src
     assert 'task_committer_mode = _rl.get("committer_mode")' in src
     assert '"bulk_mode": task_bulk_mode' in src
     assert '"committer_mode": task_committer_mode' in src

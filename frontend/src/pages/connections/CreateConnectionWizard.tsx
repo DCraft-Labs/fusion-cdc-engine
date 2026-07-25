@@ -417,6 +417,18 @@ export function CreateConnectionWizard() {
     // stream's initial load — KEDA then scales up to K concurrent pods.
     // Default 4, range 1-16 (clamped server-side).
     parallelism: "4",
+    // Initial-load fetch engine. "auto" (default) picks duckdb/python per
+    // partition based on its estimated row count (see
+    // AUTO_BULK_MODE_ROW_THRESHOLD server-side); "duckdb"/"python" force it.
+    bulk_mode: "auto",
+    // Iceberg write path: "staged" batches file registration through the
+    // single-committer process (higher throughput, matches the committer/
+    // worker-speed fixes from the throughput investigation); "direct" writes
+    // straight from the worker without a committer.
+    committer_mode: "staged",
+    // Committer's per-cycle Redis drain batch size (pending file-commit
+    // entries committed together). Blank uses the cluster default.
+    drain_batch: "",
   });
 
   const { data: sources = [] } = useQuery({ queryKey: ["sources"], queryFn: () => fetchList("/sources", "sources") });
@@ -561,12 +573,23 @@ export function CreateConnectionWizard() {
         }),
         resource_limits:
           config.max_events_sec || config.max_memory_mb || config.parallelism
+          || config.bulk_mode || config.committer_mode || config.drain_batch
             ? {
                 max_events_sec: config.max_events_sec ? Number(config.max_events_sec) : undefined,
                 max_memory_mb: config.max_memory_mb ? Number(config.max_memory_mb) : undefined,
                 // v1.2.26: K = intra-table parallelism (number of PK-range
                 // partitions enqueued per stream for the initial load).
                 parallelism: config.parallelism ? Number(config.parallelism) : undefined,
+                // Initial-load fetch engine (duckdb/python/auto — see
+                // AUTO_BULK_MODE_ROW_THRESHOLD server-side for the auto pick).
+                bulk_mode: config.bulk_mode || undefined,
+                // Iceberg write path (staged = single-committer batching).
+                committer_mode: config.committer_mode || undefined,
+                // Committer's per-cycle Redis drain batch size; only takes
+                // effect once the committer target's Helm values entry picks
+                // it up (committer processes aren't dynamically provisioned
+                // per connection today — see resource_limits notes).
+                drain_batch: config.drain_batch ? Number(config.drain_batch) : undefined,
               }
             : {},
         status: activateImmediately ? "active" : "draft",
@@ -922,6 +945,38 @@ export function CreateConnectionWizard() {
                 <div className="space-y-1"><label className="text-xs text-muted-foreground">Max events/sec</label><Input type="number" value={config.max_events_sec} onChange={(e) => setConfig({ ...config, max_events_sec: e.target.value })} placeholder="10000" /></div>
                 <div className="space-y-1"><label className="text-xs text-muted-foreground">Max memory (MB)</label><Input type="number" value={config.max_memory_mb} onChange={(e) => setConfig({ ...config, max_memory_mb: e.target.value })} placeholder="2048" /></div>
                 <div className="space-y-1 col-span-2"><label className="text-xs text-muted-foreground">Max parallel workers (initial-load intra-table parallelism, 1-16)</label><Input type="number" min={1} max={16} value={config.parallelism} onChange={(e) => setConfig({ ...config, parallelism: e.target.value })} placeholder="4" /></div>
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">Initial-load fetch engine</label>
+                  <Select value={config.bulk_mode} onValueChange={(v) => setConfig({ ...config, bulk_mode: v })}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="auto">Auto (recommended — picks by table size)</SelectItem>
+                      <SelectItem value="duckdb">DuckDB (higher throughput, larger tables)</SelectItem>
+                      <SelectItem value="python">Python (lower overhead, smaller tables)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {isIcebergDestination && (
+                  <>
+                    <div className="space-y-1">
+                      <label className="text-xs text-muted-foreground">Iceberg write path</label>
+                      <Select value={config.committer_mode} onValueChange={(v) => setConfig({ ...config, committer_mode: v })}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="staged">Staged (single-committer batching — recommended)</SelectItem>
+                          <SelectItem value="direct">Direct (worker writes without a committer)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1 col-span-2">
+                      <label className="text-xs text-muted-foreground">Committer drain batch (optional — blank uses the cluster default)</label>
+                      <Input type="number" min={1} value={config.drain_batch} onChange={(e) => setConfig({ ...config, drain_batch: e.target.value })} placeholder="e.g. 1000" />
+                      <p className="text-[11px] text-muted-foreground">
+                        Only takes effect once this connection's committer target is provisioned with this value (see the destination's Iceberg committer setup) — it does not apply retroactively to an already-running committer.
+                      </p>
+                    </div>
+                  </>
+                )}
               </div>
             </details>
           </CardContent>

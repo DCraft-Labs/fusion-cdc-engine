@@ -26,6 +26,12 @@ class WorkerConfig(BaseSettings):
     # Concurrency
     MAX_CONCURRENT_TABLES: int = 20
 
+    # Per-source crash recovery: bounded retry with exponential backoff before
+    # giving up until the next start-streaming poll picks the source back up.
+    SOURCE_MAX_RETRIES: int = 10
+    SOURCE_RETRY_BACKOFF_BASE_SECONDS: float = 2.0
+    SOURCE_RETRY_BACKOFF_MAX_SECONDS: float = 60.0
+
     # Heartbeat interval (seconds)
     HEARTBEAT_INTERVAL: int = 30
 

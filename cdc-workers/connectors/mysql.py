@@ -29,6 +29,35 @@ from cdc_worker.event_envelope import CDCEvent, build_event
 log = logging.getLogger(__name__)
 
 
+def _sanitize_scalar(v):
+    """Decode a bytes value to str so it survives json.dumps downstream.
+
+    python-mysql-replication can hand back raw bytes for BLOB/BINARY/JSON
+    columns (and, for tables whose TABLE_MAP_EVENT lacks full metadata,
+    occasionally for the column name itself). event_envelope.to_redis_dict()
+    JSON-encodes every row unconditionally, and json.dumps refuses non-str
+    dict keys outright (default= only rescues values) — one such row used to
+    crash the entire per-source streaming task with no retry (see
+    worker._run_source), permanently killing CDC for that source until the
+    pod restarted.
+    """
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8")
+        except UnicodeDecodeError:
+            return v.hex()
+    if isinstance(v, dict):
+        return _sanitize_row(v)
+    if isinstance(v, (list, tuple, set)):
+        return [_sanitize_scalar(x) for x in v]
+    return v
+
+
+def _sanitize_row(row: dict) -> dict:
+    """Recursively coerce bytes keys/values in a binlog row dict to str."""
+    return {_sanitize_scalar(k): _sanitize_scalar(v) for k, v in row.items()}
+
+
 @contextmanager
 def _ssh_tunnel_ctx(ssh_config: dict, target_host: str, target_port: int):
     """
@@ -160,12 +189,11 @@ class MySQLConnector(BaseConnector):
     def _remap_row(self, schema: str, table: str, row: dict) -> dict:
         """Replace UNKNOWN_COLn keys with real column names if available."""
         col_list = self._col_names.get((schema, table))
-        if not col_list:
-            return row
-        # Only remap if keys look like UNKNOWN_COLn
-        if not any(k.startswith("UNKNOWN_COL") for k in row):
-            return row
-        return {col_list[i]: v for i, v in enumerate(row.values()) if i < len(col_list)}
+        if col_list and any(
+            isinstance(k, str) and k.startswith("UNKNOWN_COL") for k in row
+        ):
+            row = {col_list[i]: v for i, v in enumerate(row.values()) if i < len(col_list)}
+        return _sanitize_row(row)
 
     # ------------------------------------------------------------------
     # stream_events
@@ -230,7 +258,23 @@ class MySQLConnector(BaseConnector):
                 server_id=server_id,
                 only_events=[WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent, QueryEvent, HeartbeatLogEvent],
                 resume_stream=True,
-                blocking=False,
+                # Bug found via live testing: blocking=False makes
+                # BinLogStreamReader do a single non-blocking pass over
+                # whatever is already buffered, then its internal generator
+                # is exhausted. The surrounding `while self._running: for
+                # binlog_event in self._stream:` loop re-enters the SAME
+                # now-exhausted iterator forever — Python iterators don't
+                # reset themselves — so it never actually re-polls MySQL for
+                # new binlog data again. Net effect: the connector reports
+                # "streaming" and never errors (there's nothing to catch —
+                # it isn't failing, it's just permanently done), but zero
+                # events are ever produced after the first pass, no matter
+                # how much new data the source writes. Confirmed live: the
+                # `cdc_events_total` counter never incremented once across a
+                # 20+ hour pod lifetime. blocking=True makes the reader
+                # actually block waiting for the next binlog event, which is
+                # the correct behavior for a continuous CDC daemon.
+                blocking=True,
             )
             if log_file and log_pos:
                 kwargs["log_file"] = log_file

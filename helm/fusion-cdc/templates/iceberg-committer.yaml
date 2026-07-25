@@ -123,7 +123,7 @@ spec:
             - name: ICEBERG_COMMITTER_LOCK_TTL_S
               value: {{ $root.Values.committer.lockTtlS | quote }}
             - name: ICEBERG_COMMITTER_DRAIN_BATCH
-              value: {{ $root.Values.committer.drainBatch | quote }}
+              value: {{ $tgt.drainBatch | default $root.Values.committer.drainBatch | quote }}
             - name: ICEBERG_COMMITTER_DRAIN_TIMEOUT_MS
               value: {{ $root.Values.committer.drainTimeoutMs | quote }}
             - name: ICEBERG_COMMITTER_IDLE_SLEEP_S

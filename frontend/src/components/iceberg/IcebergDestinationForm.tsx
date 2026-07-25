@@ -245,7 +245,10 @@ export default function IcebergDestinationForm({ form, setForm }: Props) {
 
         {form.auth_mode === "irsa" && (
           <>
-            <Field label="Service account role ARN" required help="Set K8s SA annotation eks.amazonaws.com/role-arn; leave static keys empty">
+            <Field
+              label="Target role ARN (cross-account/cross-role assume, optional)"
+              help="Every worker pod runs under ONE shared, fixed AWS identity set up at platform deploy time (via IRSA) — this field cannot make a pod BECOME an arbitrary role. It is a role the platform's fixed identity will assume via STS for this connection's S3 + Glue/DynamoDB access. Only set this if it differs from the platform's own identity, AND that role's trust policy explicitly allows the platform's base role to assume it — otherwise leave blank to use the platform identity directly. Ask your platform admin for the base role ARN if you don't have it."
+            >
               <Input value={form.service_account_role_arn ?? ""} onChange={(e) => set({ service_account_role_arn: e.target.value })} />
             </Field>
             <Field label="AWS region">

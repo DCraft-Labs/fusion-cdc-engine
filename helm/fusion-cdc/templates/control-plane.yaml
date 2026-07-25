@@ -61,6 +61,19 @@ spec:
               value: "redis://{{ include "fusion-cdc.redisHost" . }}:6379/0"
             - name: CONTROL_PLANE_URL
               value: {{ include "fusion-cdc.controlPlaneURL" . | quote }}
+            # app/services/committer_provisioner.py: RELEASE_NAME reproduces
+            # the Helm committer template's naming scheme
+            # (`{release}-committer-{hash}`) so a dynamically-provisioned
+            # committer replaces the exact same object a manual
+            # committer.targets entry would have rendered. TRANSFORM_WORKER_IMAGE
+            # is the image the committer Deployment runs (same image as
+            # transform-worker — iceberg_committer.py ships in it).
+            - name: RELEASE_NAME
+              value: {{ .Release.Name | quote }}
+            - name: TRANSFORM_WORKER_IMAGE
+              value: {{ include "fusion-cdc.transformWorkerImage" . | quote }}
+            - name: COMMITTER_SERVICE_ACCOUNT
+              value: {{ printf "%s-cdc-worker-sa" .Release.Name | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
