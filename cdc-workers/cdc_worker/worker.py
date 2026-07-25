@@ -207,10 +207,24 @@ class Worker:
             if routing:
                 self._publisher.publish(event, routing=routing)
                 # Bridge into the transform-worker queue (best-effort, never raises).
+                # Bug found live (v1.3.9 CDC-streams test): publish_event()
+                # returning 0 (no route matched / route fetch failed) is NOT
+                # an exception -- the old bare except-and-debug-log here gave
+                # zero visibility into that silent no-op case, which is
+                # exactly the failure mode that made this bug hard to find.
                 try:
-                    self._bridge.publish_event(event)
-                except Exception as exc:
-                    log.debug("transform bridge skipped event %s: %s", event.event_id, exc)
+                    pushed = self._bridge.publish_event(event)
+                    if pushed == 0:
+                        log.warning(
+                            "transform bridge: 0 tasks pushed for %s.%s (source=%s) — "
+                            "no matching route resolved (or the route fetch itself failed)",
+                            event.schema_name, event.table_name, event.source_id,
+                        )
+                except Exception:
+                    log.exception(
+                        "transform bridge raised for event %s (source=%s, %s.%s)",
+                        event.event_id, event.source_id, event.schema_name, event.table_name,
+                    )
                 # Record metrics for the event
                 METRICS.record_event(
                     tenant=event.tenant_id,

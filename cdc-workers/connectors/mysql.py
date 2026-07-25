@@ -275,6 +275,23 @@ class MySQLConnector(BaseConnector):
                 # actually block waiting for the next binlog event, which is
                 # the correct behavior for a continuous CDC daemon.
                 blocking=True,
+                # Bug #23 (found live, this test run): pymysqlreplication's
+                # RowsEvent._read_string() decodes every string/text column
+                # with errors="strict" by default. Confirmed live against
+                # this table's real, pre-existing data (row count matched
+                # the clean baseline — not test-batch debris): one or more
+                # historical rows contain bytes that aren't valid UTF-8 in a
+                # varchar/text column despite the table's declared utf8mb4
+                # charset (a common real-world mismatch — e.g. a row
+                # inserted under a different client charset at some point).
+                # This crashed the ENTIRE binlog stream every retry, always
+                # on the same row (the checkpoint position doesn't move past
+                # a crash), permanently blocking CDC for this source.
+                # ignore_decode_errors=True is pymysqlreplication's own
+                # supported knob for exactly this (decode_errors="ignore"
+                # instead of "strict") — skips the bad bytes in that one
+                # field rather than crashing the whole stream.
+                ignore_decode_errors=True,
             )
             if log_file and log_pos:
                 kwargs["log_file"] = log_file

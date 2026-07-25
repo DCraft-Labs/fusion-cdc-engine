@@ -10,6 +10,14 @@ pyarrow==16.0.0
 polars==0.20.23
 pyiceberg[glue,s3]==0.7.1
 requests==2.31.0
+# v1.3.9: cdc_stream_consumer.py's _get_batch_config() calls the
+# control-plane's internal cdc-batch-config endpoint via httpx (matching
+# the same client already used by cdc-workers/control-plane for their own
+# internal-API calls). Confirmed live this was missing: every fetch failed
+# with "No module named 'httpx'", silently caught and falling back to the
+# per_event default -- meaning a connection's configured cdc_batch_mode=
+# per_batch was never actually being honored.
+httpx==0.26.0
 paramiko==3.4.0
 cryptography==42.0.7
 SQLAlchemy==2.0.30

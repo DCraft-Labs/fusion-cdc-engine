@@ -5,6 +5,37 @@ This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
 
+## [1.4.0] - 2026-07-26
+
+### Bug #23 - MySQL binlog UnicodeDecodeError permanently blocks CDC
+
+`BinLogStreamReader` decoded string/text columns with `errors="strict"`
+by default. Real production rows with non-UTF-8 bytes in varchar/text
+(despite utf8mb4 table charset) crashed the entire MySQL connector on the
+same row every retry — the binlog checkpoint never advances past a crash.
+Set `ignore_decode_errors=True` so pymysqlreplication uses
+`decode_errors="ignore"` for that field instead of killing the stream.
+
+### Bug #24 - transform-worker missing `httpx` (`cdc_batch_mode` ignored)
+
+`cdc_stream_consumer._get_batch_config()` calls the control-plane
+`cdc-batch-config` endpoint via `httpx`, but `httpx` was never in
+`transform-worker/requirements.txt`. Every fetch failed with
+`No module named 'httpx'`, was silently caught, and fell back to
+`per_event` — so `cdc_batch_mode=per_batch` was never honored.
+Added `httpx==0.26.0`.
+
+### Observability - transform bridge 0-push / exception visibility
+
+`TransformBridge.publish_event()` returns `0` when no route matches
+(or route fetch fails) without raising. The old bare `except` +
+`log.debug` produced zero visibility into that silent no-op. Log
+`warning` when 0 tasks are pushed and `exception` (full traceback)
+when the bridge raises.
+
+### Chart
+- helm/fusion-cdc bumped to 1.4.0.
+
 ## [1.3.9] - 2026-07-26
 
 ### Bug #22 - TransformRoute missing `source` field (100% CDC to Iceberg write failure)
