@@ -234,7 +234,7 @@ class TestStageArrowToPendingPKColWiring(unittest.TestCase):
         table.transaction.return_value = tx_cm
         committer = IcebergCommitter(catalog, rc, "c", "t")
         dedup_calls = []
-        def fake_dedup(t, pk_col, rmin, rmax, entry):
+        def fake_dedup(table_name, t, pk_col, rmin, rmax, entry):
             dedup_calls.append((pk_col, rmin, rmax, entry.get("file_path")))
         with patch.object(IcebergCommitter, "_dedup_one_range",
                           side_effect=fake_dedup):
