@@ -4,6 +4,40 @@ All notable changes to Fusion CDC Engine are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/) and
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-07-28
+
+### Phase 0–3c — Resource admission, autoscaling, and committer consolidation
+
+Resource pool config CRUD + admission preview/confirm (tier S/M/L/XL from
+row estimates, aggressive/normal/saver modes) backed by a Redis reservation
+ledger. CDC worker source-assignment / sharding rebalance, direct StatefulSet
+autoscaling (replaces reliance on external scale-only ops), transform-worker
+replica scaling owned by control-plane (KEDA ScaledObject removed from the
+k8s base manifest), and live Iceberg committer CPU/memory resize.
+
+### Control plane
+- New: `resource_config` API/models/schemas, `resource_admission`,
+  `resource_ledger`, `source_assignment`, `cdc_worker_autoscaler`,
+  `transform_scaler`, `committer_resizer`.
+- `connections` / `sources` / `internal` / `committer_provisioner`
+  wired for admission + per-connection committers.
+- Alembic `h2b3c4d5e6f7_add_resource_config`.
+
+### Frontend
+- Resource Config settings page; wizard / sidebar / layout wiring.
+
+### Workers / Helm / k8s
+- Committer CLI `--tables` (comma-separated); Helm iceberg-committer args
+  updated. Transform-worker base manifest: control-plane owns replicas;
+  retired `NORMAL_PRIORITY_QUEUE` env.
+
+### Tests / CI
+- Unit tests for admission, ledger, autoscaler, scaler, resizer, source
+  assignment; publish-images workflow runs Phase 2 source-assignment tests.
+
+### Chart
+- helm/fusion-cdc bumped to 1.5.0.
+
 
 ## [1.4.0] - 2026-07-26
 

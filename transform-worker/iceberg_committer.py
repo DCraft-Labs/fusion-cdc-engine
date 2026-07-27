@@ -96,6 +96,24 @@ def _add_files_fast(table, tx, file_paths: list, max_workers: int = _ADD_FILES_M
 # Redis key templates (kept as class attrs so tests can introspect).
 _PENDING_KEY = "fusion:iceberg-pending-files:{conn}:{table}"
 _COMMITTED_KEY = "fusion:iceberg-committed-files:{conn}:{table}"
+# Phase 3b (control-plane committer resizing): the "cheap, frequent,
+# no-restart" lever control-plane's committer_resizer reconcile loop
+# drives is THIS process's own add_files() concurrency (see
+# _add_files_fast's ThreadPoolExecutor above) — the only real per-cycle
+# concurrency knob this committer has, since run_cycle()/run_loop() below
+# drain each of a connection's tables strictly SEQUENTIALLY (a plain
+# `for t in self.table_names` loop — there is no cross-table threading to
+# tune). Control-plane writes a per-connection override to this key on its
+# own cadence (see control-plane/app/services/committer_resizer.py);
+# _refresh_add_files_concurrency() polls it once per drain cycle so a
+# running committer picks up a new value WITHOUT a pod restart, unlike the
+# CPU/memory resource lever (which necessarily restarts the pod).
+_CONCURRENCY_KEY = "fusion:iceberg-committer-concurrency:{conn}"
+# Defensive clamps applied on READ, independent of whatever bounds
+# control-plane itself enforces before writing — this process never
+# trusts an externally-written Redis value blindly.
+_CONCURRENCY_MIN = 2
+_CONCURRENCY_MAX = 32
 # v1.3.0 Fix 3: sorted set of committed PK ranges, scored by min_pk, each
 # member a JSON {min, max, file_path}. Used by the committer to detect
 # overlap between an incoming file's pk_range and any already-committed
@@ -135,6 +153,14 @@ def lock_key(connection_id: str, table_name: str) -> str:
 
 def committed_pk_ranges_key(connection_id: str, table_name: str) -> str:
     return _COMMITTED_PK_RANGES_KEY.format(conn=connection_id, table=table_name)
+
+
+def concurrency_key(connection_id: str) -> str:
+    """Redis key control-plane's committer_resizer writes the desired
+    add_files() concurrency to for this CONNECTION's committer process
+    (per-connection, not per-table — the whole process shares one
+    ThreadPoolExecutor sizing, same as the pre-Phase-3b env var did)."""
+    return _CONCURRENCY_KEY.format(conn=connection_id)
 
 
 def _pk_to_score(pk) -> float:
@@ -332,7 +358,22 @@ def list_pending(redis_client, connection_id: str, table_name: str,
 
 
 class IcebergCommitter:
-    """Single-committer for one (connection_id, table_name) pair.
+    """Committer for a CONNECTION, draining one or more of its tables'
+    staged Parquet files into Iceberg from a single shared process.
+
+    v1.4.x Phase 1 (committer consolidation): previously one committer
+    PROCESS existed per (connection_id, table_name) pair. That changed
+    so ONE process now drains every table belonging to a connection —
+    but only the PROCESS boundary moved. Every Redis key (pending list,
+    lock, committed set, committed-pk-ranges) is still scoped per
+    (connection_id, table_name) exactly as before, and each per-table
+    method below takes an explicit ``table_name`` argument (defaulting to
+    the first/only entry in ``table_names`` so single-table callers and
+    the pre-consolidation test suite keep working unchanged).
+    ``catalog.load_table()`` was already called per-table inside one
+    process (to support the orphan sweep / dedup-on-PK paths), so one
+    shared ``catalog`` instance draining multiple tables' pending lists
+    is additive, not a redesign of that part.
 
     The committer is intentionally stateless across calls - all shared
     state lives in Redis (pending list, committed set, lock) so any pod
@@ -344,17 +385,41 @@ class IcebergCommitter:
     """
 
     def __init__(self, catalog, redis_client, connection_id: str,
-                 table_name: str, namespace: str = "fusion",
+                 table_names, namespace: str = "fusion",
+                 table_namespaces: dict | None = None,
                  lock_ttl_s: int = _DEFAULT_LOCK_TTL_S,
                  drain_batch: int = _DEFAULT_DRAIN_BATCH,
                  drain_timeout_ms: int = _DEFAULT_DRAIN_TIMEOUT_MS,
                  idle_sleep_s: float = _DEFAULT_IDLE_SLEEP_S,
-                 mark_durable=None):
+                 mark_durable=None,
+                 add_files_max_workers: int | None = None):
         self.catalog = catalog
         self.redis = redis_client
         self.connection_id = connection_id
-        self.table_name = table_name
+        # Phase 3b: runtime-adjustable add_files() concurrency (see
+        # _CONCURRENCY_KEY above). Seeded from the constructor arg (falls
+        # back to the module-level env-var default, preserving the exact
+        # pre-Phase-3b behavior for any caller that doesn't pass it) and
+        # re-read from Redis once per drain cycle by
+        # _refresh_add_files_concurrency() — no pod restart required to
+        # change it, unlike CPU/memory (see committer_provisioner.py).
+        self.add_files_max_workers = int(add_files_max_workers or _ADD_FILES_MAX_WORKERS)
+        # Accept either a single table name (str — the pre-consolidation
+        # shape, kept for backward compatibility with existing callers/
+        # tests) or a list of table names (the new per-connection shape).
+        # Always stored internally as a list.
+        if isinstance(table_names, str):
+            table_names = [table_names]
+        self.table_names = list(table_names)
         self.namespace = namespace
+        # A connection's streams can each override their destination
+        # namespace (``stream.stream_namespace`` in the control-plane), so
+        # even though one committer process now drains every table of a
+        # connection, individual tables may still resolve to different
+        # Iceberg namespaces. ``table_namespaces`` is an optional
+        # ``{table_name: namespace}`` override map; any table absent from
+        # it falls back to the shared ``namespace`` default.
+        self.table_namespaces = dict(table_namespaces or {})
         self.lock_ttl_s = lock_ttl_s
         self.drain_batch = drain_batch
         self.drain_timeout_ms = drain_timeout_ms
@@ -362,18 +427,68 @@ class IcebergCommitter:
         self.mark_durable = mark_durable  # callable(entry) -> None
         self._lock_token = str(uuid.uuid4())
 
+    def _namespace_for(self, table_name: str) -> str:
+        """Resolve the Iceberg namespace for ``table_name``: an explicit
+        per-table override from ``table_namespaces`` if set, else the
+        committer's shared default ``namespace``."""
+        return self.table_namespaces.get(table_name, self.namespace)
+
+    @property
+    def table_name(self):
+        """Backward-compat accessor: the first (or only) configured table.
+        Kept so pre-consolidation single-table callers/tests that read
+        ``committer.table_name`` keep working."""
+        return self.table_names[0] if self.table_names else None
+
+    def _default_table(self, table_name) :
+        table_name = table_name or self.table_name
+        if table_name is None:
+            raise ValueError("IcebergCommitter has no tables configured")
+        return table_name
+
+    # ── Runtime-adjustable concurrency (Phase 3b hot-reload) ─────────────
+    def _refresh_add_files_concurrency(self) -> None:
+        """Poll ``concurrency_key`` for a control-plane-written override of
+        ``add_files_max_workers``. Best-effort: any Redis error or missing/
+        invalid value leaves the current setting untouched (never raises,
+        never blocks a drain cycle on this). Called once per
+        ``run_cycle()`` — cheap (one GET) relative to the drain/commit work
+        the rest of the cycle does, so polling every cycle (rather than on
+        a coarser timer) is fine and keeps this genuinely "frequent"."""
+        if self.redis is None:
+            return
+        try:
+            raw = self.redis.get(concurrency_key(self.connection_id))
+        except Exception:
+            return
+        if raw is None:
+            return
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            log.warning("committer: ignoring non-integer concurrency override %r for connection=%s",
+                        raw, self.connection_id)
+            return
+        clamped = max(_CONCURRENCY_MIN, min(_CONCURRENCY_MAX, value))
+        if clamped != self.add_files_max_workers:
+            log.info("committer: add_files concurrency %d -> %d (connection=%s, hot-reload, no restart)",
+                      self.add_files_max_workers, clamped, self.connection_id)
+            self.add_files_max_workers = clamped
+
     # ── Redis lock (short batching window, NOT per-chunk) ────────────────
-    def _acquire_lock(self) -> bool:
+    def _acquire_lock(self, table_name: str | None = None) -> bool:
         if self.redis is None:
             return True
-        key = lock_key(self.connection_id, self.table_name)
+        table_name = self._default_table(table_name)
+        key = lock_key(self.connection_id, table_name)
         return bool(self.redis.set(key, self._lock_token, nx=True,
                                     ex=self.lock_ttl_s))
 
-    def _release_lock(self) -> None:
+    def _release_lock(self, table_name: str | None = None) -> None:
         if self.redis is None:
             return
-        key = lock_key(self.connection_id, self.table_name)
+        table_name = self._default_table(table_name)
+        key = lock_key(self.connection_id, table_name)
         # Only delete if we still hold the token (Lua compare-and-delete).
         script = (
             "if redis.call('get', KEYS[1]) == ARGV[1] then "
@@ -389,26 +504,30 @@ class IcebergCommitter:
             except Exception:
                 pass
 
-    # ── Core: drain + commit ─────────────────────────────────────────────
-    def drain_and_commit(self) -> dict:
-        """Drain up to ``drain_batch`` pending entries and register them in
+    # ── Core: drain + commit (one table) ─────────────────────────────────
+    def drain_and_commit(self, table_name: str | None = None) -> dict:
+        """Drain up to ``drain_batch`` pending entries for ``table_name``
+        (defaults to the first/only configured table, for backward
+        compatibility with single-table callers) and register them in
         ONE Iceberg transaction. Returns a summary dict:
         ``{drained, committed, skipped_duplicate, committed_paths,
         errors}``."""
+        table_name = self._default_table(table_name)
         result = {"drained": 0, "committed": 0, "skipped_duplicate": 0,
                   "committed_paths": [], "errors": []}
-        if not self._acquire_lock():
-            log.debug("committer lock held by another pod - skipping this cycle")
+        if not self._acquire_lock(table_name):
+            log.debug("committer lock held by another pod - skipping this "
+                      "cycle (table=%s)", table_name)
             return result
         try:
             entries = list_pending(self.redis, self.connection_id,
-                                   self.table_name,
+                                   table_name,
                                    count=self.drain_batch,
                                    timeout_ms=self.drain_timeout_ms)
             if not entries:
                 return result
             result["drained"] = len(entries)
-            committed = self._commit_entries(entries, result)
+            committed = self._commit_entries(table_name, entries, result)
             # On success, mark each committed entry durable.
             if self.mark_durable is not None:
                 for e in committed:
@@ -417,10 +536,10 @@ class IcebergCommitter:
                     except Exception:
                         log.exception("mark_durable failed for entry %s", e)
         finally:
-            self._release_lock()
+            self._release_lock(table_name)
         return result
 
-    def _commit_entries(self, entries: list[dict], result: dict) -> list[dict]:
+    def _commit_entries(self, table_name: str, entries: list[dict], result: dict) -> list[dict]:
         """Filter duplicates, open ONE transaction, add_files() each path,
         commit once, SADD committed paths. Returns the list of entries
         that were actually committed (for durable-marking).
@@ -438,7 +557,7 @@ class IcebergCommitter:
         # At-most-once: skip any path already in the committed set (e.g.
         # a committer restart that re-discovered a file it already
         # registered in a prior cycle).
-        committed_set = committed_key(self.connection_id, self.table_name)
+        committed_set = committed_key(self.connection_id, table_name)
         to_commit = []
         for e in entries:
             path = e.get("file_path")
@@ -531,7 +650,7 @@ class IcebergCommitter:
         for e in to_commit:
             pk_range = e.get("pk_range")
             overlaps = _find_overlapping_committed_ranges(
-                self.redis, self.connection_id, self.table_name, pk_range)
+                self.redis, self.connection_id, table_name, pk_range)
             if not overlaps:
                 # v1.3.4 Fix 3: a same-batch partial-overlap entry that has
                 # no committed-range overlap still needs dedup-on-PK before
@@ -570,10 +689,10 @@ class IcebergCommitter:
             result["skipped_duplicate"] += 1
             log.info("committer: skipping PK-duplicate (fully contained) %s",
                      e.get("file_path"))
-            self._delete_staged_file(e.get("file_path"), result)
+            self._delete_staged_file(table_name, e.get("file_path"), result)
         # (a) run dedup-on-PK for overlapping-but-not-contained entries.
         if dedup_before_commit:
-            self._dedup_overlapping_entries(dedup_before_commit, result)
+            self._dedup_overlapping_entries(table_name, dedup_before_commit, result)
             register_clean.extend(dedup_before_commit)
         if not register_clean:
             return []
@@ -582,17 +701,22 @@ class IcebergCommitter:
         try:
             _t0 = time.perf_counter()
             table = self.catalog.load_table(
-                f"{self.namespace}.{self.table_name}")
+                f"{self._namespace_for(table_name)}.{table_name}")
             load_table_ms = (time.perf_counter() - _t0) * 1000.0
         except Exception as e:
             result["errors"].append({"phase": "load_table", "error": str(e)})
             # Re-enqueue the entries so the next cycle retries.
-            self._reenqueue(register_clean)
+            self._reenqueue(table_name, register_clean)
             return []
         try:
             _t1 = time.perf_counter()
             with table.transaction() as tx:
-                _add_files_fast(table, tx, [e["file_path"] for e in register_clean])
+                # Phase 3b: max_workers is now this instance's runtime-
+                # adjustable self.add_files_max_workers (see
+                # _refresh_add_files_concurrency) rather than always the
+                # module-level _ADD_FILES_MAX_WORKERS default.
+                _add_files_fast(table, tx, [e["file_path"] for e in register_clean],
+                                 max_workers=self.add_files_max_workers)
                 add_files_ms = (time.perf_counter() - _t1) * 1000.0
                 _t2 = time.perf_counter()
             # commit_transaction runs on context-manager exit
@@ -600,7 +724,7 @@ class IcebergCommitter:
             log.info(
                 "committer: commit phase timing table=%s files_in_batch=%d "
                 "load_table_ms=%.1f add_files_ms=%.1f commit_ms=%.1f",
-                self.table_name, len(register_clean),
+                table_name, len(register_clean),
                 load_table_ms, add_files_ms, commit_ms,
             )
             # Commit succeeded - record each path in the committed set
@@ -614,7 +738,7 @@ class IcebergCommitter:
                                 "(dedup across restarts degraded)")
                 for e in register_clean:
                     _record_committed_pk_range(
-                        self.redis, self.connection_id, self.table_name,
+                        self.redis, self.connection_id, table_name,
                         e.get("pk_range"), e["file_path"])
             result["committed"] = len(register_clean)
             result["committed_paths"].extend(committed_paths)
@@ -623,10 +747,10 @@ class IcebergCommitter:
             log.exception("committer: add_files transaction failed (%s) - "
                           "re-enqueueing %d entries for retry", e, len(register_clean))
             result["errors"].append({"phase": "add_files", "error": str(e)})
-            self._reenqueue(register_clean)
+            self._reenqueue(table_name, register_clean)
             return []
 
-    def _delete_staged_file(self, file_path: str, result: dict) -> None:
+    def _delete_staged_file(self, table_name: str, file_path: str, result: dict) -> None:
         """Best-effort delete of a staged-but-skipped Parquet file from the
         object store (pure PK duplicate). Failures are logged but not
         fatal — an orphan sweep will reconcile later."""
@@ -634,7 +758,7 @@ class IcebergCommitter:
             return
         try:
             table = self.catalog.load_table(
-                f"{self.namespace}.{self.table_name}")
+                f"{self._namespace_for(table_name)}.{table_name}")
             try:
                 table.io.delete(file_path)
             except Exception as de:
@@ -643,7 +767,7 @@ class IcebergCommitter:
         except Exception as le:
             log.debug("committer: load_table for delete failed (%s)", le)
 
-    def _dedup_overlapping_entries(self, entries: list[dict],
+    def _dedup_overlapping_entries(self, table_name: str, entries: list[dict],
                                     result: dict) -> None:
         """Run dedup-on-PK against the table for the overlapping PK ranges
         so the incoming file's rows replace the already-committed rows in
@@ -668,7 +792,7 @@ class IcebergCommitter:
             return
         try:
             table = self.catalog.load_table(
-                f"{self.namespace}.{self.table_name}")
+                f"{self._namespace_for(table_name)}.{table_name}")
         except Exception as e:
             log.warning("committer: dedup-on-PK load_table failed (%s) — "
                         "entries will register without dedup", e)
@@ -681,9 +805,9 @@ class IcebergCommitter:
                 rmin, rmax = pk_range[0], pk_range[1]
             except Exception:
                 continue
-            self._dedup_one_range(table, pk_col, rmin, rmax, e)
+            self._dedup_one_range(table_name, table, pk_col, rmin, rmax, e)
 
-    def _dedup_one_range(self, table, pk_col: str, rmin, rmax,
+    def _dedup_one_range(self, table_name: str, table, pk_col: str, rmin, rmax,
                          entry: dict) -> None:
         """Delete rows in [rmin, rmax] from the table (delete-then-register).
         Tries the discrete-key path via iceberg_writer._dedup_on_pk (reading
@@ -713,7 +837,7 @@ class IcebergCommitter:
             return
         # Path 1: read the staged file's PK column and use the existing
         # _dedup_on_pk discrete-key delete.
-        keys = self._extract_pk_values_from_staged_file(entry, pk_col)
+        keys = self._extract_pk_values_from_staged_file(table_name, entry, pk_col)
         if keys:
             try:
                 from iceberg_writer import _dedup_on_pk
@@ -734,7 +858,7 @@ class IcebergCommitter:
                         "entry will register; compaction will reconcile",
                         entry.get("file_path"), de)
 
-    def _extract_pk_values_from_staged_file(self, entry: dict,
+    def _extract_pk_values_from_staged_file(self, table_name: str, entry: dict,
                                              pk_col: str) -> list:
         """Best-effort read of the PK column from the staged Parquet file.
         Returns [] on any failure (the range-delete fallback handles it)."""
@@ -744,7 +868,7 @@ class IcebergCommitter:
         try:
             import pyarrow.parquet as pq
             table = self.catalog.load_table(
-                f"{self.namespace}.{self.table_name}")
+                f"{self._namespace_for(table_name)}.{table_name}")
             with table.io.open_input_file(file_path) as f:
                 pf = pq.ParquetFile(f)
                 tbl = pf.read()
@@ -753,12 +877,12 @@ class IcebergCommitter:
         except Exception:
             return []
 
-    def _reenqueue(self, entries: list[dict]) -> None:
+    def _reenqueue(self, table_name: str, entries: list[dict]) -> None:
         """Put entries back on the pending list (head) so the next cycle
         retries them. Uses LPUSH so they're processed before newer entries."""
         if self.redis is None or not entries:
             return
-        key = pending_key(self.connection_id, self.table_name)
+        key = pending_key(self.connection_id, table_name)
         for e in entries:
             try:
                 self.redis.lpush(key, json.dumps(e, default=str))
@@ -766,11 +890,16 @@ class IcebergCommitter:
                 log.exception("committer: re-enqueue failed for entry %s", e)
 
     # ── Orphan-file sweep (crash recovery) ───────────────────────────────
-    def orphan_sweep(self, register: bool = True) -> dict:
+    def orphan_sweep(self, table_name: str | None = None, register: bool = True) -> dict:
         """List Parquet files under ``table.location()/data/`` not yet in
         any manifest, cross-check against the pending list + committed
         set, and either register orphans via add_files() (if register) or
         delete them. Returns a summary dict.
+
+        ``table_name`` defaults to the first/only configured table (for
+        backward compatibility with single-table callers); use
+        ``orphan_sweep_all`` to sweep every table of a multi-table
+        connection.
 
         This is the crash-recovery reconciliation pass: a file written to
         the object store but never committed is inert (add_files() hasn't
@@ -779,10 +908,11 @@ class IcebergCommitter:
         or deletes them if they correspond to a chunk that was
         re-processed.
         """
+        table_name = self._default_table(table_name)
         result = {"orphans": [], "registered": 0, "deleted": 0, "errors": []}
         try:
             table = self.catalog.load_table(
-                f"{self.namespace}.{self.table_name}")
+                f"{self._namespace_for(table_name)}.{table_name}")
         except Exception as e:
             result["errors"].append({"phase": "load_table", "error": str(e)})
             return result
@@ -798,7 +928,7 @@ class IcebergCommitter:
         # Cross-check committed set: a path in the committed set but not in
         # a manifest is a real orphan (commit happened in our bookkeeping
         # but the catalog lost it - rare, but handle it).
-        committed_set = committed_key(self.connection_id, self.table_name)
+        committed_set = committed_key(self.connection_id, table_name)
         to_register = []
         for path in orphans:
             already_committed = False
@@ -832,7 +962,7 @@ class IcebergCommitter:
         if to_register:
             try:
                 with table.transaction() as tx:
-                    _add_files_fast(table, tx, to_register)
+                    _add_files_fast(table, tx, to_register, max_workers=self.add_files_max_workers)
                 if self.redis is not None:
                     try:
                         self.redis.sadd(committed_set, *to_register)
@@ -886,16 +1016,59 @@ class IcebergCommitter:
             pass
         return out
 
+    def orphan_sweep_all(self, register: bool = True) -> dict:
+        """Run ``orphan_sweep`` for every table in ``table_names``,
+        isolating each table's failure from the others (a sweep exception
+        for one table must not skip the sweep for the connection's other
+        tables). Returns ``{table_name: result}``."""
+        out: dict[str, dict] = {}
+        for t in self.table_names:
+            try:
+                out[t] = self.orphan_sweep(t, register=register)
+            except Exception as e:
+                log.exception("committer: orphan_sweep failed for table=%s "
+                              "(connection=%s) — continuing with the "
+                              "connection's other tables", t, self.connection_id)
+                out[t] = {"orphans": [], "registered": 0, "deleted": 0,
+                          "errors": [{"phase": "orphan_sweep", "error": str(e)}]}
+        return out
+
     # ── Run loop (for a dedicated committer process/sidecar) ────────────
+    def run_cycle(self) -> dict:
+        """Run ONE drain-and-commit cycle across EVERY table in
+        ``table_names``. One table's commit failure is isolated (logged,
+        recorded as an error result) and never stops the other tables in
+        the connection from draining during the same cycle. Returns
+        ``{table_name: result}``."""
+        results: dict[str, dict] = {}
+        # Phase 3b: pick up any control-plane-driven concurrency change
+        # once per cycle, before draining any table this cycle.
+        self._refresh_add_files_concurrency()
+        for t in self.table_names:
+            try:
+                results[t] = self.drain_and_commit(t)
+            except Exception as e:
+                log.exception("committer: drain_and_commit failed for "
+                              "table=%s (connection=%s) — continuing with "
+                              "the connection's other tables", t,
+                              self.connection_id)
+                results[t] = {"drained": 0, "committed": 0,
+                              "skipped_duplicate": 0, "committed_paths": [],
+                              "errors": [{"phase": "drain_and_commit",
+                                          "error": str(e)}]}
+        return results
+
     def run_loop(self, max_cycles: int | None = None) -> None:
-        """Drain-and-commit loop. Sleeps ``idle_sleep_s`` when there's
-        nothing to drain. If ``max_cycles`` is set, stops after that many
-        cycles (useful for tests)."""
+        """Drain-and-commit loop across every table this committer's
+        connection owns. Sleeps ``idle_sleep_s`` when a cycle drained
+        nothing for ANY table. If ``max_cycles`` is set, stops after that
+        many cycles (useful for tests)."""
         cycle = 0
         while True:
-            r = self.drain_and_commit()
+            results = self.run_cycle()
             cycle += 1
-            if r["drained"] == 0:
+            any_drained = any(r.get("drained", 0) for r in results.values())
+            if not any_drained:
                 time.sleep(self.idle_sleep_s)
             if max_cycles is not None and cycle >= max_cycles:
                 return
@@ -919,8 +1092,30 @@ if __name__ == "__main__":  # pragma: no cover - manual sidecar entry
 
     ap = argparse.ArgumentParser(description="Fusion CDC Iceberg committer")
     ap.add_argument("--connection-id", required=True)
-    ap.add_argument("--table", required=True)
-    ap.add_argument("--namespace", default="fusion")
+    # v1.4.x Phase 1 (committer consolidation): one committer process now
+    # drains ALL of a connection's iceberg-destined tables, not just one.
+    # --tables replaces the old single --table flag; it takes a
+    # comma-separated list (e.g. "orders,customers,line_items"). Each
+    # table's pending-list/lock/pk-range Redis keys stay per-table
+    # (unchanged) — only the process boundary moved to per-connection.
+    ap.add_argument("--tables", required=True,
+                    help="Comma-separated list of destination table names "
+                         "this committer drains for the connection, e.g. "
+                         "'orders,customers,line_items'.")
+    ap.add_argument("--namespace", default="fusion",
+                    help="Default Iceberg namespace for tables that don't "
+                         "have a per-table override in --table-namespaces.")
+    # A connection's streams can each override their destination namespace
+    # (stream.stream_namespace), so even one committer process per
+    # connection may need different namespaces for different tables.
+    # Optional JSON map {table_name: namespace}; tables absent from it use
+    # --namespace. Empty/unset means every table uses --namespace, matching
+    # the pre-consolidation single-namespace-per-table behavior.
+    ap.add_argument("--table-namespaces",
+                    default=os.environ.get("ICEBERG_TABLE_NAMESPACES", "{}"),
+                    help="JSON object mapping table name -> Iceberg "
+                         "namespace override, for connections whose streams "
+                         "target different namespaces per table.")
     ap.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
     # Per-connection override of the Redis drain batch size (how many
     # pending file-commit entries are popped and committed together per
@@ -954,12 +1149,23 @@ if __name__ == "__main__":  # pragma: no cover - manual sidecar entry
             '"s3_secret_access_key":"..."}).'
         )
 
+    tables = [t.strip() for t in args.tables.split(",") if t.strip()]
+    if not tables:
+        ap.error("--tables must contain at least one non-empty table name "
+                 "(got %r)" % (args.tables,))
+    try:
+        table_namespaces = json.loads(args.table_namespaces or "{}")
+    except (TypeError, ValueError):
+        ap.error("--table-namespaces must be a JSON object (got %r)" %
+                 (args.table_namespaces,))
+
     rc = redis_lib.from_url(args.redis_url)
     catalog = load_catalog(json.loads(args.catalog_config))
     committer = IcebergCommitter(catalog, rc, args.connection_id,
-                                  args.table, namespace=args.namespace,
+                                  tables, namespace=args.namespace,
+                                  table_namespaces=table_namespaces,
                                   drain_batch=args.drain_batch)
-    log.info("IcebergCommitter starting for conn=%s table=%s",
-             args.connection_id, args.table)
-    committer.orphan_sweep(register=True)
+    log.info("IcebergCommitter starting for conn=%s tables=%s",
+             args.connection_id, ",".join(tables))
+    committer.orphan_sweep_all(register=True)
     committer.run_loop()

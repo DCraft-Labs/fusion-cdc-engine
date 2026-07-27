@@ -17,6 +17,7 @@ import {
   Inbox,
   ChevronsLeft,
   ChevronsRight,
+  Cpu,
 } from "lucide-react";
 
 const navSections = [
@@ -61,6 +62,7 @@ const navSections = [
   {
     title: "ADMIN",
     items: [
+      { to: "/resource-config", icon: Cpu, label: "Resource Config" },
       { to: "/settings", icon: Settings, label: "Settings" },
     ],
   },

@@ -895,9 +895,21 @@ class InitialLoadTask:
                 elif kind == "arrow":
                     t_c0 = time.monotonic()
                     transformed = arrow_tbl.to_pylist()
-                    INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
+                    # Bug fix: this branch (bulk_mode="duckdb" + Postgres
+                    # destination) used to silently drop configured
+                    # transform_steps entirely — no execute_pipeline* call at
+                    # all, unlike the Iceberg branch above, and no warning
+                    # either. Mirror the ordinary Python-mode Postgres path
+                    # (~line 1003) now that we already have a plain row list.
                     child_tables = {}
                     transformed_schema = cached_source_schema
+                    if steps:
+                        transformed, child_tables, transformed_schema = self.engine.execute_pipeline(
+                            transformed, steps, schema=cached_source_schema,
+                        )
+                        if cached_transformed_schema is None and transformed_schema is not None:
+                            cached_transformed_schema = transformed_schema
+                    INITIAL_LOAD_CHUNK_DURATION.labels(_m_conn, _m_stream, "convert").observe(time.monotonic() - t_c0)
                     dest_dsn = _dest_dsn_from_dest(dest)
                     if not dest_dsn:
                         log.error("InitialLoad connection=%s cannot derive dest_dsn for connector_type=%s — destination block missing/incomplete. Stopping load after %d rows.",

@@ -32,6 +32,7 @@ from app.api import (
 )
 from app.api import dlq
 from app.api import settings as settings_api
+from app.api import resource_config
 from app.api.graphql import graphql_app as _graphql_router, graphql_rest_router as _graphql_rest_router
 
 # ---------------------------------------------------------------------------
@@ -277,6 +278,51 @@ def _diff_discovery_cache(old_cache: dict, new_cache: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# cdc-worker direct-scaling reconcile loop (source-count/tier sized).
+#
+# NOT SAFE TO ENABLE IN PRODUCTION YET — see
+# app/services/cdc_worker_autoscaler.py's module docstring. The real
+# StatefulSet-patching action is gated behind
+# CDC_WORKER_DIRECT_SCALING_ENABLED (default "false"); this loop always
+# RUNS and LOGS its computation regardless, so it's dry-run/observability
+# by default, not fully dormant.
+#
+# NOTE: a separate, parallel effort ("Phase 3b") is building an analogous
+# direct-scaling reconcile loop for transform-worker/committer sized by
+# queue depth. That work wasn't visible from this worktree at the time this
+# was written (no such loop existed in main.py yet) — once both land, this
+# and that task should likely be reconciled into one periodic-task
+# registration point rather than two near-identical asyncio.create_task
+# blocks in lifespan().
+# ---------------------------------------------------------------------------
+
+async def _periodic_cdc_worker_autoscale() -> None:
+    """Background asyncio task: every CDC_WORKER_RECONCILE_INTERVAL_SECONDS
+    (default 120s), reconciles each cdc-worker StatefulSet's replica count
+    against its assigned-source count/tier weight (see
+    app/services/cdc_worker_autoscaler.py)."""
+    from app.services.cdc_worker_autoscaler import (
+        CDC_WORKER_RECONCILE_INTERVAL_SECONDS,
+        reconcile_cdc_worker_replicas,
+    )
+
+    interval_seconds = CDC_WORKER_RECONCILE_INTERVAL_SECONDS
+    await asyncio.sleep(30)  # Brief startup delay before first run
+    while True:
+        try:
+            from app.database import SessionLocal
+            db = SessionLocal()
+            try:
+                reconcile_cdc_worker_replicas(db)
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.error("cdc-worker autoscale reconcile error: %s", exc, exc_info=True)
+
+        await asyncio.sleep(interval_seconds)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI lifespan — start/stop background tasks
 # ---------------------------------------------------------------------------
 
@@ -328,19 +374,46 @@ async def lifespan(app: FastAPI):
     scheduler_task = asyncio.create_task(scheduler.run(), name="scheduler")
     logger.info("Worker scheduler task started")
 
+    autoscale_task = asyncio.create_task(
+        _periodic_cdc_worker_autoscale(), name="cdc-worker-autoscale"
+    )
+    logger.info(
+        "cdc-worker direct-scaling reconcile task started "
+        "(dry-run/observability unless CDC_WORKER_DIRECT_SCALING_ENABLED=true)"
+    )
+
+    # Phase 3b: transform-worker replica autoscaling (replaces the stale
+    # KEDA ScaledObject — see app/services/transform_scaler.py) and
+    # ongoing per-connection Iceberg committer resizing (concurrency +
+    # CPU/memory — see app/services/committer_resizer.py). Both are
+    # separate asyncio background tasks, each independently
+    # leader-elected (own Redis key), mirroring the scheduler above.
+    from app.services.transform_scaler import TransformScalerService
+    from app.services.committer_resizer import CommitterResizerService
+    transform_scaler = TransformScalerService(redis_client=_redis)
+    transform_scaler_task = asyncio.create_task(transform_scaler.run(), name="transform-scaler")
+    committer_resizer = CommitterResizerService(session_factory=SessionLocal, redis_client=_redis)
+    committer_resizer_task = asyncio.create_task(committer_resizer.run(), name="committer-resizer")
+    logger.info("Transform-worker scaler and committer resizer tasks started")
+
+    # Consolidated per both the cdc-worker-autoscale and transform-scaler/
+    # committer-resizer work's own flagged TODO: this used to be three
+    # separately-written, near-identical create/cancel/await blocks (one
+    # per background task, added independently in parallel). One list +
+    # loop for all five background tasks now, instead of repeated
+    # boilerplate that would only keep growing with the next addition.
+    _background_tasks = [task, scheduler_task, autoscale_task, transform_scaler_task, committer_resizer_task]
+
     try:
         yield
     finally:
-        task.cancel()
-        scheduler_task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await scheduler_task
-        except asyncio.CancelledError:
-            pass
+        for _t in _background_tasks:
+            _t.cancel()
+        for _t in _background_tasks:
+            try:
+                await _t
+            except asyncio.CancelledError:
+                pass
         if _redis:
             await _redis.aclose()
         logger.info("Background tasks stopped")
@@ -517,6 +590,23 @@ app.include_router(
     settings_api.router,
     prefix="/api/v1/settings",
     tags=["Settings"],
+)
+
+# Resource admission-control: pool config CRUD + admission-preview/confirm.
+# The admission_router is mounted at the SAME prefix as connections.router
+# (FastAPI supports multiple routers sharing a prefix) so its paths read as
+# ``/api/v1/connections/{id}/admission-preview`` without adding those routes
+# directly inside connections.py — keeps this feature's diff fully separate
+# from the other agents' work in that file.
+app.include_router(
+    resource_config.router,
+    prefix="/api/v1/resource-config",
+    tags=["Resource Config"],
+)
+app.include_router(
+    resource_config.admission_router,
+    prefix="/api/v1/connections",
+    tags=["Admission Control"],
 )
 
 # Spec §1 (P1-5): GraphQL endpoint

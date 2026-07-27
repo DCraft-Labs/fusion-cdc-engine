@@ -317,6 +317,20 @@ async def _trigger_dag_or_worker(connection: Connection, db: Session) -> None:
     sync_type = (getattr(connection, "sync_type", "") or "").upper()
     connection_id = str(connection.connection_id)
 
+    # Resource admission control: this connection is now ACTIVE (streaming
+    # or scheduled), so it holds a standing CDC baseline reservation in the
+    # ledger for its entire lifetime (released only on delete — see
+    # delete_connection's teardown_committer block below). Idempotent
+    # (HSETNX-based) so resume / trigger-sync re-calling this function
+    # doesn't double-reserve. Never blocks activation on a ledger/Redis
+    # failure — best-effort, matching this function's existing
+    # "log and continue" contract for Redis/HTTP calls below.
+    try:
+        from app.services import resource_ledger as _resource_ledger
+        _resource_ledger.ensure_baseline_reservation(connection_id)
+    except Exception as exc:
+        log.warning("resource_ledger: baseline reservation failed for connection=%s: %s", connection_id, exc)
+
     # Normalise sync_type: CDC → REALTIME, BATCH → SCHEDULED for routing
     is_batch = sync_type in ("SCHEDULED", "BATCH")
 
@@ -734,6 +748,14 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
         # never overwrites it with rows_written, so progress_pct reflects
         # real progress instead of always reading 100%.
         from app.services.partitioning import partition_with_estimates
+        # v1.4.x Phase 1 (committer consolidation): accumulate every
+        # iceberg-destined stream's (table, namespace, rows_estimated)
+        # across the loop below, then provision ONE committer for the
+        # whole connection after the loop — instead of the old
+        # one-ensure_committer-call-per-stream-per-table behavior.
+        _iceberg_tables: list[dict] = []
+        _iceberg_rows_estimated_total = 0
+        _iceberg_any_rows_estimated = False
         for stream in streams:
             to = stream.transform_overrides or {}
             steps = to.get("transforms", []) if isinstance(to, dict) else []
@@ -765,38 +787,51 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
                 stream.source_table_name, pk_col, src_connector_type, k,
             )
 
-            # Dynamic committer provisioning: an Iceberg destination needs a
-            # committer process draining staged files for THIS (connection,
-            # table) pair. Ensure it exists (create-or-update, idempotent)
-            # BEFORE enqueueing tasks that will stage files for it — no
-            # manual helm values.committer.targets edit + `helm upgrade`
-            # required. Never blocks/raises on failure (see
-            # committer_provisioner.ensure_committer docstring); tasks still
-            # enqueue even if provisioning couldn't run, matching the
-            # existing "producer never raises" contract for this function.
+            # Dynamic committer provisioning (v1.4.x Phase 1: consolidated
+            # to one committer PROCESS per connection instead of one per
+            # (connection, table) pair). Rather than provisioning here
+            # inside the per-stream loop, just record this stream's
+            # destination table/namespace/row-estimate; the actual
+            # ensure_committer() call happens ONCE after the loop, covering
+            # every iceberg-destined table this connection has.
+            #
+            # Bug fix (found by actually running tests/test_partitioning.py
+            # ::TestBackgroundPartitioningCompletes::test_enqueue_produces_k_tasks
+            # — a real regression, not a test-fixture issue): this used to
+            # be part of the per-stream committer-provisioning call, which
+            # was wrapped in its own try/except specifically so a
+            # committer-related failure for one stream could never block
+            # task enqueueing for the connection's OTHER streams. Moving it
+            # to plain accumulation here (v1.4.x Phase 1 consolidation)
+            # silently dropped that isolation — an exception building
+            # THIS stream's table/namespace entry now propagates out of
+            # the whole function, past the `for stream in streams:` loop,
+            # so ZERO tasks get enqueued for the entire connection instead
+            # of just this one stream's committer bookkeeping being
+            # skipped. Restoring the same isolation contract here.
             if dest_connector_type == "iceberg":
-                dest_table_name = stream.destination_table_name or stream.source_table_name
-                stream_rows_estimated = sum(
-                    (p.get("rows_estimated") or 0) for p in parts
-                ) or None
                 try:
-                    from app.services.committer_provisioner import ensure_committer
-                    ensure_committer(
-                        connection_id=str(connection.connection_id),
-                        table=dest_table_name,
-                        catalog_config=dest_config,
-                        resource_limits=_rl,
-                        k=k,
-                        rows_estimated_total=stream_rows_estimated,
-                        dest_namespace=stream.stream_namespace or dest_config.get("namespace") or "fusion",
-                    )
+                    dest_table_name = stream.destination_table_name or stream.source_table_name
+                    stream_rows_estimated = sum(
+                        (p.get("rows_estimated") or 0) for p in parts
+                    ) or None
+                    _iceberg_tables.append({
+                        "table": dest_table_name,
+                        "namespace": getattr(stream, "stream_namespace", None)
+                            or dest_config.get("namespace") or "fusion",
+                    })
+                    if stream_rows_estimated:
+                        _iceberg_rows_estimated_total += stream_rows_estimated
+                        _iceberg_any_rows_estimated = True
                 except Exception:
                     log.exception(
-                        "initial_load producer: committer auto-provisioning "
-                        "failed for connection=%s table=%s — continuing to "
-                        "enqueue tasks regardless",
-                        connection.connection_id, dest_table_name,
+                        "initial_load producer: failed to record iceberg-table "
+                        "bookkeeping for connection=%s stream=%s — this stream's "
+                        "table will be skipped by the connection-level committer, "
+                        "other streams' tasks still enqueue",
+                        connection.connection_id, stream.stream_id,
                     )
+                    _iceberg_any_rows_estimated = True
 
             for seq, part in enumerate(parts):
                 pk_start = part.get("pk_start")
@@ -842,6 +877,43 @@ async def _enqueue_initial_load_tasks(connection: Connection, db: Session) -> in
                 }
                 r.lpush(high_queue, _json.dumps(task))
                 pushed += 1
+
+        # Provision (create-or-update, idempotent) ONE committer for the
+        # whole connection, covering every iceberg-destined table
+        # accumulated above. The committer only needs to exist before its
+        # staged files are actually drained (which happens asynchronously
+        # on the committer's own schedule), so a single call here — after
+        # all streams have been processed and their tasks enqueued — is
+        # equivalent in effect to the old per-stream provisioning while
+        # avoiding one k8s round-trip per table. Never blocks/raises on
+        # failure (see committer_provisioner.ensure_committer docstring);
+        # tasks still enqueue even if provisioning couldn't run, matching
+        # the existing "producer never raises" contract for this function.
+        # The k8s calls inside ensure_committer are blocking I/O, so
+        # offload to a worker thread (matching the partition_with_estimates
+        # pattern above) rather than blocking the uvicorn event loop.
+        if dest_connector_type == "iceberg" and _iceberg_tables:
+            try:
+                from app.services.committer_provisioner import ensure_committer
+                await _asyncio.to_thread(
+                    ensure_committer,
+                    connection_id=str(connection.connection_id),
+                    tables=_iceberg_tables,
+                    catalog_config=dest_config,
+                    resource_limits=_rl,
+                    k=k,
+                    rows_estimated_total=(_iceberg_rows_estimated_total
+                                          if _iceberg_any_rows_estimated else None),
+                    dest_namespace=dest_config.get("namespace") or "fusion",
+                )
+            except Exception:
+                log.exception(
+                    "initial_load producer: committer auto-provisioning "
+                    "failed for connection=%s tables=%s — continuing to "
+                    "enqueue tasks regardless",
+                    connection.connection_id,
+                    [t["table"] for t in _iceberg_tables],
+                )
 
         log.info(
             "initial_load producer: enqueued %d task(s) for connection=%s "
@@ -1192,30 +1264,46 @@ async def delete_connection(
     _stop_worker_streaming(connection)
     _delete_redis_cdc_keys(str(connection.source_id))
 
-    # Disable all streams for this connection, tearing down each stream's
-    # dynamically-provisioned Iceberg committer (see
+    # Resource admission control: release BOTH the standing CDC baseline
+    # reservation and any in-flight transient initial-load reservation for
+    # this connection (see app/services/resource_ledger.py). A deleted
+    # connection can't be "active" or "currently syncing" anymore either
+    # way, so both are released regardless of which one(s) were actually
+    # held. Never blocks the delete — same best-effort contract as the
+    # committer teardown below.
+    try:
+        from app.services import resource_ledger as _resource_ledger
+        _resource_ledger.release_all(str(connection_id))
+    except Exception:
+        import logging as _logging
+        _logging.getLogger(__name__).exception(
+            "delete_connection: resource_ledger release failed for connection=%s", connection_id,
+        )
+
+    # Disable all streams for this connection, and tear down the
+    # connection's single dynamically-provisioned Iceberg committer (see
     # app/services/committer_provisioner.py / _enqueue_initial_load_tasks's
-    # ensure_committer call at creation/activation time). Never blocks the
-    # delete on a teardown failure — an orphaned committer Deployment is a
-    # cleanup nuisance, not a reason to fail the connection delete.
+    # ensure_committer call at creation/activation time). v1.4.x Phase 1:
+    # one committer now exists PER CONNECTION rather than per (connection,
+    # table) pair, so teardown_committer() is called once for the
+    # connection (not once per stream). Never blocks the delete on a
+    # teardown failure — an orphaned committer Deployment is a cleanup
+    # nuisance, not a reason to fail the connection delete.
     dest_connector_type = ""
     if connection.destination and connection.destination.connector_definition:
         dest_connector_type = (connection.destination.connector_definition.connector_type or "").lower()
     for stream in db.query(Stream).filter(Stream.connection_id == connection_id).all():
         stream.is_enabled = False
-        if dest_connector_type == "iceberg":
-            try:
-                from app.services.committer_provisioner import teardown_committer
-                teardown_committer(
-                    connection_id=str(connection_id),
-                    table=stream.destination_table_name or stream.source_table_name,
-                )
-            except Exception:
-                import logging as _logging
-                _logging.getLogger(__name__).exception(
-                    "delete_connection: committer teardown failed for connection=%s table=%s",
-                    connection_id, stream.destination_table_name,
-                )
+    if dest_connector_type == "iceberg":
+        try:
+            from app.services.committer_provisioner import teardown_committer
+            teardown_committer(connection_id=str(connection_id))
+        except Exception:
+            import logging as _logging
+            _logging.getLogger(__name__).exception(
+                "delete_connection: committer teardown failed for connection=%s",
+                connection_id,
+            )
 
     # Cancel any running jobs
     from app.models.monitoring import ConnectionRun
@@ -1913,28 +2001,38 @@ async def get_initial_load_progress(
     conn_id_str = str(connection_id)
     state = _get_initial_load_state(conn_id_str)
 
-    rows = (
-        db.query(InitialLoadCheckpoint)
+    # Bug fix (frontend-view OOM candidate): this used to pull EVERY
+    # InitialLoadCheckpoint row for the connection into Python just to sum
+    # two columns and find a min — for a large connection (many
+    # tables x K partitions each), that's several thousand ORM-hydrated rows,
+    # on every poll, every 5s, for as long as the load is running. The
+    # aggregate numbers below are computed in SQL instead (exact regardless
+    # of row count); only the per-partition DETAIL list is capped, since a
+    # progress UI has no real use for thousands of individual partition rows
+    # in one response.
+    agg = (
+        db.query(
+            func.coalesce(func.sum(InitialLoadCheckpoint.rows_written), 0),
+            func.coalesce(func.sum(InitialLoadCheckpoint.rows_estimated), 0),
+            func.count(InitialLoadCheckpoint.rows_estimated),
+            func.min(InitialLoadCheckpoint.started_at),
+            func.count(InitialLoadCheckpoint.chunk_seq),
+        )
         .filter(InitialLoadCheckpoint.connection_id == connection_id)
-        .order_by(InitialLoadCheckpoint.chunk_seq)
-        .all()
+        .one()
     )
+    total_written, total_estimated, estimated_count, started, partitions_total = agg
+    has_estimate = estimated_count > 0
 
     now = datetime.now(timezone.utc)
-    total_written = sum((r.rows_written or 0) for r in rows)
-    total_estimated = sum((r.rows_estimated or 0) for r in rows if r.rows_estimated)
-    has_estimate = any(r.rows_estimated for r in rows)
 
     # Throughput: rows written since the oldest partition's started_at.
     throughput = None
-    if rows:
-        started = min((r.started_at for r in rows if r.started_at), default=None)
-        if started is not None:
-            # Compute elapsed treating started_at as tz-aware.
-            s = started if started.tzinfo else started.replace(tzinfo=timezone.utc)
-            elapsed = (now - s).total_seconds()
-            if elapsed > 0:
-                throughput = total_written / elapsed
+    if started is not None:
+        s = started if started.tzinfo else started.replace(tzinfo=timezone.utc)
+        elapsed = (now - s).total_seconds()
+        if elapsed > 0:
+            throughput = total_written / elapsed
 
     progress_pct = None
     eta_seconds = None
@@ -1944,10 +2042,16 @@ async def get_initial_load_progress(
             eta_seconds = int((total_estimated - total_written) / throughput)
 
     # Overall phase: prefer the in-memory partitioning state; otherwise infer
-    # from checkpoint statuses.
+    # from checkpoint statuses (distinct values only — small result set even
+    # for a huge connection, unlike pulling every row).
     phase = state.get("phase", "idle")
     if phase in ("idle", None):
-        statuses = {r.status for r in rows}
+        statuses = {
+            s for (s,) in db.query(InitialLoadCheckpoint.status)
+            .filter(InitialLoadCheckpoint.connection_id == connection_id)
+            .distinct()
+            .all()
+        }
         if statuses and all(s == "completed" for s in statuses):
             phase = "completed"
         elif statuses and any(s == "failed" for s in statuses):
@@ -1955,8 +2059,16 @@ async def get_initial_load_progress(
         elif statuses:
             phase = "running"
 
+    _MAX_PROGRESS_PARTITIONS_RETURNED = 500
+    detail_rows = (
+        db.query(InitialLoadCheckpoint)
+        .filter(InitialLoadCheckpoint.connection_id == connection_id)
+        .order_by(InitialLoadCheckpoint.chunk_seq)
+        .limit(_MAX_PROGRESS_PARTITIONS_RETURNED)
+        .all()
+    )
     partitions = []
-    for r in rows:
+    for r in detail_rows:
         est = r.rows_estimated
         written = r.rows_written or 0
         p_pct = round(min(100.0, (written / est) * 100.0), 2) if est else None
@@ -1971,6 +2083,7 @@ async def get_initial_load_progress(
             "last_updated_at": r.last_updated_at.isoformat() if r.last_updated_at else None,
             "progress_pct": p_pct,
         })
+    partitions_truncated = partitions_total > len(detail_rows)
 
     return {
         "connection_id": conn_id_str,
@@ -1981,6 +2094,8 @@ async def get_initial_load_progress(
         "eta_seconds": eta_seconds,
         "throughput_rows_per_sec": round(throughput, 2) if throughput else None,
         "partitions": partitions,
+        "partitions_total": partitions_total,
+        "partitions_truncated": partitions_truncated,
         "updated_at": state.get("updated_at"),
     }
 
@@ -2140,22 +2255,44 @@ async def get_connection_runs(
     if updated:
         db.commit()
 
-    # Always also include initial load checkpoints as synthetic "Run #0 – Initial Load" entries
-    # even when connection_runs is empty (worker may not write a ConnectionRun record)
-    checkpoints = (
-        db.query(InitialLoadCheckpoint)
+    # Bug fix (frontend-view OOM candidate): this used to pull EVERY
+    # InitialLoadCheckpoint row for the connection (this endpoint is polled
+    # every 3s while a run is active) just to sum/min/max/all/any over them
+    # in Python — several thousand rows per poll for a large connection.
+    # Compute the aggregates in SQL (exact regardless of row count); only
+    # the per-table `tables` detail list below is capped.
+    il_count_agg = (
+        db.query(
+            func.count(InitialLoadCheckpoint.checkpoint_id),
+            func.coalesce(func.sum(InitialLoadCheckpoint.rows_written), 0),
+            func.min(InitialLoadCheckpoint.started_at),
+            func.max(InitialLoadCheckpoint.completed_at),
+        )
         .filter(InitialLoadCheckpoint.connection_id == connection_id)
-        .order_by(InitialLoadCheckpoint.started_at)
-        .all()
+        .one()
     )
+    checkpoint_count, total_rows, earliest_start, latest_end = il_count_agg
+    total_rows = int(total_rows or 0)
 
-    if checkpoints:
-        # Group by start time (same second = same bulk run)
-        total_rows = sum(int(c.rows_written or 0) for c in checkpoints)
-        earliest_start = min((c.started_at for c in checkpoints if c.started_at), default=None)
-        latest_end = max((c.completed_at for c in checkpoints if c.completed_at), default=None)
-        all_done = all(c.status in ("done", "completed") for c in checkpoints)
-        any_error = any(c.status == "error" for c in checkpoints)
+    if checkpoint_count:
+        done_count = (
+            db.query(func.count(InitialLoadCheckpoint.checkpoint_id))
+            .filter(
+                InitialLoadCheckpoint.connection_id == connection_id,
+                InitialLoadCheckpoint.status.in_(("done", "completed")),
+            )
+            .scalar()
+        )
+        error_count = (
+            db.query(func.count(InitialLoadCheckpoint.checkpoint_id))
+            .filter(
+                InitialLoadCheckpoint.connection_id == connection_id,
+                InitialLoadCheckpoint.status == "error",
+            )
+            .scalar()
+        )
+        all_done = done_count == checkpoint_count
+        any_error = error_count > 0
         duration_sec_il = None
         if earliest_start and latest_end:
             s = earliest_start.replace(tzinfo=None) if earliest_start.tzinfo else earliest_start
@@ -2165,6 +2302,14 @@ async def get_connection_runs(
         # Only add synthetic entry if there's no existing initial_load run in connection_runs
         has_il_run = any(r.get("is_first_sync") for r in result)
         if not has_il_run:
+            _MAX_TABLE_DETAILS_RETURNED = 500
+            detail_checkpoints = (
+                db.query(InitialLoadCheckpoint)
+                .filter(InitialLoadCheckpoint.connection_id == connection_id)
+                .order_by(InitialLoadCheckpoint.started_at)
+                .limit(_MAX_TABLE_DETAILS_RETURNED)
+                .all()
+            )
             table_details = [
                 {
                     "table_name": c.source_table,
@@ -2176,7 +2321,7 @@ async def get_connection_runs(
                     "completed_at": c.completed_at.isoformat() if c.completed_at else None,
                     "error": c.error,
                 }
-                for c in checkpoints
+                for c in detail_checkpoints
             ]
             result.append({
                 "id": f"il-{connection_id}",
@@ -2195,6 +2340,8 @@ async def get_connection_runs(
                 "error_message": None,
                 "is_first_sync": True,
                 "tables": table_details,
+                "tables_total": checkpoint_count,
+                "tables_truncated": checkpoint_count > len(detail_checkpoints),
                 "run_config": {},
             })
 

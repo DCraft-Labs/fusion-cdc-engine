@@ -21,7 +21,7 @@ resources:
   - frontend.yaml           # Next.js frontend
   - cdc-workers.yaml        # 3 typed CDC worker Deployments + KEDA
   - cdc-consumer.yaml       # CDC consumer + KEDA
-  - transform-worker.yaml   # DuckDB transform worker + KEDA (min=0)
+  - transform-worker.yaml   # DuckDB transform worker; replicas owned by control-plane's transform_scaler.py (Phase 3b — no KEDA here anymore)
   - hpa.yaml
 
 images:

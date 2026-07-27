@@ -52,6 +52,11 @@ jobs:
             tests/unit/test_v136_task_bulk_committer_modes.py \
             tests/unit/test_v137_post_rollout_bugfixes.py \
             -q --noconftest -p no:cacheprovider
+      - name: cdc-worker source-assignment/sharding tests (Phase 2)
+        run: |
+          python -m pytest \
+            control-plane/tests/test_connections/test_source_assignment_p2.py \
+            -q --noconftest -p no:cacheprovider
       - name: Setup Helm (for v1.3.5 chart template assertions)
         uses: azure/setup-helm@v4
         with:

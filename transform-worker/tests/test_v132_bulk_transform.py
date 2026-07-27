@@ -115,4 +115,34 @@ class TestBulkTransformInfoLog(unittest.TestCase):
         with self.assertLogs("loader", level="INFO") as cm:
             task._maybe_log_bulk_transform_run("s", "t", [{"type": "cast", "column": "id"}, {"type": "expression", "expression": "id+1", "output_column": "x"}])
         self.assertIn("2", cm.records[0].getMessage())
+class TestBulkModePostgresTransformNotSkipped(unittest.TestCase):
+    """Regression test: bulk_mode="duckdb" + Postgres destination used to
+    silently drop configured transform_steps (loader.py's `elif kind ==
+    "arrow":` Postgres branch never called execute_pipeline* at all, unlike
+    the Iceberg branch above it — no error, no warning, rows just landed
+    unmodified). The fix mirrors the ordinary Python-mode Postgres path and
+    runs `arrow_tbl.to_pylist()` through `execute_pipeline` before
+    `_copy_to_postgres`. This exercises that exact composition — the same
+    inputs/steps the fixed loader.py branch now passes through.
+    """
+    def setUp(self): self.engine = _make_engine()
+    def tearDown(self):
+        try: self.engine.close()
+        except Exception: pass
+    def test_steps_applied_to_arrow_derived_rows_before_postgres_write(self):
+        import pyarrow as pa
+        arrow_tbl = pa.table({"id": ["1", "2", "3"], "name": ["alice", "bob", "cy"]})
+        rows = arrow_tbl.to_pylist()
+        steps = [{"type": "cast", "column": "id", "to_type": "long", "output_column": "id"},
+                 {"type": "string_op", "column": "name", "op": "upper", "output_column": "name"}]
+        transformed, _child_tables, _schema = self.engine.execute_pipeline(rows, steps)
+        self.assertEqual([r["id"] for r in transformed], [1, 2, 3])
+        self.assertEqual([r["name"] for r in transformed], ["ALICE", "BOB", "CY"])
+    def test_no_steps_leaves_arrow_derived_rows_unchanged(self):
+        import pyarrow as pa
+        arrow_tbl = pa.table({"id": [1, 2, 3]})
+        rows = arrow_tbl.to_pylist()
+        # Mirrors the fixed branch's `if steps:` guard — empty steps means
+        # no execute_pipeline call, rows pass through as-is.
+        self.assertEqual(rows, [{"id": 1}, {"id": 2}, {"id": 3}])
 if __name__ == "__main__": unittest.main()

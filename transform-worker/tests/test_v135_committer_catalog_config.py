@@ -93,14 +93,17 @@ class TestCommitterCliRequiresCatalogConfig(unittest.TestCase):
     --catalog-config is empty/None (was silent default → crash-loop)."""
 
     def test_committer_main_errors_without_catalog_config(self):
-        # Simulate `python iceberg_committer.py --connection-id X --table Y`
+        # Simulate `python iceberg_committer.py --connection-id X --tables Y`
         # with no --catalog-config and no ICEBERG_CATALOG_CONFIG env var.
+        # v1.4.x Phase 1: --tables (comma-separated) replaced the old
+        # singular --table flag when the committer was consolidated to one
+        # process per connection.
         env = dict(os.environ)
         env.pop("ICEBERG_CATALOG_CONFIG", None)
         proc = subprocess.run(
             [sys.executable, "iceberg_committer.py",
              "--connection-id", "conn-1",
-             "--table", "customers",
+             "--tables", "customers",
              "--redis-url", "redis://localhost:6379/0"],
             capture_output=True, text=True, env=env, timeout=10,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

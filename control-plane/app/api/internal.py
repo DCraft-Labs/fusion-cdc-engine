@@ -211,6 +211,21 @@ def worker_heartbeat(
     # heartbeats, scale down the K8s deployment replica to 0.
     if payload.status in ("idle", "stopped") and payload.pod_name:
         _maybe_scale_down_worker(pod_name=payload.pod_name, worker_metadata=payload.worker_metadata or {})
+    # Phase 2: piggyback the source-assignment rebalance trigger on the
+    # heartbeat every worker already sends every HEARTBEAT_INTERVAL seconds
+    # (simplest mechanism that actually works — see
+    # source_assignment.maybe_rebalance_on_heartbeat's docstring for why a
+    # full K8s watch-based reconciler was judged out of scope for this
+    # pass). No-op unless this worker's StatefulSet's ready replica count
+    # has changed since we last saw it. Never raises.
+    try:
+        from app.services.source_assignment import maybe_rebalance_on_heartbeat
+        maybe_rebalance_on_heartbeat(db, payload.worker_id)
+    except Exception:
+        log.exception(
+            "source_assignment: heartbeat-triggered rebalance check failed for worker_id=%s",
+            payload.worker_id,
+        )
     return HeartbeatResponse(ok=True)
 
 
@@ -265,14 +280,23 @@ def get_worker_sources(
     _token: str = Depends(_verify_worker_token),
 ) -> List[SourceAssignment]:
     """
-    Return all active sources whose config field contains
-    {"assigned_worker_id": worker_id}.
+    Return the sources this specific worker pod (`worker_id` — its own
+    stable StatefulSet pod name, e.g. "<release>-cdc-worker-mysql-1") owns,
+    per app/services/source_assignment.py's consistent-hash assignment
+    written onto each source's config["assigned_worker_id"].
 
-    If no sources are assigned to this worker, returns all active sources
-    (single-worker / dev mode).
+    Real per-pod filtering only kicks in once assignment has actually run
+    for this worker's source-type StatefulSet (i.e. at least one of its
+    sources has an assigned_worker_id). Until then — dev/local/docker-compose
+    without a real Kubernetes API, or a WORKER_ID that isn't a StatefulSet
+    ordinal pod name — this falls back to returning ALL active sources
+    (single-worker mode), exactly as before. This keeps today's default
+    (1 replica) working unchanged while making 2+ replicas actually split
+    sources instead of every pod grabbing everything.
     """
     # Query all non-deleted, active sources joined with their connector definition
     from sqlalchemy.orm import joinedload
+    from app.services.source_assignment import select_assigned_sources
 
     sources = (
         db.query(Source)
@@ -284,13 +308,7 @@ def get_worker_sources(
         .all()
     )
 
-    # Filter to sources assigned to this worker (or return all if none are assigned)
-    assigned = [
-        s for s in sources
-        if s.config.get("assigned_worker_id") == worker_id
-    ]
-    if not assigned:
-        assigned = sources  # dev / single-worker mode
+    assigned = select_assigned_sources(sources, worker_id)
 
     # Build a mapping: source_id -> list of enabled streams
     source_ids = [s.source_id for s in assigned]
@@ -1199,6 +1217,42 @@ def _maybe_mark_initial_load_completed(db: Session, conn_uuid, stream_uuid) -> N
                     "initial_load_completed: connection=%s stream=%s — all %d partitions done",
                     conn_uuid, stream_uuid, k,
                 )
+
+                # Resource admission control: this connection's initial load
+                # has genuinely completed — release its transient ledger
+                # reservation NOW, whether that's early or late relative to
+                # the ETA computed at admission-confirm time. No partial
+                # credit, no mid-flight resizing — an explicit product
+                # decision, not an oversight. Never blocks/raises: a leak
+                # here just makes capacity look a bit tighter than it is,
+                # not a correctness bug in the checkpoint write itself.
+                try:
+                    from app.services import resource_ledger as _resource_ledger
+                    from app.services import resource_admission as _resource_admission
+
+                    _resource_ledger.release_transient(str(conn_uuid))
+
+                    # Stretch goal: feed the real observed throughput back
+                    # into the ETA baseline (see loader.py's
+                    # ADAPTIVE_MIN_CHUNK/MAX_CHUNK for the "adapt from
+                    # observation" precedent this mirrors). Best-effort —
+                    # skipped silently if we don't have enough bookkeeping
+                    # (started_at / the admission block's bulk_mode) to
+                    # compute a sane rate.
+                    admission_meta = (conn.resource_limits or {}).get("admission") or {}
+                    bulk_mode = admission_meta.get("bulk_mode")
+                    started_at = conn.initial_load_started_at
+                    if bulk_mode and started_at:
+                        elapsed = (conn.initial_load_completed_at - started_at).total_seconds()
+                        rows_written_total = sum(int(r.rows_written or 0) for r in rows)
+                        _resource_admission.record_observed_throughput(
+                            bulk_mode, rows_written_total, elapsed, parallelism=k,
+                        )
+                except Exception:
+                    log.warning(
+                        "resource_ledger: release_transient/record_observed_throughput failed for connection=%s",
+                        conn_uuid, exc_info=True,
+                    )
     except Exception:
         log.warning("_maybe_mark_initial_load_completed: failed for connection=%s stream=%s",
                     conn_uuid, stream_uuid, exc_info=True)

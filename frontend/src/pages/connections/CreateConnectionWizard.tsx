@@ -12,7 +12,7 @@ import { CheckCircle, Circle, ChevronDown, ChevronRight, Plus, X, Zap } from "lu
 import StreamIcebergPartitionEditor from "@/components/iceberg/StreamIcebergPartitionEditor";
 import { type PartitionField } from "@/lib/iceberg-config";
 
-const STEPS = ["Source", "Destination", "Streams & Transforms", "Config", "Review"];
+const STEPS = ["Source", "Destination", "Streams & Transforms", "Config", "Admission Mode", "Review"];
 
 // ── Transform step types ──────────────────────────────────────────────────────
 
@@ -82,6 +82,42 @@ interface StreamConfig {
 
 function makeStepId() {
   return Math.random().toString(36).slice(2, 8);
+}
+
+// ── Admission control (resource-aware mode selection) ────────────────────────
+// Contract (agreed with the backend team, see PUT/GET /resource-config and
+// POST /connections/{id}/admission-preview): given the connection's selected
+// tables, the API returns each speed mode's availability, ETA, and resource
+// footprint under the tenant's configured resource pool.
+
+interface AdmissionMode {
+  mode: "aggressive" | "normal" | "saver";
+  fits: boolean;
+  eta_seconds: number | null;
+  cpu_millis: number;
+  memory_mi: number;
+  reason?: string | null;
+}
+
+// Backend reports CPU in millicores and memory in MiB (see
+// AdmissionModeOption in app/schemas/resource_config.py) — format for
+// display the way the rest of this codebase's resource fields read
+// (fractional cores, MiB).
+function formatCpuMillis(millis: number): string {
+  return `${(millis / 1000).toFixed(millis % 1000 === 0 ? 0 : 2)} CPU`;
+}
+function formatMemoryMi(mi: number): string {
+  return mi >= 1024 ? `${(mi / 1024).toFixed(1)} GiB` : `${mi} MiB`;
+}
+
+// Mirrors the eta_seconds formatting convention used for initial-load
+// progress in ConnectionDetailPage.tsx (< 60s shown in seconds, otherwise
+// minutes), extended with an hours bucket since saver-mode ETAs can be long.
+function formatEta(seconds: number | null | undefined): string {
+  if (seconds == null) return "—";
+  if (seconds >= 3600) return `${(seconds / 3600).toFixed(1)} hr`;
+  if (seconds > 60) return `${Math.ceil(seconds / 60)} min`;
+  return `${seconds} s`;
 }
 
 function buildTransformSpec(stream: StreamConfig): Record<string, any> | undefined {
@@ -402,6 +438,12 @@ export function CreateConnectionWizard() {
   const [destinationId, setDestinationId] = useState("");
   const [streamConfigs, setStreamConfigs] = useState<StreamConfig[]>([]);
   const [activateImmediately, setActivateImmediately] = useState(true);
+  // Admission control: the connection is created as a draft once the user
+  // leaves the Config step (so a real connection_id exists for the
+  // admission-preview call), then activated for real — with the chosen
+  // mode — from the Review step.
+  const [draftConnectionId, setDraftConnectionId] = useState<string | null>(null);
+  const [selectedMode, setSelectedMode] = useState<string>("");
   const [config, setConfig] = useState({
     name: "",
     sync_mode: "cdc",
@@ -552,66 +594,117 @@ export function CreateConnectionWizard() {
 
   const selectedStreams = streamConfigs.filter((s) => s.selected);
 
-  const createMutation = useMutation({
+  // Admission preview: fetched once the draft connection exists and the
+  // Admission Mode step is showing. Keyed on the draft id + selected table
+  // set so it refreshes if the user goes back and changes table selection
+  // (note: as documented below, in that case the earlier draft is stale —
+  // this is a known simplification, not the common path).
+  const { data: admissionPreview, isFetching: admissionLoading, isError: admissionPreviewError } = useQuery({
+    queryKey: ["connections", draftConnectionId, "admission-preview"],
+    queryFn: () =>
+      api
+        // The real backend's AdmissionPreviewRequest.stream_ids defaults to
+        // "every is_enabled=true stream on the connection" when omitted —
+        // exactly the tables just selected, since the draft was created
+        // with precisely those streams. No table/stream identifier needs
+        // to be sent at all.
+        .post(`/connections/${draftConnectionId}/admission-preview`, {})
+        .then((r) => r.data),
+    enabled: step === 4 && !!draftConnectionId,
+  });
+  const admissionModes: AdmissionMode[] = admissionPreview?.modes ?? [];
+
+  // Confirming a mode atomically reserves transient initial-load capacity
+  // server-side (POST /connections/{id}/admission-confirm — a separate
+  // endpoint from activation, not folded into it). Only called when the
+  // user actually activates, not when leaving this step to "keep as
+  // draft" — reserving capacity for a connection that isn't being
+  // activated yet would leak a reservation with nothing to release it.
+  const admissionConfirmMutation = useMutation({
     mutationFn: () =>
-      api.post("/connections", {
-        connection_name: config.name,
-        source_id: sourceId,
-        destination_id: destinationId,
-        sync_mode: config.sync_mode,
-        sync_type: config.schedule === "continuous" ? "CDC" : "BATCH",
-        sync_frequency: config.schedule === "cron" ? config.cron : config.schedule === "manual" ? "manual" : null,
-        streams: selectedStreams.map((s) => {
-          const transform_steps = buildTransformSpec(s);
-          return {
-            stream_name: s.name,
-            stream_namespace: s.schema_name || null,
-            source_table_name: s.name,
-            source_schema_name: s.schema_name || null,
-            destination_table_name: s.dest_table_name || s.name,
-            sync_mode: s.sync_mode,
-            primary_keys: s.primary_key ? [s.primary_key] : [],
-            cursor_field: s.cursor_field || null,
-            is_enabled: true,
-            transform_steps: transform_steps ?? null,
-            // Iceberg lake path (per-stream)
-            partition_spec: s.partition_spec ?? null,
-            identifier_fields: s.identifier_fields ?? (s.primary_key ? [s.primary_key] : []),
-            iceberg_namespace: s.iceberg_namespace ?? null,
-          };
-        }),
-        resource_limits:
-          config.max_events_sec || config.max_memory_mb || config.parallelism
-          || config.bulk_mode || config.committer_mode || config.drain_batch
-          || config.cdc_batch_mode !== "per_event" || config.cdc_batch_max_events
-          || config.cdc_batch_max_wait_minutes
-            ? {
-                max_events_sec: config.max_events_sec ? Number(config.max_events_sec) : undefined,
-                max_memory_mb: config.max_memory_mb ? Number(config.max_memory_mb) : undefined,
-                // v1.2.26: K = intra-table parallelism (number of PK-range
-                // partitions enqueued per stream for the initial load).
-                parallelism: config.parallelism ? Number(config.parallelism) : undefined,
-                // Initial-load fetch engine (duckdb/python/auto — see
-                // AUTO_BULK_MODE_ROW_THRESHOLD server-side for the auto pick).
-                bulk_mode: config.bulk_mode || undefined,
-                // Iceberg write path (staged = single-committer batching).
-                committer_mode: config.committer_mode || undefined,
-                // Committer's per-cycle Redis drain batch size; only takes
-                // effect once the committer target's Helm values entry picks
-                // it up (committer processes aren't dynamically provisioned
-                // per connection today — see resource_limits notes).
-                drain_batch: config.drain_batch ? Number(config.drain_batch) : undefined,
-                // v1.3.9: ongoing CDC batching (post-initial-load). See
-                // _resolve_cdc_batch_config server-side for the defaults
-                // applied when these are left blank.
-                cdc_batch_mode: config.cdc_batch_mode || undefined,
-                cdc_batch_max_events: config.cdc_batch_max_events ? Number(config.cdc_batch_max_events) : undefined,
-                cdc_batch_max_wait_minutes: config.cdc_batch_max_wait_minutes ? Number(config.cdc_batch_max_wait_minutes) : undefined,
-              }
-            : {},
-        status: activateImmediately ? "active" : "draft",
+      api
+        .post(`/connections/${draftConnectionId}/admission-confirm`, { mode: selectedMode })
+        .then((r) => r.data as { reserved: boolean; reason?: string }),
+  });
+
+  function buildConnectionPayload(status: "draft" | "active") {
+    return {
+      connection_name: config.name,
+      source_id: sourceId,
+      destination_id: destinationId,
+      sync_mode: config.sync_mode,
+      sync_type: config.schedule === "continuous" ? "CDC" : "BATCH",
+      sync_frequency: config.schedule === "cron" ? config.cron : config.schedule === "manual" ? "manual" : null,
+      streams: selectedStreams.map((s) => {
+        const transform_steps = buildTransformSpec(s);
+        return {
+          stream_name: s.name,
+          stream_namespace: s.schema_name || null,
+          source_table_name: s.name,
+          source_schema_name: s.schema_name || null,
+          destination_table_name: s.dest_table_name || s.name,
+          sync_mode: s.sync_mode,
+          primary_keys: s.primary_key ? [s.primary_key] : [],
+          cursor_field: s.cursor_field || null,
+          is_enabled: true,
+          transform_steps: transform_steps ?? null,
+          // Iceberg lake path (per-stream)
+          partition_spec: s.partition_spec ?? null,
+          identifier_fields: s.identifier_fields ?? (s.primary_key ? [s.primary_key] : []),
+          iceberg_namespace: s.iceberg_namespace ?? null,
+        };
       }),
-    onSuccess: (res) => navigate(`/connections/${res.data.connection_id}`),
+      resource_limits:
+        config.max_events_sec || config.max_memory_mb || config.parallelism
+        || config.bulk_mode || config.committer_mode || config.drain_batch
+        || config.cdc_batch_mode !== "per_event" || config.cdc_batch_max_events
+        || config.cdc_batch_max_wait_minutes
+          ? {
+              max_events_sec: config.max_events_sec ? Number(config.max_events_sec) : undefined,
+              max_memory_mb: config.max_memory_mb ? Number(config.max_memory_mb) : undefined,
+              // v1.2.26: K = intra-table parallelism (number of PK-range
+              // partitions enqueued per stream for the initial load).
+              parallelism: config.parallelism ? Number(config.parallelism) : undefined,
+              // Initial-load fetch engine (duckdb/python/auto — see
+              // AUTO_BULK_MODE_ROW_THRESHOLD server-side for the auto pick).
+              bulk_mode: config.bulk_mode || undefined,
+              // Iceberg write path (staged = single-committer batching).
+              committer_mode: config.committer_mode || undefined,
+              // Committer's per-cycle Redis drain batch size; only takes
+              // effect once the committer target's Helm values entry picks
+              // it up (committer processes aren't dynamically provisioned
+              // per connection today — see resource_limits notes).
+              drain_batch: config.drain_batch ? Number(config.drain_batch) : undefined,
+              // v1.3.9: ongoing CDC batching (post-initial-load). See
+              // _resolve_cdc_batch_config server-side for the defaults
+              // applied when these are left blank.
+              cdc_batch_mode: config.cdc_batch_mode || undefined,
+              cdc_batch_max_events: config.cdc_batch_max_events ? Number(config.cdc_batch_max_events) : undefined,
+              cdc_batch_max_wait_minutes: config.cdc_batch_max_wait_minutes ? Number(config.cdc_batch_max_wait_minutes) : undefined,
+            }
+          : {},
+      status,
+    };
+  }
+
+  // Step: Admission Mode needs a real connection_id to preview against, so
+  // the connection is created as a draft as soon as the user leaves Config.
+  const createDraftMutation = useMutation({
+    mutationFn: () => api.post("/connections", buildConnectionPayload("draft")),
+    onSuccess: (res) => {
+      setDraftConnectionId(res.data.connection_id);
+      setStep((s) => s + 1);
+    },
+  });
+
+  // Activation itself is the existing, unmodified call (POST
+  // /connections/{id}/activate — see ConnectionsPage.tsx's
+  // activateMutation) — the chosen mode is NOT passed here. It's already
+  // been reserved and stamped onto resource_limits by admission-confirm,
+  // called right before this in the button handler below.
+  const activateMutation = useMutation({
+    mutationFn: () => api.post(`/connections/${draftConnectionId}/activate`, {}),
+    onSuccess: () => navigate(`/connections/${draftConnectionId}`),
   });
 
   const selectedSource = sources.find((s: any) => s.source_id === sourceId);
@@ -632,6 +725,7 @@ export function CreateConnectionWizard() {
     if (step === 1) return !!destinationId;
     if (step === 2) return selectedStreams.length > 0;
     if (step === 3) return !!config.name;
+    if (step === 4) return !!selectedMode;
     return true;
   };
 
@@ -1025,8 +1119,81 @@ export function CreateConnectionWizard() {
         </Card>
       )}
 
-      {/* ── Step 5: Review ── */}
+      {/* ── Step 5: Admission Mode ── */}
       {step === 4 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Admission Mode</CardTitle>
+            <p className="text-sm text-muted-foreground mt-1">
+              Based on the tables you selected and this cluster's configured resource pool, here's what speed
+              this connection's initial load can run at right now.
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {createDraftMutation.isError && (
+              <p className="text-sm text-destructive">
+                Failed to prepare this connection. Go back and check your configuration, then try again.
+              </p>
+            )}
+            {admissionLoading ? (
+              <p className="text-sm text-muted-foreground text-center py-8">Checking available capacity…</p>
+            ) : admissionPreviewError ? (
+              <p className="text-sm text-destructive text-center py-8">
+                Failed to check available capacity. Go back and try again.
+              </p>
+            ) : admissionModes.length === 0 ? (
+              <p className="text-sm text-muted-foreground text-center py-8">No admission modes returned.</p>
+            ) : (
+              admissionModes.map((m) => (
+                <label
+                  key={m.mode}
+                  className={`flex items-center gap-3 rounded-lg border p-4 transition-colors ${
+                    !m.fits
+                      ? "opacity-50 cursor-not-allowed"
+                      : selectedMode === m.mode
+                        ? "cursor-pointer border-primary bg-primary/5 ring-1 ring-primary"
+                        : "cursor-pointer hover:bg-muted/50"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="admission_mode"
+                    value={m.mode}
+                    checked={selectedMode === m.mode}
+                    disabled={!m.fits}
+                    onChange={() => setSelectedMode(m.mode)}
+                    className="sr-only"
+                  />
+                  <div
+                    className={`w-4 h-4 rounded-full border-2 flex items-center justify-center shrink-0 ${
+                      selectedMode === m.mode ? "border-primary" : "border-muted-foreground"
+                    }`}
+                  >
+                    {selectedMode === m.mode && <div className="w-2 h-2 rounded-full bg-primary" />}
+                  </div>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium capitalize">{m.mode}</span>
+                      {!m.fits && <Badge variant="secondary">Not available</Badge>}
+                    </div>
+                    <div className="text-xs text-muted-foreground mt-0.5">
+                      {formatCpuMillis(m.cpu_millis)} · {formatMemoryMi(m.memory_mi)} memory
+                      {!m.fits && m.reason && <span className="text-destructive"> — {m.reason}</span>}
+                    </div>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <div className="text-sm font-semibold">{formatEta(m.eta_seconds)}</div>
+                    <div className="text-xs text-muted-foreground">ETA</div>
+                  </div>
+                </label>
+              ))
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ── Step 6: Review ── */}
+      {step === 5 && (
         <Card>
           <CardHeader><CardTitle>Review Connection</CardTitle></CardHeader>
           <CardContent className="space-y-4">
@@ -1040,6 +1207,7 @@ export function CreateConnectionWizard() {
                 {totalTransformCount > 0 && <div><dt className="text-muted-foreground">Transforms</dt><dd className="font-medium">{totalTransformCount} steps across {selectedStreams.filter((s) => s.columns.some((c) => c.transforms.length > 0) || s.table_udfs.some((u) => u.function_name)).length} tables</dd></div>}
                 <div><dt className="text-muted-foreground">DQ Policy</dt><dd className="font-medium">{config.dq_policy_id ? policies.find((p: any) => (p.id ?? p.policy_id) === config.dq_policy_id)?.name ?? config.dq_policy_id : "None"}</dd></div>
                 <div><dt className="text-muted-foreground">Schema Evolution</dt><dd className="font-medium">{config.schema_policy === "auto_apply" ? "Auto Apply" : "Manual Approval"}</dd></div>
+                <div><dt className="text-muted-foreground">Admission Mode</dt><dd className="font-medium capitalize">{selectedMode || "—"}{selectedMode && (() => { const m = admissionModes.find((am) => am.mode === selectedMode); return m ? ` (ETA ${formatEta(m.eta_seconds)})` : ""; })()}</dd></div>
               </dl>
               {selectedStreams.length > 0 && (
                 <div className="pt-3 border-t space-y-2">
@@ -1061,8 +1229,15 @@ export function CreateConnectionWizard() {
               <input type="checkbox" checked={activateImmediately} onChange={(e) => setActivateImmediately(e.target.checked)} />
               Activate immediately after creation
             </label>
-            {createMutation.isError && (
-              <p className="text-sm text-destructive">Failed to create connection. Please check your configuration.</p>
+            {activateMutation.isError && (
+              <p className="text-sm text-destructive">Failed to activate connection. Please check your configuration.</p>
+            )}
+            {admissionConfirmMutation.data?.reserved === false && (
+              <p className="text-sm text-destructive">
+                The reserved capacity was taken by another connection just now
+                ({admissionConfirmMutation.data.reason ?? "insufficient_capacity"}). Go back to
+                Admission Mode to see what's still available.
+              </p>
             )}
           </CardContent>
         </Card>
@@ -1077,10 +1252,50 @@ export function CreateConnectionWizard() {
           {step > 0 && <Button variant="ghost" onClick={() => navigate("/connections")}>Cancel</Button>}
         </div>
         <Button
-          onClick={() => { if (step < 4) setStep(step + 1); else createMutation.mutate(); }}
-          disabled={!canNext() || (step === 4 && createMutation.isPending)}
+          onClick={() => {
+            const lastStep = STEPS.length - 1;
+            // Leaving Config (step 3): create the draft connection first —
+            // Admission Mode needs a real connection_id to preview against.
+            if (step === 3 && !draftConnectionId) {
+              createDraftMutation.mutate();
+              return;
+            }
+            if (step < lastStep) {
+              setStep(step + 1);
+              return;
+            }
+            // Final step (Review): reserve the chosen mode's capacity, then
+            // activate — or, if not activating now, leave as the draft
+            // that was already created before the Admission Mode step
+            // (no reservation is made in that case; see the mutation's
+            // own comment for why).
+            if (activateImmediately) {
+              admissionConfirmMutation.mutate(undefined, {
+                onSuccess: (data) => {
+                  if (data.reserved) activateMutation.mutate();
+                },
+              });
+            } else {
+              navigate(`/connections/${draftConnectionId}`);
+            }
+          }}
+          disabled={
+            !canNext() ||
+            createDraftMutation.isPending ||
+            (step === STEPS.length - 1 && (admissionConfirmMutation.isPending || activateMutation.isPending))
+          }
         >
-          {step === 4 ? (createMutation.isPending ? "Creating…" : activateImmediately ? "Create & Activate" : "Create Connection") : "Next →"}
+          {step === 3 && createDraftMutation.isPending
+            ? "Preparing…"
+            : step === STEPS.length - 1
+              ? admissionConfirmMutation.isPending
+                ? "Reserving capacity…"
+                : activateMutation.isPending
+                  ? "Activating…"
+                  : activateImmediately
+                    ? "Activate Connection"
+                    : "Finish (Keep as Draft)"
+              : "Next →"}
         </Button>
       </div>
     </div>

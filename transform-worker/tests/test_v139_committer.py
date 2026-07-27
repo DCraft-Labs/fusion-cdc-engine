@@ -387,5 +387,96 @@ class TestLoaderStagingPath(unittest.TestCase):
         eq.assert_not_called()
 
 
+class TestMultiTableCommitterConsolidation(unittest.TestCase):
+    """v1.4.x Phase 1 (committer consolidation): one committer PROCESS now
+    drains every table belonging to a connection, sharing ONE catalog
+    instance, instead of one process per (connection, table) pair. Every
+    Redis key (pending list, committed set) stays scoped per-table —
+    only the process boundary changed."""
+
+    def test_run_cycle_drains_each_table_own_pending_list_via_shared_catalog(self):
+        from iceberg_committer import (IcebergCommitter, pending_key,
+                                        committed_key)
+        rc = _FakeRedis()
+        rc.rpush(pending_key("c", "orders"), json.dumps(_entry("o1.parquet", 0)))
+        rc.rpush(pending_key("c", "customers"), json.dumps(_entry("c1.parquet", 0)))
+        catalog, table, tx = _make_catalog()
+        # ONE IcebergCommitter, ONE shared catalog, TWO tables.
+        committer = IcebergCommitter(catalog, rc, "c", ["orders", "customers"])
+        results = committer.run_cycle()
+
+        self.assertEqual(set(results.keys()), {"orders", "customers"})
+        self.assertEqual(results["orders"]["committed"], 1)
+        self.assertEqual(results["customers"]["committed"], 1)
+        # Each table's own pending list / committed set was used — the
+        # Redis key scheme is unchanged by the process consolidation.
+        self.assertEqual(rc.lists.get(pending_key("c", "orders")), [])
+        self.assertEqual(rc.lists.get(pending_key("c", "customers")), [])
+        self.assertEqual(rc.sets[committed_key("c", "orders")], {"o1.parquet"})
+        self.assertEqual(rc.sets[committed_key("c", "customers")], {"c1.parquet"})
+        # Both tables were loaded through the SAME catalog instance (no
+        # per-table catalog re-authentication/reconstruction).
+        called_tables = {args[0] for args, _kwargs in catalog.load_table.call_args_list}
+        self.assertIn("fusion.orders", called_tables)
+        self.assertIn("fusion.customers", called_tables)
+
+    def test_run_cycle_isolates_unexpected_exception_per_table(self):
+        """Item 1 requirement: one table's commit failure must not stop
+        the connection's other tables from draining in the same cycle."""
+        from iceberg_committer import IcebergCommitter
+        rc = _FakeRedis()
+        catalog, table, tx = _make_catalog()
+        committer = IcebergCommitter(catalog, rc, "c", ["t1", "t2"])
+
+        real_drain = committer.drain_and_commit
+
+        def flaky_drain(table_name=None):
+            if table_name == "t1":
+                raise RuntimeError("simulated unexpected failure for t1")
+            return real_drain(table_name)
+
+        committer.drain_and_commit = flaky_drain
+        results = committer.run_cycle()
+
+        self.assertEqual(results["t1"]["committed"], 0)
+        self.assertEqual(results["t1"]["errors"][0]["phase"], "drain_and_commit")
+        # t2 is completely unaffected by t1's exception (still a normal,
+        # non-error result — just nothing to drain in this fake Redis).
+        self.assertEqual(results["t2"]["committed"], 0)
+        self.assertEqual(results["t2"]["errors"], [])
+
+    def test_single_string_table_name_still_works(self):
+        """Backward compatibility: constructing with a single table-name
+        string (the pre-consolidation shape) must behave identically to
+        the old single-table IcebergCommitter."""
+        from iceberg_committer import (IcebergCommitter, pending_key)
+        rc = _FakeRedis()
+        rc.rpush(pending_key("c", "t"), json.dumps(_entry("f0.parquet", 0)))
+        catalog, table, tx = _make_catalog()
+        committer = IcebergCommitter(catalog, rc, "c", "t")
+        self.assertEqual(committer.table_names, ["t"])
+        self.assertEqual(committer.table_name, "t")
+        r = committer.drain_and_commit()  # no table_name arg -> defaults to "t"
+        self.assertEqual(r["committed"], 1)
+
+    def test_table_namespaces_override_resolves_per_table(self):
+        """A connection's streams can each override their destination
+        namespace; the committer should resolve each table's catalog
+        lookup against its own namespace override, not just the shared
+        default."""
+        from iceberg_committer import IcebergCommitter, pending_key
+        rc = _FakeRedis()
+        rc.rpush(pending_key("c", "special"), json.dumps(_entry("s1.parquet", 0)))
+        catalog, table, tx = _make_catalog()
+        committer = IcebergCommitter(
+            catalog, rc, "c", ["special"], namespace="fusion",
+            table_namespaces={"special": "other_ns"},
+        )
+        committer.drain_and_commit("special")
+        called_tables = {args[0] for args, _kwargs in catalog.load_table.call_args_list}
+        self.assertIn("other_ns.special", called_tables)
+        self.assertNotIn("fusion.special", called_tables)
+
+
 if __name__ == "__main__":
     unittest.main()

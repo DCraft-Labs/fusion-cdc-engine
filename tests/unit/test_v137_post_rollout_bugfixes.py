@@ -93,6 +93,118 @@ def test_resolve_drain_batch_baseline_and_override():
     assert mod._catalog_readiness_check_url({"catalog_type": "glue"}) is None
 
 
+def _fresh_provisioner_module(name: str, fake_k8s_client):
+    """Load committer_provisioner.py with a FRESH, caller-owned mock for
+    ``kubernetes.client`` (not whatever generic MagicMock an earlier test
+    in this session may have already cached in sys.modules — ``_load``'s
+    stubs use ``setdefault``, so a stale cached stub would silently win
+    over a new one otherwise).
+
+    Also wires ``.client``/``.config`` explicitly as attributes on the
+    ``kubernetes`` package mock: MagicMock's ``hasattr()`` always returns
+    True, so ``from kubernetes import client as k8s`` never falls through
+    to ``sys.modules['kubernetes.client']`` (CPython's fromlist machinery
+    only imports the submodule when ``hasattr(pkg, name)`` is False) — it
+    would otherwise auto-vivify an unrelated ``kubernetes_pkg_mock.client``
+    instead of resolving to the caller's ``fake_k8s_client``.
+    """
+    for mod_name in ("kubernetes", "kubernetes.client", "kubernetes.config"):
+        sys.modules.pop(mod_name, None)
+    fake_k8s_config = MagicMock()
+    kubernetes_pkg = MagicMock()
+    kubernetes_pkg.client = fake_k8s_client
+    kubernetes_pkg.config = fake_k8s_config
+    return _load(PROVISIONER, name, stubs={
+        "kubernetes": kubernetes_pkg,
+        "kubernetes.client": fake_k8s_client,
+        "kubernetes.config": fake_k8s_config,
+    })
+
+
+# ── v1.4.x Phase 1: committer consolidation (per-connection, not per-table) ──
+
+def test_committer_name_is_per_connection_and_never_collides_with_old_scheme():
+    """New naming scheme drops the table component entirely so a fresh
+    per-connection committer can never collide with (or be mistaken for)
+    an old per-(connection, table) one still running pre-migration."""
+    mod = _fresh_provisioner_module("committer_provisioner_v14_naming", MagicMock())
+    conn_id = "550e8400-e29b-41d4-a716-446655440000"
+    new_name = mod._committer_name(conn_id, "fusion-cdc")
+    assert new_name.startswith("fusion-cdc-committer-")
+    # Deterministic for the same connection.
+    assert mod._committer_name(conn_id, "fusion-cdc") == new_name
+    # Must differ from the OLD per-(connection, table) hash for any table.
+    import hashlib
+    for table in ("orders", "customers", ""):
+        old_name = ("fusion-cdc-committer-"
+                    + hashlib.sha256(f"{conn_id}-{table}".encode()).hexdigest()[:10])
+        assert new_name != old_name
+
+
+def test_ensure_committer_provisions_one_deployment_for_all_connection_tables(monkeypatch):
+    """v1.4.x Phase 1: ensure_committer() now takes a LIST of tables and
+    provisions ONE Deployment/Secret/Service for the whole connection,
+    instead of one call (and one Deployment) per table."""
+    fake_k8s = MagicMock()
+    mod = _fresh_provisioner_module("committer_provisioner_v14_ensure", fake_k8s)
+    monkeypatch.setenv("RELEASE_NAME", "fusion-cdc")
+    monkeypatch.setenv("TRANSFORM_WORKER_IMAGE", "fusion/transform-worker:test")
+
+    apps_v1 = fake_k8s.AppsV1Api.return_value
+    core_v1 = fake_k8s.CoreV1Api.return_value
+    # Force the create path (nothing exists yet) for all three objects.
+    apps_v1.read_namespaced_deployment.side_effect = Exception("not found")
+    core_v1.read_namespaced_secret.side_effect = Exception("not found")
+    core_v1.read_namespaced_service.side_effect = Exception("not found")
+
+    result = mod.ensure_committer(
+        connection_id="conn-1",
+        tables=["orders", "customers"],
+        catalog_config={"catalog_type": "nessie",
+                        "nessie_uri": "http://nessie:19120/api/v1"},
+        resource_limits={},
+        k=4,
+        rows_estimated_total=100_000,
+        dest_namespace="fusion",
+    )
+    assert result["provisioned"] is True
+    assert set(result["tables"]) == {"orders", "customers"}
+
+    # ONE Deployment/Secret for the whole connection — not one per table.
+    assert apps_v1.create_namespaced_deployment.call_count == 1
+    assert core_v1.create_namespaced_secret.call_count == 1
+    assert fake_k8s.V1Container.call_count == 1
+
+    container_kwargs = fake_k8s.V1Container.call_args.kwargs
+    args = container_kwargs["args"]
+    assert "--connection-id" in args
+    # New --tables (plural, comma-joined) replaces the old singular --table.
+    assert "--table" not in args
+    assert "--tables" in args
+    tables_arg = args[args.index("--tables") + 1]
+    assert set(tables_arg.split(",")) == {"orders", "customers"}
+
+
+def test_teardown_committer_takes_single_connection_id(monkeypatch):
+    """v1.4.x Phase 1: teardown_committer() drops the ``table`` parameter —
+    one call tears down the whole connection's committer."""
+    fake_k8s = MagicMock()
+    mod = _fresh_provisioner_module("committer_provisioner_v14_teardown", fake_k8s)
+    monkeypatch.setenv("RELEASE_NAME", "fusion-cdc")
+
+    result = mod.teardown_committer(connection_id="conn-1")
+    assert result["deprovisioned"] is True
+    apps_v1 = fake_k8s.AppsV1Api.return_value
+    core_v1 = fake_k8s.CoreV1Api.return_value
+    assert apps_v1.delete_namespaced_deployment.call_count == 1
+    assert core_v1.delete_namespaced_secret.call_count == 1
+    assert core_v1.delete_namespaced_service.call_count == 1
+    # teardown_committer(connection_id) — no `table` argument accepted.
+    import inspect
+    params = list(inspect.signature(mod.teardown_committer).parameters)
+    assert params == ["connection_id"]
+
+
 # ── Bug #3: auto bulk_mode resolver ──────────────────────────────────────────
 
 def test_resolve_bulk_mode_auto_threshold():

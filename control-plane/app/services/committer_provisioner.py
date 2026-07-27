@@ -10,13 +10,31 @@ operator to notice and go do that by hand.
 This module replaces that manual step: ``ensure_committer()`` is called from
 the initial-load producer (``app/api/connections.py::_enqueue_initial_load_tasks``,
 the single choke point both connection-creation-with-immediate-activation and
-retry-initial-load already funnel through) whenever a stream's destination
-needs the transform-worker/committer path. It builds the exact same
-Deployment + Secret + headless Service that the Helm template
-(``templates/iceberg-committer.yaml``) renders — same naming scheme
-(``sha256(connectionId + "-" + table)[:10]``), same labels, same env vars,
-same probes — but does it directly against the Kubernetes API, idempotently
-(create if missing, patch if the resolved config changed).
+retry-initial-load already funnel through) whenever a connection has any
+iceberg-destined streams. It builds the exact same Deployment + Secret +
+headless Service that the Helm template (``templates/iceberg-committer.yaml``)
+renders — same labels, same env vars, same probes — but does it directly
+against the Kubernetes API, idempotently (create if missing, patch if the
+resolved config changed).
+
+v1.4.x Phase 1 (committer consolidation): ``ensure_committer``/
+``teardown_committer`` used to be called once per (connection, table), each
+provisioning its own Deployment (naming scheme
+``sha256(connectionId + "-" + table)[:10]``). Consolidated to ONE committer
+Deployment per CONNECTION, draining every one of its iceberg-destined tables
+from a single shared ``iceberg_committer.py --tables`` process (see that
+module's ``IcebergCommitter`` docstring). Naming changed to
+``sha256(connectionId)[:10]`` — deliberately dropping the table component so
+it can NEVER collide with (or be mistaken for) the old per-table name.
+
+MIGRATION NOTE: a live environment with old per-(connection, table)
+Deployments will end up with BOTH those (now orphaned — ``teardown_committer``
+only knows the new name) AND the new per-connection ones after this ships.
+One-time manual rollout step: delete the old
+``<release>-committer-<sha256(connectionId+"-"+table)[:10]>`` Deployments/
+Secrets/Services (identifiable by the ``cdc.dcraftfusion.io/table`` label,
+which only they carry) before or shortly after rollout; fresh per-connection
+ones provision automatically on each connection's next initial-load/retry.
 
 Set ``COMMITTER_AUTO_PROVISION_ENABLED=false`` to disable (falls back to the
 old manual Helm-values workflow). All operations are no-ops (with a clear log
@@ -30,9 +48,23 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
+
+# Bug fix (control-plane OOM on large connections): ensure_committer() used to
+# build a brand-new AppsV1Api()/CoreV1Api() — each wrapping its own ApiClient,
+# its own urllib3 connection pool and TLS context — on every single call. For
+# a connection with N tables, _enqueue_initial_load_tasks() calls this once
+# per stream in one HTTP request; at N=500 that's ~1000 abandoned client
+# objects plus thousands of unpooled HTTP connections alive at once in one
+# process, which is what actually OOMs control-plane (not the K8s calls
+# themselves being slow — the client objects piling up). The underlying
+# config is loaded once and doesn't change between calls, so one ApiClient
+# can safely be reused for the process's lifetime.
+_shared_api_client_lock = threading.Lock()
+_shared_api_client = None
 
 _ENABLED = os.environ.get("COMMITTER_AUTO_PROVISION_ENABLED", "true").lower() == "true"
 
@@ -86,15 +118,48 @@ def resolve_drain_batch(resource_limits: dict, k: int, rows_estimated_total: Opt
     return int(max(_AUTO_DRAIN_BATCH_MIN, min(_AUTO_DRAIN_BATCH_MAX, scaled)))
 
 
-def _committer_name(connection_id: str, table: str, release_name: str) -> str:
-    """Matches the Helm template's naming EXACTLY:
-    ``printf "%s-%s" $tgt.connectionId $tgt.table | sha256sum | trunc 10``
-    so provisioning a connection that was previously added by hand under
-    ``committer.targets`` finds and updates the SAME object instead of
-    creating a duplicate.
+def _committer_name(connection_id: str, release_name: str) -> str:
+    """v1.4.x Phase 1 (committer consolidation): per-CONNECTION naming
+    scheme, ``sha256(connectionId)[:10]``. Deliberately DROPS the table
+    component that the old per-(connection, table) scheme
+    (``sha256(connectionId + "-" + table)[:10]``, matching the Helm
+    template's ``printf "%s-%s" $tgt.connectionId $tgt.table | sha256sum |
+    trunc 10``) used, so a newly provisioned per-connection committer can
+    NEVER collide with — or be mistaken for — an old per-table one still
+    running from before this consolidation. See the module docstring's
+    MIGRATION NOTE: old per-table Deployments need a one-time manual
+    cleanup at rollout since they are no longer addressable by this
+    function.
     """
-    digest = hashlib.sha256(f"{connection_id}-{table}".encode()).hexdigest()[:10]
+    digest = hashlib.sha256(connection_id.encode()).hexdigest()[:10]
     return f"{release_name}-committer-{digest}"
+
+
+def _normalize_tables(tables, default_namespace: str) -> list[dict]:
+    """Normalize the ``tables`` argument accepted by ``ensure_committer``
+    into a list of ``{"table": name, "namespace": ns}`` dicts.
+
+    Accepts either plain table-name strings (namespace falls back to
+    ``default_namespace``) or dicts with an explicit ``namespace`` — a
+    connection's streams can each override their destination namespace
+    (``stream.stream_namespace``), so even though ``catalog_config`` is one
+    per connection, the namespace a table resolves to is not necessarily
+    the same for every table in the connection.
+    """
+    out: list[dict] = []
+    seen = set()
+    for t in tables or []:
+        if isinstance(t, dict):
+            name = t.get("table")
+            ns = t.get("namespace") or default_namespace or "fusion"
+        else:
+            name = t
+            ns = default_namespace or "fusion"
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append({"table": name, "namespace": ns})
+    return out
 
 
 def _current_namespace() -> str:
@@ -136,13 +201,17 @@ def _catalog_readiness_check_url(catalog_config: dict) -> Optional[str]:
     return f"{scheme}://{parsed.hostname}:{port}/api/v1/config"
 
 
-def _labels(committer_name: str, connection_id: str, table: str) -> dict:
+def _labels(committer_name: str, connection_id: str) -> dict:
+    # v1.4.x Phase 1: deliberately no ``cdc.dcraftfusion.io/table`` label —
+    # one committer now owns multiple tables per connection. This also
+    # means the label's ABSENCE reliably distinguishes a new per-connection
+    # object from an old per-table one during the rollout migration (see
+    # the module docstring's MIGRATION NOTE).
     return {
         "app.kubernetes.io/component": "iceberg-committer",
         "app.kubernetes.io/name": committer_name,
         "app.kubernetes.io/managed-by": "fusion-cdc-control-plane",
         "cdc.dcraftfusion.io/connection-id": connection_id,
-        "cdc.dcraftfusion.io/table": table,
     }
 
 
@@ -162,40 +231,77 @@ def _load_k8s():
     return k8s, k8s_config
 
 
-def ensure_committer(connection_id: str, table: str, catalog_config: dict,
+def _get_shared_api_client(k8s):
+    """Return a process-wide shared ApiClient, constructed at most once.
+
+    See the module-level comment above _shared_api_client for why this
+    exists — reusing one client instead of one-per-call is the actual OOM
+    fix, independent of the threading change in the caller.
+    """
+    global _shared_api_client
+    if _shared_api_client is not None:
+        return _shared_api_client
+    with _shared_api_client_lock:
+        if _shared_api_client is None:
+            _shared_api_client = k8s.ApiClient()
+        return _shared_api_client
+
+
+def ensure_committer(connection_id: str, tables, catalog_config: dict,
                       resource_limits: dict, k: int,
                       rows_estimated_total: Optional[int] = None,
                       dest_namespace: str = "fusion") -> dict:
-    """Idempotently create or update the committer Deployment/Secret/Service
-    for this (connection_id, table) pair. Returns a dict describing what
-    happened. Never raises — a provisioning failure logs loudly but does not
-    block the initial-load producer (the connection can still be manually
-    provisioned via the legacy Helm-values path as a fallback).
+    """Idempotently create or update the ONE committer Deployment/Secret/
+    Service that drains every iceberg-destined table for this CONNECTION
+    (v1.4.x Phase 1: consolidated from one committer process per
+    (connection, table) pair).
+
+    ``tables`` is a list of the connection's destination table names —
+    either plain strings, or ``{"table": name, "namespace": ns}`` dicts for
+    streams whose destination namespace overrides ``dest_namespace`` (see
+    ``_normalize_tables``). ``catalog_config`` is a SINGLE dict for the
+    whole connection: the control-plane resolves the destination's
+    connection_config once per connection, before iterating streams (see
+    ``_enqueue_initial_load_tasks`` in ``app/api/connections.py``) — no
+    stream carries its own catalog_config, so unlike ``tables`` this is
+    not a per-table list.
+
+    Returns a dict describing what happened. Never raises — a provisioning
+    failure logs loudly but does not block the initial-load producer (the
+    connection can still be manually provisioned via the legacy Helm-values
+    path as a fallback).
     """
     if not _ENABLED:
         log.debug("committer_provisioner: auto-provisioning disabled "
                   "(COMMITTER_AUTO_PROVISION_ENABLED=false)")
         return {"provisioned": False, "reason": "auto-provisioning disabled"}
 
+    table_specs = _normalize_tables(tables, dest_namespace)
+    if not table_specs:
+        log.debug("committer_provisioner: no tables provided for "
+                  "connection=%s — nothing to provision", connection_id)
+        return {"provisioned": False, "reason": "no tables provided"}
+    table_names = [t["table"] for t in table_specs]
+
     k8s, _ = _load_k8s()
     if k8s is None:
         log.warning("committer_provisioner: kubernetes library/credentials unavailable — "
-                    "skipping auto-provisioning for connection=%s table=%s "
+                    "skipping auto-provisioning for connection=%s tables=%s "
                     "(fall back to the manual helm committer.targets workflow)",
-                    connection_id, table)
+                    connection_id, table_names)
         return {"provisioned": False, "reason": "kubernetes client unavailable"}
 
     release_name = os.environ.get("RELEASE_NAME")
     transform_worker_image = os.environ.get("TRANSFORM_WORKER_IMAGE")
     if not release_name or not transform_worker_image:
         log.warning("committer_provisioner: RELEASE_NAME/TRANSFORM_WORKER_IMAGE env vars "
-                    "not set — skipping auto-provisioning for connection=%s table=%s",
-                    connection_id, table)
+                    "not set — skipping auto-provisioning for connection=%s tables=%s",
+                    connection_id, table_names)
         return {"provisioned": False, "reason": "RELEASE_NAME/TRANSFORM_WORKER_IMAGE not set"}
 
     namespace = _current_namespace()
-    committer_name = _committer_name(connection_id, table, release_name)
-    labels = _labels(committer_name, connection_id, table)
+    committer_name = _committer_name(connection_id, release_name)
+    labels = _labels(committer_name, connection_id)
     drain_batch = resolve_drain_batch(resource_limits, k, rows_estimated_total)
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     # Bug (found via live test): this used to GUESS the catalog's readiness
@@ -218,8 +324,9 @@ def ensure_committer(connection_id: str, table: str, catalog_config: dict,
     secret_name = f"{committer_name}-catalog"
 
     try:
-        apps_v1 = k8s.AppsV1Api()
-        core_v1 = k8s.CoreV1Api()
+        api_client = _get_shared_api_client(k8s)
+        apps_v1 = k8s.AppsV1Api(api_client)
+        core_v1 = k8s.CoreV1Api(api_client)
 
         # 1. Secret (destination connection_config, so the committer can
         # build a PyIceberg Catalog without an operator manually supplying it).
@@ -243,16 +350,32 @@ def ensure_committer(connection_id: str, table: str, catalog_config: dict,
         ]
         args = [
             "--connection-id", str(connection_id),
-            "--table", str(table),
+            "--tables", ",".join(table_names),
             "--namespace", str(dest_namespace or "fusion"),
             "--redis-url", redis_url,
             "--drain-batch", str(drain_batch),
         ]
+        # Only pass --table-namespaces when at least one table's resolved
+        # namespace actually differs from the connection-level default —
+        # keeps the common single-namespace case's args identical to the
+        # pre-consolidation shape (minus --table -> --tables).
+        _table_namespaces = {
+            t["table"]: t["namespace"] for t in table_specs
+            if t["namespace"] and t["namespace"] != (dest_namespace or "fusion")
+        }
+        if _table_namespaces:
+            args += ["--table-namespaces", json.dumps(_table_namespaces)]
+        # Liveness/readiness lag check now sums the pending-files backlog
+        # across EVERY table this connection's committer drains, since one
+        # process is responsible for all of them.
+        _pending_keys = [
+            f"fusion:iceberg-pending-files:{connection_id}:{t}" for t in table_names
+        ]
         lag_check = (
             "import os, sys, redis\n"
             "r = redis.from_url(os.environ['REDIS_URL'])\n"
-            f"k = 'fusion:iceberg-pending-files:{connection_id}:{table}'\n"
-            "lag = r.llen(k) if r.exists(k) else 0\n"
+            f"keys = {_pending_keys!r}\n"
+            "lag = sum(r.llen(k) for k in keys if r.exists(k))\n"
             "sys.exit(0 if lag < {threshold} else 1)\n"
         )
         startup_probe = None
@@ -323,15 +446,15 @@ def ensure_committer(connection_id: str, table: str, catalog_config: dict,
         )
         _apply_service(core_v1, namespace, f"{committer_name}-headless", service_body)
 
-        log.info("committer_provisioner: %s committer=%s connection=%s table=%s drain_batch=%d",
-                  action, committer_name, connection_id, table, drain_batch)
+        log.info("committer_provisioner: %s committer=%s connection=%s tables=%s drain_batch=%d",
+                  action, committer_name, connection_id, table_names, drain_batch)
         return {"provisioned": True, "action": action, "committer_name": committer_name,
-                "drain_batch": drain_batch}
+                "drain_batch": drain_batch, "tables": table_names}
     except Exception:
         log.exception("committer_provisioner: failed to provision committer for "
-                      "connection=%s table=%s — connection will still enqueue tasks, "
+                      "connection=%s tables=%s — connection will still enqueue tasks, "
                       "but no committer may be running to drain them",
-                      connection_id, table)
+                      connection_id, table_names)
         return {"provisioned": False, "reason": "provisioning error (see logs)"}
 
 
@@ -366,9 +489,12 @@ def _apply_service(core_v1, namespace: str, name: str, body) -> str:
         return "created"
 
 
-def teardown_committer(connection_id: str, table: str) -> dict:
-    """Delete the committer Deployment/Secret/Service for this
-    (connection_id, table) pair. Called on connection deletion. Never raises.
+def teardown_committer(connection_id: str) -> dict:
+    """Delete the committer Deployment/Secret/Service for this CONNECTION
+    (drains every iceberg-destined table it owns). Called once per
+    connection on connection deletion (v1.4.x Phase 1: previously called
+    once per (connection, table) pair — see the module docstring). Never
+    raises.
     """
     if not _ENABLED:
         return {"deprovisioned": False, "reason": "auto-provisioning disabled"}
@@ -379,11 +505,12 @@ def teardown_committer(connection_id: str, table: str) -> dict:
     if not release_name:
         return {"deprovisioned": False, "reason": "RELEASE_NAME not set"}
     namespace = _current_namespace()
-    committer_name = _committer_name(connection_id, table, release_name)
+    committer_name = _committer_name(connection_id, release_name)
     removed = []
     try:
-        apps_v1 = k8s.AppsV1Api()
-        core_v1 = k8s.CoreV1Api()
+        api_client = _get_shared_api_client(k8s)
+        apps_v1 = k8s.AppsV1Api(api_client)
+        core_v1 = k8s.CoreV1Api(api_client)
         for kind, api, name in (
             ("deployment", apps_v1.delete_namespaced_deployment, committer_name),
             ("secret", core_v1.delete_namespaced_secret, f"{committer_name}-catalog"),
@@ -394,10 +521,10 @@ def teardown_committer(connection_id: str, table: str) -> dict:
                 removed.append(f"{kind}/{name}")
             except Exception:
                 pass  # already gone — fine
-        log.info("committer_provisioner: torn down committer=%s connection=%s table=%s (%s)",
-                  committer_name, connection_id, table, ", ".join(removed) or "nothing to remove")
+        log.info("committer_provisioner: torn down committer=%s connection=%s (%s)",
+                  committer_name, connection_id, ", ".join(removed) or "nothing to remove")
         return {"deprovisioned": True, "removed": removed}
     except Exception:
         log.exception("committer_provisioner: failed to tear down committer for "
-                      "connection=%s table=%s", connection_id, table)
+                      "connection=%s", connection_id)
         return {"deprovisioned": False, "reason": "teardown error (see logs)"}

@@ -65,6 +65,7 @@ import { AlertRuleDetailPage } from "@/pages/alerts/AlertRuleDetailPage";
 import { AlertChannelDetailPage } from "@/pages/alerts/AlertChannelDetailPage";
 import { ChangePasswordPage } from "@/pages/settings/ChangePasswordPage";
 import { DQTemplatesPage } from "@/pages/data-quality/DQTemplatesPage";
+import { ResourceConfigPage } from "@/pages/settings/ResourceConfigPage";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
@@ -88,6 +89,9 @@ export default function App() {
       >
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="dashboard" element={<DashboardPage />} />
+        {/* Resource Config — forced on first login until saved; see the
+            resource-config gate in MainLayout.tsx */}
+        <Route path="resource-config" element={<ResourceConfigPage />} />
         {/* Connectors */}
         <Route path="connectors" element={<ConnectorsPage />} />
         <Route path="connectors/:id" element={<ConnectorDetailPage />} />

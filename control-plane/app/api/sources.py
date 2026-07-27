@@ -120,6 +120,27 @@ def _maybe_activate_source(source: Source, db: Session) -> bool:
         source.updated_at = datetime.utcnow()
         db.flush()
         log.info("Source %s auto-activated (connection OK, %d tables discovered)", source.source_id, total_tables)
+        # Phase 2: (re)compute cdc-worker pod assignment for this source's
+        # type now that it's newly active, so it's immediately shardable
+        # instead of waiting for the next heartbeat-triggered rebalance
+        # (see app/services/source_assignment.py). Never blocks activation
+        # on a provisioning/K8s hiccup -- mirrors the
+        # committer_provisioner.ensure_committer call-site convention in
+        # app/api/connections.py.
+        try:
+            from app.services.source_assignment import rebalance_source_type
+            connector_type = (
+                source.connector_definition.connector_type
+                if source.connector_definition else None
+            )
+            rebalance_source_type(db, connector_type)
+        except Exception:
+            log.exception(
+                "source_assignment: rebalance failed after activating source %s — "
+                "worker(s) will fall back to single-worker mode until the next "
+                "successful rebalance",
+                source.source_id,
+            )
         return True
     return False
 

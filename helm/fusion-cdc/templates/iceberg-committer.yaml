@@ -148,7 +148,15 @@ spec:
             # here would break the committer's Redis key lookups.
             - --connection-id
             - {{ $tgt.connectionId | quote }}
-            - --table
+            # v1.4.x Phase 1: iceberg_committer.py's CLI now takes
+            # --tables (comma-separated) instead of the old singular
+            # --table, since the control-plane's auto-provisioning path
+            # now runs one committer PER CONNECTION draining all of its
+            # tables. This manual per-target Helm path still renders one
+            # Deployment per (connection, table) target, so it just passes
+            # a single-entry --tables list here — functionally identical
+            # to the old --table for this one-target-per-Deployment model.
+            - --tables
             - {{ $tgt.table | quote }}
             - --namespace
             - {{ $tgt.namespace | default "fusion" | quote }}

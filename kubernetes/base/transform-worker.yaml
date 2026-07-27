@@ -2,7 +2,26 @@
 # Fusion CDC Engine — Transform Worker
 # Smart path: initial loads (100M+ rows) + CDC events with column transforms
 # DuckDB engine: all 10 transform types, Python UDFs, chunked PK-range loading
-# KEDA: scale-to-zero (min=0). 0 pods at idle = $0 cost.
+#
+# Phase 3b: replica scaling for this Deployment is now owned DIRECTLY by
+# control-plane (see control-plane/app/services/transform_scaler.py),
+# NOT KEDA. The ScaledObject that used to live below this Deployment is
+# removed: one of its two triggers correctly watched
+# `fusion:transforms:high` (initial-load queue depth), but the OTHER
+# trigger watched `fusion:transforms:normal` — a Redis List retired since
+# v1.3.9 in favor of per-connection Redis Streams (see
+# transform-worker/worker.py:47-51 and transform-worker/
+# cdc_stream_consumer.py) — so it never fired. CDC-driven autoscaling for
+# this Deployment had been silently dead since v1.3.9. control-plane's
+# reconcile loop now reads BOTH a real initial-load signal (the same
+# `fusion:transforms:high` LLEN) and a real CDC-backlog signal (aggregate
+# Redis Streams pending count across `fusion:transforms:stream:*`) and
+# patches `spec.replicas` directly, in both directions, with its own
+# hysteresis/cooldown (see that module's `decide_next_replicas`) so it
+# never depends on a KEDA install for this component. `replicas: 0` below
+# is only the manifest's bootstrap default (true scale-to-zero, same as
+# the old ScaledObject's minReplicaCount) — control-plane owns the field
+# from the first reconcile tick onward.
 # ─────────────────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
@@ -14,7 +33,7 @@ metadata:
     app.kubernetes.io/component: transform-worker
     app.kubernetes.io/part-of: fusion-cdc
 spec:
-  replicas: 0               # KEDA starts from 0 — true scale-to-zero
+  replicas: 0               # bootstrap default only — control-plane's transform_scaler.py owns this field from here on (both directions)
   selector:
     matchLabels:
       app.kubernetes.io/name: transform-worker
@@ -73,8 +92,10 @@ spec:
                   fieldPath: metadata.name
             - name: HIGH_PRIORITY_QUEUE
               value: fusion:transforms:high
-            - name: NORMAL_PRIORITY_QUEUE
-              value: fusion:transforms:normal
+            # NORMAL_PRIORITY_QUEUE (fusion:transforms:normal) removed:
+            # retired since v1.3.9 (transform-worker/worker.py:47-51) —
+            # CDC now flows through per-connection Redis Streams, and
+            # worker.py no longer reads this env var at all.
             - name: DUCKDB_THREADS
               value: "2"
             - name: DUCKDB_MEMORY_LIMIT
@@ -93,32 +114,13 @@ spec:
         - name: duckdb-scratch
           emptyDir:
             sizeLimit: 10Gi      # DuckDB memory-mapped temp files for 100M row loads
----
-# KEDA: scale-to-zero on Redis queue depth
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: transform-worker-scaler
-  namespace: fusion
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: fusion-transform-worker
-  minReplicaCount: 0          # TRUE scale-to-zero
-  maxReplicaCount: 500
-  cooldownPeriod: 120         # 2 min idle → scale to 0
-  pollingInterval: 5
-  triggers:
-    # High priority: initial loads (1 pod per task, max priority)
-    - type: redis
-      metadata:
-        address: fusion-redis-master.fusion.svc.cluster.local:6379
-        listName: fusion:transforms:high
-        listLength: "1"          # 1 task = 1 pod immediately
-    # Normal priority: CDC events with column transforms (batch them)
-    - type: redis
-      metadata:
-        address: fusion-redis-master.fusion.svc.cluster.local:6379
-        listName: fusion:transforms:normal
-        listLength: "5"          # 5 tasks batched per pod
+# Phase 3b: the `transform-worker-scaler` KEDA ScaledObject that used to
+# follow this Deployment is REMOVED — see the Deployment's own comment
+# above for why (its CDC trigger watched a retired queue and never fired)
+# and control-plane/app/services/transform_scaler.py for the replacement.
+# MAX_REPLICAS=500/MIN_REPLICAS=0 (this ScaledObject's old
+# maxReplicaCount/minReplicaCount) are preserved as that module's own
+# TRANSFORM_SCALER_MAX_REPLICAS/TRANSFORM_SCALER_MIN_REPLICAS defaults, and
+# its HIGH_TASKS_PER_REPLICA=1/CDC_BACKLOG_PER_REPLICA=5 defaults mirror
+# this ScaledObject's own listLength ratios ("1" / "5") so replica counts
+# don't shift wildly relative to the (partially) working prior behavior.

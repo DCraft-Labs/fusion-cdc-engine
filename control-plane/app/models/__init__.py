@@ -97,6 +97,11 @@ from app.models.auth import (
     AuditLog,
 )
 
+# Resource admission-control models
+from app.models.resource_config import (
+    ResourceConfig,
+)
+
 __all__ = [
     # Base
     "TimestampMixin",
@@ -159,4 +164,6 @@ __all__ = [
     "Permission",
     "RefreshToken",
     "AuditLog",
+    # Resource admission-control
+    "ResourceConfig",
 ]
