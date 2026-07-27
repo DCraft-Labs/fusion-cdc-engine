@@ -70,7 +70,6 @@ except ImportError:
     _api_request_duration = _Noop()
     _api_request_count = _Noop()
 
-
 # ---------------------------------------------------------------------------
 # Structured JSON logging (spec §3: tenant_id, trace_id, log_level, message)
 # ---------------------------------------------------------------------------
@@ -88,7 +87,6 @@ class _JsonFormatter(logging.Formatter):
             log_dict["exc"] = self.formatException(record.exc_info)
         return json.dumps(log_dict, default=str)
 
-
 def _configure_logging() -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(_JsonFormatter())
@@ -97,10 +95,8 @@ def _configure_logging() -> None:
     root.addHandler(handler)
     root.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
 
-
 _configure_logging()
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Periodic re-introspection (spec §3):
@@ -189,7 +185,6 @@ async def _periodic_reintrospection() -> None:
 
         await asyncio.sleep(interval_seconds)
 
-
 def _diff_discovery_cache(old_cache: dict, new_cache: dict) -> list:
     """
     Compare old vs new discovery caches and return a list of change dicts.
@@ -276,7 +271,6 @@ def _diff_discovery_cache(old_cache: dict, new_cache: dict) -> list:
 
     return changes
 
-
 # ---------------------------------------------------------------------------
 # cdc-worker direct-scaling reconcile loop (source-count/tier sized).
 #
@@ -311,16 +305,37 @@ async def _periodic_cdc_worker_autoscale() -> None:
     while True:
         try:
             from app.database import SessionLocal
-            db = SessionLocal()
-            try:
-                reconcile_cdc_worker_replicas(db)
-            finally:
-                db.close()
+
+            def _reconcile_once() -> None:
+                db = SessionLocal()
+                try:
+                    reconcile_cdc_worker_replicas(db)
+                finally:
+                    db.close()
+
+            # Bug fix (confirmed live in UAT: HPA "FailedGetResourceMetric
+            # ... pods might be unready" warnings + real replica-count
+            # flapping on control-plane itself, ~314 rescales/23h): this
+            # used to call reconcile_cdc_worker_replicas(db) — a blocking
+            # DB query plus one Kubernetes StatefulSet read per source type
+            # — directly on the event loop, every 120s, unconditionally
+            # (the reads still happen even with CDC_WORKER_DIRECT_SCALING_
+            # ENABLED=false, since dry-run mode has to read real state to
+            # log what it WOULD do). That blocked control-plane's request
+            # handling — including its own readiness probe response — for
+            # however long those calls took, every single tick, forever.
+            # This is the exact same class of bug already fixed once for
+            # ensure_committer() (see committer_provisioner.py's shared
+            # ApiClient comment) — except that one only fired during large
+            # connection activation, while this one fires continuously.
+            # transform_scaler.py and committer_resizer.py's own _tick()
+            # methods already correctly do this via run_in_executor —
+            # mirroring that exact pattern here.
+            await asyncio.get_event_loop().run_in_executor(None, _reconcile_once)
         except Exception as exc:
             logger.error("cdc-worker autoscale reconcile error: %s", exc, exc_info=True)
 
         await asyncio.sleep(interval_seconds)
-
 
 # ---------------------------------------------------------------------------
 # FastAPI lifespan — start/stop background tasks
@@ -417,7 +432,6 @@ async def lifespan(app: FastAPI):
         if _redis:
             await _redis.aclose()
         logger.info("Background tasks stopped")
-
 
 # Create FastAPI application
 app = FastAPI(
@@ -674,7 +688,6 @@ async def metrics_endpoint():
     if _PROM_AVAILABLE and generate_latest is not None:
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
     return Response(content="# prometheus_client not installed\n", media_type="text/plain")
-
 
 if __name__ == "__main__":
     import uvicorn
